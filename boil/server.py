@@ -172,10 +172,14 @@ class App:
         title = str(body.get("title") or "我的材料")
         subject = str(body.get("subject") or "")
         text = str(body.get("text") or "")
+        documents = body.get("documents")
+        if documents is not None and not isinstance(documents, list):
+            raise ApiError(400, "documents 必须是数组", "bad_request")
         use_llm = bool(body.get("use_llm", True))
         use_embeddings = bool(body.get("use_embeddings", True))
         return services.compile_preview(self.db, title, subject, text, use_llm,
-                                        use_embeddings=use_embeddings)
+                                        use_embeddings=use_embeddings,
+                                        documents=documents)
 
     def socratic_start(self, req, match, query, body):
         if not isinstance(body, dict):

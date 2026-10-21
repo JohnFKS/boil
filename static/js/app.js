@@ -64,9 +64,9 @@ function navigate(hash, { replace = false } = {}) {
   const target = hash.startsWith("#") ? hash : `#/${hash.replace(/^\/?/, "")}`;
   if (replace) {
     history.replaceState(null, "", target);
-    route();
+    renderRoute();
   } else if (location.hash === target) {
-    route();
+    renderRoute();
   } else {
     location.hash = target;
   }
@@ -444,8 +444,15 @@ async function boot() {
     return;
   }
   clearTimeout(watchdog);
-  await renderRoute();
-  window.__boilBootReady?.();
+  try {
+    await renderRoute();
+    window.__boilBootReady?.();
+  } catch (e) {
+    console.error(e);
+    window.__boilBootReady?.();
+    app.innerHTML = bootErrorHTML(e);
+    bindBootError();
+  }
 }
 
 function bindBootError() {

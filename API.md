@@ -211,10 +211,16 @@ Base URL：`http://127.0.0.1:7860`
 {
   "title": "第 3 章 导数",
   "subject": "高等数学",
-  "text": "……",
+  "text": "补充粘贴内容（可选）",
+  "documents": [
+    {"name": "讲义.md", "text": "……"},
+    {"name": "笔记.txt", "text": "……"}
+  ],
   "use_llm": true
 }
 ```
+
+`documents` 可选，用于把多个文件合并到同一个主题：后端会按文件名添加二级标题，再接上 `text` 作为“补充笔记”。最多 20 个文件，合并后上限 200,000 字符；空文档会忽略。
 
 返回：
 
@@ -228,6 +234,7 @@ Base URL：`http://127.0.0.1:7860`
 
 - `use_llm=true` 且配置了模型：LLM 结构化抽取；失败显式降级并给出 warning。
 - 无模型 / `use_llm=false`：本地确定性编译器。
+- 使用 `documents` 时，Pack 的 `source.documents` 会记录文件名与字符数，`source.material_chars` 记录合并长度。
 - 编译会保存用户 Pack 到 `data/packs/`，可以直接用于 onboarding。
 
 ### `POST /api/packs/import`

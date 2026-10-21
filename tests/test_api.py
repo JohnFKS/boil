@@ -183,6 +183,28 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(comp["ok"])
         self.assertTrue(comp["data"]["pack"]["units"])
         new_pack = comp["data"]["pack"]["id"]
+        multi = self.call("POST", "/api/packs/compile", {
+            "title": "多文件材料", "subject": "学习科学", "text": "补充：睡眠影响记忆巩固。",
+            "documents": [
+                {"name": "记忆.md", "text": "## 记忆形成\n学习会形成可提取的记忆，模仿与练习共同塑造神经回路。"},
+                {"name": "复习.txt", "text": "间隔复习能提高长期保持。合书复述比重复阅读更有效。"},
+            ],
+            "use_llm": False,
+        })
+        self.assertTrue(multi["ok"])
+        multi_pack = multi["data"]["pack"]
+        self.assertTrue(multi_pack["units"])
+        self.assertEqual([d["name"] for d in multi_pack["source"]["documents"]],
+                         ["记忆.md", "复习.txt"])
+        self.assertGreater(multi_pack["source"]["material_chars"], 60)
+        try:
+            self.call("POST", "/api/packs/compile", {
+                "title": "坏输入", "subject": "测试", "text": "x" * 80,
+                "documents": "not-a-list", "use_llm": False,
+            })
+            self.fail("documents must be a list")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
         imported = self.call("POST", "/api/packs/import", {"pack": comp["data"]["pack"]})
         self.assertTrue(imported["ok"])
         plan = self.call("POST", "/api/plan/rebuild", {"daily_minutes": 55, "deadline": "2026-11-30"})

@@ -13,6 +13,43 @@ function defaultDate(days = 56) {
   return d.toISOString().slice(0, 10);
 }
 
+const MATERIAL_EXTENSIONS = new Set(["md", "markdown", "json", "txt"]);
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_TOTAL_CHARS = 180000;
+const MAX_FILES = 20;
+
+function fileExtension(name) {
+  return String(name || "").split(".").pop().toLowerCase();
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function flattenJSON(value, depth = 0) {
+  if (depth > 6) return "…";
+  if (value == null) return "无";
+  if (typeof value !== "object") return String(value);
+  const pad = "  ".repeat(depth);
+  if (Array.isArray(value)) {
+    if (!value.length) return `${pad}（空）`;
+    return value.map((item, i) => {
+      if (item && typeof item === "object") {
+        return `${pad}- 条目 ${i + 1}\n${flattenJSON(item, depth + 1)}`;
+      }
+      return `${pad}- ${String(item)}`;
+    }).join("\n");
+  }
+  return Object.entries(value).map(([key, item]) => {
+    if (item && typeof item === "object") {
+      return `${pad}${key}：\n${flattenJSON(item, depth + 1)}`;
+    }
+    return `${pad}${key}：${item == null ? "无" : String(item)}`;
+  }).join("\n");
+}
+
 export async function render(el, ctx, params) {
   window.scrollTo({ top: 0, behavior: "instant" });
   const catalog = await ctx.api.get("/api/packs");
@@ -23,6 +60,7 @@ export async function render(el, ctx, params) {
   let step = 1;
   let materialPack = null;
   let busy = false;
+  let files = [];
   let draft = {
     name: ctx.state.me?.user?.name || "",
     goalTitle: "",
@@ -63,6 +101,30 @@ export async function render(el, ctx, params) {
 
   function updateDots() {
     el.querySelectorAll("[data-dot]").forEach(d => d.classList.toggle("active", Number(d.dataset.dot) <= step));
+  }
+
+  function fileListHTML() {
+    if (!files.length) {
+      return `<div class="file-empty">还没有选择文件；也可以直接在下方粘贴文本。</div>`;
+    }
+    return files.map((f, i) => `
+      <div class="file-row">
+        <span class="file-kind">${escapeHTML(f.kind)}</span>
+        <span class="file-name" title="${escapeHTML(f.name)}">${escapeHTML(f.name)}</span>
+        <span class="file-meta">${formatBytes(f.size)} · ${f.chars.toLocaleString()} 字符</span>
+        <button class="file-remove" type="button" data-file-remove="${i}" aria-label="移除 ${escapeHTML(f.name)}">×</button>
+      </div>`).join("");
+  }
+
+  function refreshFiles() {
+    const list = body.querySelector("#ob-file-list");
+    if (list) list.innerHTML = fileListHTML();
+    const summary = body.querySelector("#ob-file-summary");
+    if (summary) {
+      summary.textContent = files.length
+        ? `${files.length} 个文件 · ${files.reduce((n, f) => n + f.chars, 0).toLocaleString()} 字符`
+        : "可多选";
+    }
   }
 
   function renderStep1() {
@@ -125,7 +187,18 @@ export async function render(el, ctx, params) {
           ${mode === "material" ? `
             <div class="field full"><label>材料标题</label><input class="input" id="ob-material-title" value="${escapeHTML(materialPack?.name || draft.materialTitle)}" placeholder="例如：第 3 章 导数与微分"></div>
             <div class="field"><label>学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
-            <div class="field full"><label>材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="把讲义、笔记或教材片段粘贴到这里。至少 60 个字符。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
+            <div class="field full">
+              <label>材料文件（可多选）</label>
+              <div class="file-drop" id="ob-drop" role="button" tabindex="0" aria-label="选择 Markdown、JSON 或 TXT 材料文件">
+                <span class="file-drop-icon">${icon("upload", 18)}</span>
+                <span class="file-drop-copy"><strong>拖入或选择 .md / .json / .txt</strong><span>多份文件会合并到同一个主题；单文件不超过 2 MB</span></span>
+                <span class="badge badge-muted" id="ob-file-summary">${files.length ? `${files.length} 个文件` : "可多选"}</span>
+                <input type="file" id="ob-files" accept=".md,.markdown,.json,.txt" multiple hidden>
+              </div>
+              <div class="file-list" id="ob-file-list">${fileListHTML()}</div>
+              <span class="hint">JSON 会按键值结构铺平成可读文本；文件与下方粘贴文本合计不超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符。</span>
+            </div>
+            <div class="field full"><label>材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="也可以把补充讲义、笔记或教材片段粘贴到这里。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
           ` : ""}
           <div class="field"><label>截止日期</label><input class="input" type="date" id="ob-deadline" value="${escapeHTML(draft.deadline)}"></div>
           <div class="field"><label>每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
@@ -147,6 +220,97 @@ export async function render(el, ctx, params) {
     const minutes = body.querySelector("#ob-minutes");
     const minutesLabel = body.querySelector("#ob-minutes-label");
     minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });
+
+    if (mode === "material") {
+      const drop = body.querySelector("#ob-drop");
+      const fileInput = body.querySelector("#ob-files");
+      const fileList = body.querySelector("#ob-file-list");
+
+      const addFiles = async (incoming) => {
+        const chosen = [...(incoming || [])];
+        if (!chosen.length) return;
+        const errors = [];
+        let added = 0;
+        for (const file of chosen) {
+          if (files.length >= MAX_FILES) {
+            errors.push(`最多合并 ${MAX_FILES} 个文件`);
+            break;
+          }
+          const ext = fileExtension(file.name);
+          if (!MATERIAL_EXTENSIONS.has(ext)) {
+            errors.push(`${file.name}：只支持 .md / .json / .txt`);
+            continue;
+          }
+          if (file.size > MAX_FILE_BYTES) {
+            errors.push(`${file.name}：超过 2 MB`);
+            continue;
+          }
+          try {
+            let content = await file.text();
+            if (ext === "json") {
+              try {
+                content = flattenJSON(JSON.parse(content));
+              } catch {
+                throw new Error("JSON 解析失败");
+              }
+            }
+            content = content.replace(/\r\n?/g, "\n").trim();
+            if (!content) throw new Error("文件为空");
+            const used = files.reduce((n, f) => n + f.chars, 0);
+            if (used + content.length > MAX_TOTAL_CHARS) {
+              throw new Error(`合并后超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符上限`);
+            }
+            files.push({ name: file.name, size: file.size, chars: content.length, kind: ext, text: content });
+            added += 1;
+          } catch (err) {
+            errors.push(`${file.name}：${err.message || "读取失败"}`);
+          }
+        }
+        if (added) {
+          refreshFiles();
+          const titleInput = body.querySelector("#ob-material-title");
+          if (titleInput && !titleInput.value.trim()) {
+            titleInput.value = files[0].name.replace(/\.[^.]+$/, "");
+          }
+          toast(`已加入 ${added} 个文件，将合并编译为同一个主题。`, "success", 3600);
+        }
+        if (errors.length) toast(errors[0], "error", 6000);
+      };
+
+      drop?.addEventListener("click", (event) => {
+        if (event.target === fileInput) return;
+        fileInput?.click();
+      });
+      drop?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          fileInput?.click();
+        }
+      });
+      ["dragenter", "dragover"].forEach(type => drop?.addEventListener(type, (event) => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        drop.classList.add("dragging");
+      }));
+      ["dragleave", "drop"].forEach(type => drop?.addEventListener(type, (event) => {
+        event.preventDefault();
+        drop.classList.remove("dragging");
+      }));
+      drop?.addEventListener("drop", (event) => addFiles(event.dataTransfer?.files));
+      fileInput?.addEventListener("change", () => {
+        addFiles(fileInput.files);
+        fileInput.value = "";
+      });
+      fileList?.addEventListener("click", (event) => {
+        const btn = event.target.closest("[data-file-remove]");
+        if (!btn) return;
+        const index = Number(btn.dataset.fileRemove);
+        if (!Number.isInteger(index)) return;
+        files.splice(index, 1);
+        refreshFiles();
+      });
+    }
+
     body.querySelector("[data-back]").addEventListener("click", renderStep1);
     body.querySelector("[data-submit]").addEventListener("click", async () => {
       if (busy) return;
@@ -166,12 +330,18 @@ export async function render(el, ctx, params) {
             await createGoal({ name, pack_id: materialPack.id, goal_title: goalTitle, deadline, daily_minutes: daily, level: draft.level });
             return;
           }
-          const text = body.querySelector("#ob-text").value.trim();
-          if (text.length < 60) throw new Error("材料太短，至少 60 个字符");
+          const pasted = body.querySelector("#ob-text").value.trim();
+          const documents = files.map(f => ({ name: f.name, text: f.text }));
+          const totalChars = files.reduce((n, f) => n + f.chars, 0) + pasted.length;
+          if (!documents.length && !pasted) throw new Error("请先上传材料文件，或粘贴一段文本");
+          if (totalChars < 60) throw new Error("材料太短，至少 60 个字符");
+          if (totalChars > MAX_TOTAL_CHARS) throw new Error(`材料超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符上限`);
           const materialTitle = body.querySelector("#ob-material-title").value.trim() || goalTitle;
           const subject = body.querySelector("#ob-subject").value.trim();
-          draft = { ...draft, materialTitle, subject, text };
-          const res = await ctx.api.post("/api/packs/compile", { title: materialTitle, subject, text, use_llm: true });
+          draft = { ...draft, materialTitle, subject, text: pasted };
+          const res = await ctx.api.post("/api/packs/compile", {
+            title: materialTitle, subject, text: pasted, documents, use_llm: true,
+          });
           materialPack = res.pack;
           if (res.warnings?.length) toast(res.warnings[0], "info", 5200);
           renderStep3();

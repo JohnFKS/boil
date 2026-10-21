@@ -772,12 +772,52 @@ def import_pack(payload: dict[str, Any]) -> dict[str, Any]:
     return {"pack": pack, "summary": pack_summary(pack)}
 
 
+MAX_MATERIAL_CHARS = 200_000
+
+
+def merge_material_documents(documents: list[Any] | None, text: str) -> tuple[str, list[dict[str, Any]]]:
+    docs: list[dict[str, Any]] = []
+    for i, raw in enumerate((documents or [])[:20]):
+        if not isinstance(raw, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(raw.get("name") or "")).strip()[:100]
+        content = str(raw.get("text") or "").replace("\r\n", "\n").strip()
+        if not content:
+            continue
+        docs.append({"name": name or f"材料 {i + 1}", "text": content, "chars": len(content)})
+    parts = []
+    for doc in docs:
+        if len(docs) > 1:
+            parts.append(f"## {doc['name']}\n\n{doc['text']}")
+        else:
+            parts.append(doc["text"])
+    pasted = (text or "").strip()
+    if pasted:
+        if docs:
+            parts.append(f"## 补充笔记\n\n{pasted}")
+        else:
+            parts.append(pasted)
+    merged = "\n\n".join(parts).strip()
+    if len(merged) > MAX_MATERIAL_CHARS:
+        raise ValueError(
+            f"材料过长（{len(merged):,} 字符），请压缩到 {MAX_MATERIAL_CHARS:,} 字符以内。"
+        )
+    return merged, docs
+
+
 def compile_preview(db: Database, title: str, subject: str, text: str,
-                    use_llm: bool = True, use_embeddings: bool = True) -> dict[str, Any]:
-    if len((text or "").strip()) < 60:
+                    use_llm: bool = True, use_embeddings: bool = True,
+                    documents: list[Any] | None = None) -> dict[str, Any]:
+    merged, docs = merge_material_documents(documents, text)
+    if len(merged) < 60:
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
-    pack, warnings = compile_material(title, subject, text, use_llm=use_llm,
+    pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
                                       use_embeddings=use_embeddings)
+    if docs:
+        pack.setdefault("source", {})["documents"] = [
+            {"name": d["name"], "chars": d["chars"]} for d in docs
+        ]
+        pack["source"]["material_chars"] = len(merged)
     save_user_pack(pack)
     return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings}
 

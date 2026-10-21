@@ -140,6 +140,7 @@ python3 run.py
 
 ## Markdown、Embedding 与数据备份
 
+- **多文件材料**：开始页支持一次拖入/选择多个 `.md`、`.json`、`.txt`，JSON 会按键值铺平成可读文本，所有文件合并到同一个主题后编译；文件清单可逐项移除，单文件 2 MB、合并 180,000 字符以内。
 - **Markdown 解析**：标题、列表、段落是结构真相源；有模型时可做更细的语义抽取。
 - **Embedding**：可接**硅基流动**或任意 OpenAI 兼容 `/embeddings`（推荐 `BAAI/bge-m3`，1024 维）；没有标题的材料用它做语义分组，语义搜索与“相关单元”也走这一层。批量请求、磁盘缓存、失败冷却、自动回退本地 `local-hash-256`，错误在设置页可见。
 - **Embedding 隐私**：配置云端后，参与分组/检索的文本会发往该端点；Key 只保存在本地 `data/embedding.json`（0600）。不配置就完全本地、离线。
@@ -199,6 +200,10 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Library](screenshots/library.png) | ![Onboarding](screenshots/onboarding.png) |
 
+| 多文件材料 | 编译预览 |
+|---|---|
+| ![Multi-file upload](screenshots/onboarding-files.png) | ![Compiled units](screenshots/onboarding-compiled.png) |
+
 | 第 0 档音频 | 极致对标 |
 |---|---|
 | ![Audio](screenshots/audio.png) | ![Benchmark](screenshots/benchmark.png) |
@@ -218,7 +223,7 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 ## 功能
 
 - **目标与路径**：截止日期、每日分钟数、前置 DAG、最少必要路径、暂存单元、动态重排。
-- **内容编译**：把 Markdown/纯文本编译成知识单元、探针、卡片；有标题时按结构切分，无标题时用本地向量做语义分组；有模型时做更细的结构抽取。
+- **内容编译**：把 Markdown/JSON/纯文本（支持多文件合并）编译成知识单元、探针、卡片；有标题时按结构切分，无标题时用本地向量做语义分组；有模型时做更细的结构抽取。
 - **知识地图**：可缩放/平移/筛选的 SVG 图谱；节点状态：未开始、学习中、已烧开、需复习。
 - **苏格拉底对话**：SSE 流式；一次一问；提示阶梯；阶段推进；结束生成四维证据报告。
 - **费曼挑战**：三种讲解对象；计时；六维评分；缺口、术语、参考讲解、追问。
@@ -404,7 +409,7 @@ python3 -m unittest discover -s tests -v
 
 - FSRS 新卡/复习/遗忘/保留率
 - 前置 DAG 规划与最少必要路径
-- 内容编译与 Pack 校验
+- 内容编译与 Pack 校验、多文件合并与来源记录
 - Pack 重复安装不重置 SRS
 - 苏格拉底流式对话、六轮收束、证据报告
 - 费曼评分、复习、洞察、重排、导出
