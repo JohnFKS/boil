@@ -11,6 +11,7 @@ from typing import Any
 
 from . import llm
 from .packs import PackError, derive_key_points, normalize_pack, validate_pack
+from .embeddings import semantic_groups
 from .utils import new_id, now_iso, slugify, split_cn
 
 PROBE_TEMPLATES = {
@@ -28,7 +29,7 @@ def _clean_line(line: str) -> str:
     return re.sub(r"^[\s>#*\-•]+", "", line).strip()
 
 
-def _split_sections(text: str) -> list[tuple[str, str]]:
+def _split_sections(text: str, use_embeddings: bool = True) -> list[tuple[str, str]]:
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return []
@@ -50,15 +51,18 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
     if len(paragraphs) <= 1:
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         paragraphs = lines
-    groups = []
-    chunk = []
-    for p in paragraphs:
-        chunk.append(p)
-        if len(chunk) >= 3 or len(" ".join(chunk)) > 700:
+    if use_embeddings and len(paragraphs) >= 4:
+        groups = semantic_groups(paragraphs, max_size=3, threshold=None)
+    else:
+        groups = []
+        chunk = []
+        for p in paragraphs:
+            chunk.append(p)
+            if len(chunk) >= 3 or len(" ".join(chunk)) > 700:
+                groups.append(chunk)
+                chunk = []
+        if chunk:
             groups.append(chunk)
-            chunk = []
-    if chunk:
-        groups.append(chunk)
     sections = []
     for i, group in enumerate(groups[:8]):
         body = "\n\n".join(group)
@@ -177,8 +181,8 @@ def _heuristic_unit(title: str, body: str, index: int, subject: str) -> dict[str
     return unit
 
 
-def compile_heuristic(title: str, subject: str, text: str) -> dict[str, Any]:
-    sections = _split_sections(text)
+def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool = True) -> dict[str, Any]:
+    sections = _split_sections(text, use_embeddings=use_embeddings)
     if not sections:
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
     units = [_heuristic_unit(t, b, i, subject) for i, (t, b) in enumerate(sections[:8])]
@@ -277,7 +281,8 @@ def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict
 
 
 def compile_material(title: str, subject: str, text: str,
-                     use_llm: bool = True) -> tuple[dict[str, Any], list[str]]:
+                     use_llm: bool = True,
+                     use_embeddings: bool = True) -> tuple[dict[str, Any], list[str]]:
     title = (title or "未命名材料").strip()
     subject = (subject or "").strip()
     warnings: list[str] = []
@@ -297,7 +302,7 @@ def compile_material(title: str, subject: str, text: str,
             return pack, warnings
         except Exception as exc:
             warnings.append(f"真实模型编译失败，已回退本地编译器：{str(exc)[:180]}")
-    pack = compile_heuristic(title, subject, text)
+    pack = compile_heuristic(title, subject, text, use_embeddings=use_embeddings)
     errors = validate_pack(pack)
     if errors:
         raise PackError("本地编译器生成的内容包未通过校验", errors)

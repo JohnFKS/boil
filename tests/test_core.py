@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import config, feynman, llm, mastery, planner, services, socratic
+from boil import backup, config, embeddings, feynman, llm, mastery, planner, services, socratic
 from boil.compiler import compile_heuristic, compile_material
 from boil.db import Database
 from boil.packs import (all_available_packs, install_pack, validate_pack)
@@ -24,6 +24,9 @@ class TempCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="boil-test-")
         base = Path(self.tmp.name)
+        self._old_emb = (embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE)
+        embeddings._CONFIG_OVERRIDE = base / "embedding.json"
+        embeddings._CACHE_OVERRIDE = base / "embedding_cache.json"
         self._old = {
             "PACKS_DIR": config.PACKS_DIR,
             "DATA_DIR": config.DATA_DIR,
@@ -42,6 +45,7 @@ class TempCase(unittest.TestCase):
         self.db.close()
         for key, value in self._old.items():
             setattr(config, key, value)
+        embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE = self._old_emb
         self.tmp.cleanup()
 
     def get_pack(self):
@@ -160,6 +164,17 @@ class CompilerTest(TempCase):
             self.assertTrue(unit["cards"])
         self.assertTrue(any("连续" in u["title"] for u in pack["units"]))
 
+    def test_semantic_group_without_headings(self):
+        text = (
+            "极限是趋近过程，不是到达。连续要求极限存在且等于函数值。\n\n"
+            "导数描述函数的变化率，可导必连续。\n\n"
+            "矩阵的秩是线性无关列的最大数量。\n\n"
+            "行列式为零则矩阵不可逆。"
+        )
+        pack = compile_heuristic("无标题材料", "数学", text, use_embeddings=True)
+        self.assertGreaterEqual(len(pack["units"]), 2)
+        self.assertEqual(validate_pack(pack), [])
+
     def test_compile_material_without_llm(self):
         pack, warnings = compile_material("测试", "数学", "## 概念\n这是核心概念。\n- 步骤一\n注意边界。", use_llm=False)
         self.assertTrue(validate_pack(pack) == [])
@@ -268,6 +283,53 @@ class ServiceTest(TempCase):
         # no duplicate cards
         count = self.db.scalar("SELECT COUNT(*) FROM cards WHERE unit_id=?", (before["unit_id"],), 0)
         self.assertEqual(count, 2)
+
+    def test_notes_backup_and_semantic_search(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        notes = services.save_unit_note(self.db, "local", unit_id, "mnemonic", "修路压路基")
+        self.assertEqual(notes["mnemonic"]["content"], "修路压路基")
+        detail = services.unit_detail(self.db, "local", unit_id)
+        self.assertEqual(detail["notes"]["mnemonic"]["content"], "修路压路基")
+        self.assertTrue(detail["related"])
+        queue = services.review_queue(self.db, "local")
+        self.assertTrue(queue["cards"])
+        self.assertEqual(queue["cards"][0]["mnemonic"], "修路压路基")
+        services.rate_card(self.db, "local", queue["cards"][0]["id"], 3, 1000)
+        found = services.search(self.db, "local", "神经回路")
+        self.assertTrue(found["units"])
+        self.assertEqual(found["engine"], "local-hash-256")
+
+        export = services.export_data(self.db, "local")
+        self.assertIn("unit_notes", export)
+        self.assertTrue(export["boil_records"])
+        other = Database(Path(self.tmp.name) / "import.db")
+        try:
+            result = backup.import_backup(other, "local", export, "merge")
+            self.assertGreaterEqual(result["goals"], 1)
+            self.assertGreaterEqual(result["units"], 8)
+            self.assertGreaterEqual(result["notes"], 1)
+            self.assertGreaterEqual(result["records"], 1)
+            dash = services.dashboard(other, "local")
+            self.assertTrue(dash["has_goal"])
+            imported = services.unit_detail(other, "local", unit_id)
+            self.assertEqual(imported["notes"]["mnemonic"]["content"], "修路压路基")
+            self.assertTrue(services.insights(other, "local")["records"])
+        finally:
+            other.close()
+
+        # replace 模式：先清空，再恢复备份
+        services.onboarding(self.db, {
+            "name": "临时", "pack_id": "boil.xueshen.learning",
+            "goal_title": "临时目标", "daily_minutes": 20,
+        })
+        self.assertGreaterEqual(len(services.list_goals(self.db, "local")), 2)
+        replaced = backup.import_backup(self.db, "local", export, "replace")
+        self.assertEqual(replaced["mode"], "replace")
+        goals = services.list_goals(self.db, "local")
+        self.assertEqual(len(goals), len(export["goals"]))
+        restored = services.unit_detail(self.db, "local", unit_id)
+        self.assertEqual(restored["notes"]["mnemonic"]["content"], "修路压路基")
 
     def test_insights_catalog_search_export_replan(self):
         out = self.onboard()

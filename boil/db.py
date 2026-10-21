@@ -247,6 +247,17 @@ CREATE TABLE IF NOT EXISTS study_days (
   PRIMARY KEY (user_id, day)
 );
 
+CREATE TABLE IF NOT EXISTS unit_notes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'note',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(user_id, unit_id, kind)
+);
+
 CREATE TABLE IF NOT EXISTS boil_records (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -264,6 +275,7 @@ CREATE TABLE IF NOT EXISTS boil_records (
 
 CREATE INDEX IF NOT EXISTS idx_units_goal ON units(goal_id, order_index);
 CREATE INDEX IF NOT EXISTS idx_boil_records_user ON boil_records(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_unit_notes_user ON unit_notes(user_id, unit_id);
 CREATE INDEX IF NOT EXISTS idx_relations_goal ON relations(goal_id);
 CREATE INDEX IF NOT EXISTS idx_probes_unit ON probes(unit_id);
 CREATE INDEX IF NOT EXISTS idx_cards_user_due ON cards(user_id, due_at);

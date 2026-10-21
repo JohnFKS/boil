@@ -53,6 +53,8 @@ export async function render(el, ctx, params) {
   const pnText = pn.source
     ? (pn.missing?.length ? `标准步骤 ${pn.total || "—"} 步，最近报告还缺 ${pn.missing.length} 步。` : `最近报告没有发现缺口；用极致对标验收。`)
     : "还没有对话或讲解证据。先预消化，再开始苏格拉底。";
+  const notes = data.notes || {};
+  const related = data.related || [];
   const cards = data.cards || [];
   const probes = data.probes || [];
   const sessions = data.sessions || [];
@@ -174,6 +176,15 @@ export async function render(el, ctx, params) {
         </div>
 
         <div class="card side-card">
+          <div class="side-label">速记与我的笔记</div>
+          <div class="field mt-2"><label>速记（复习线索）</label><textarea class="textarea" id="note-mnemonic" style="min-height:64px" placeholder="口诀、谐音、类比、画面感…">${escapeHTML(notes.mnemonic?.content || "")}</textarea></div>
+          <button class="btn btn-ghost btn-sm mt-2" data-save-note="mnemonic">保存速记</button>
+          <div class="field mt-3"><label>我的笔记</label><textarea class="textarea" id="note-note" style="min-height:80px" placeholder="把这一单元的边界、反例、自己的话记下来。">${escapeHTML(notes.note?.content || "")}</textarea></div>
+          <button class="btn btn-ghost btn-sm mt-2" data-save-note="note">保存笔记</button>
+          <div class="faint tiny mt-2">来自 mem 的速记/批注思路：速记会在复习卡上作为可选线索出现。</div>
+        </div>
+
+        <div class="card side-card">
           <div class="side-label">六种模式</div>
           <div class="side-actions">
             <button class="btn btn-ghost btn-block" data-audio>${icon("volume", 15)} 听讲 · 音频浸泡</button>
@@ -186,6 +197,7 @@ export async function render(el, ctx, params) {
         </div>
 
         ${data.relations?.length ? `<div class="card side-card"><div class="side-label">关系</div><div class="mt-2">${data.relations.map(r => `<div class="card-mini"><span>${r.kind === "prerequisite" ? "前置" : r.kind}</span><span class="due">${escapeHTML(r.from_title || "")} → ${escapeHTML(r.to_title || "")}</span></div>`).join("")}</div></div>` : ""}
+        ${related.length ? `<div class="card side-card"><div class="between"><span class="side-label">相关单元</span><span class="badge badge-violet">语义相似</span></div><div class="mt-2">${related.map(r => `<a class="card-mini" href="#/unit/${escapeAttr(r.id)}"><span style="min-width:0">${escapeHTML(truncate(r.title, 26))}</span><span class="due">${Math.round((r.score || 0) * 100)}%</span></a>`).join("")}</div></div>` : ""}
 
         <div class="card side-card">
           <div class="side-label">来源</div>
@@ -202,6 +214,19 @@ export async function render(el, ctx, params) {
 
   el.querySelectorAll("[data-socratic]").forEach(btn => btn.addEventListener("click", () => ctx.startSocratic(u.id)));
   el.querySelectorAll("[data-audio]").forEach(btn => btn.addEventListener("click", () => openAudioModal(ctx, u)));
+  el.querySelectorAll("[data-save-note]").forEach(btn => btn.addEventListener("click", async () => {
+    const kind = btn.dataset.saveNote;
+    const ta = el.querySelector(kind === "mnemonic" ? "#note-mnemonic" : "#note-note");
+    btn.disabled = true;
+    try {
+      await ctx.api.post(`/api/units/${encodeURIComponent(u.id)}/notes`, { kind, content: ta.value });
+      toast(kind === "mnemonic" ? "速记已保存。" : "笔记已保存。", "success");
+    } catch (e) {
+      toast(e.message || "保存失败", "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }));
   el.querySelectorAll("[data-probe] .probe-head").forEach(head => {
     head.addEventListener("click", () => head.parentElement.classList.toggle("open"));
   });

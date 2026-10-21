@@ -157,12 +157,21 @@ Base URL：`http://127.0.0.1:7860`
 }
 ```
 
+### `POST /api/units/{unit_id}/notes`
+
+```json
+{"kind": "mnemonic", "content": "复习像压路基，每次提取都压实一点"}
+```
+
+`kind`：`mnemonic` / `note`。内容为空会删除该条。返回最新的 notes 字典。
+
 ### `GET /api/units/{unit_id}`
 
 返回：
 
 - `unit`（含 steps/boundaries/misconceptions/faq/key_points/source_ref）
 - `mastery`、`status`、`heat`、`heat_label`、`pn`、`records`
+- `notes`（速记/笔记）、`related`（语义相关单元）
 - `probes`、`cards`、`sessions`、`relations`、`attempts`
 
 ---
@@ -531,6 +540,28 @@ data: {}
   Dots 可用 `{"chat_template_kwargs":{"enable_thinking":false}}` 控制深度思考。
 - 响应为新的 public config；Key 永远不会回传。
 
+### `GET /api/settings/embeddings`
+
+返回 Embedding 配置（Key 只给掩码）；`mode` 为 `cloud` / `fallback` / `local`，`last_error` 可见。
+
+### `POST /api/settings/embeddings`
+
+```json
+{
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "BAAI/bge-m3",
+  "api_key": "sk-...",
+  "timeout": 30
+}
+```
+
+- `api_key` 省略：保持现有 Key；空字符串：清空并回退本地向量。
+- 返回公开配置，不含 Key。
+
+### `POST /api/settings/embeddings/test`
+
+实测一次云端 `/embeddings`，返回维度、耗时与模型；失败返回 `400 embedding_error`，不会回传 Key。
+
 ### `POST /api/settings/llm/test`
 
 发送一个极短的 ping。成功：
@@ -548,8 +579,10 @@ data: {}
 ### `GET /api/search?q=学习`
 
 ```json
-{"units": [], "packs": []}
+{"units": [], "packs": [], "engine": "local-hash-256"}
 ```
+
+单元结果带 `score`；`engine` 为实际向量模型名（如 `BAAI/bge-m3`，失败降级时为 `local-hash-256`）。
 
 ### `GET /api/events?after=0&limit=30`
 
@@ -557,8 +590,19 @@ data: {}
 
 ### `GET /api/export`
 
-下载 JSON 文件（`Content-Disposition: attachment`），包含目标、计划、Pack、单元、卡片、复习日志、会话、消息、证据、掌握度、解释、事件、学习日。
+下载 JSON 文件（`Content-Disposition: attachment`），包含目标、计划、Pack、单元、卡片、复习日志、会话、消息、证据、掌握度、解释、火候记录、速记笔记、事件、学习日。
 **不包含** API Key。
+
+### `POST /api/import`
+
+```json
+{"data": {"goals": [], "units": [], "...": "..."}, "mode": "merge"}
+```
+
+- `mode`：`merge`（按 ID 合并/更新）或 `replace`（先清空当前用户数据再导入）。
+- `replace` 必须带 `"confirm": "IMPORT"`。
+- 返回各表导入计数与 `goals/units/cards/records/notes` 摘要。
+- 只导入白名单表与列；`llm` 配置和 API Key 永远不会导入。
 
 ### `POST /api/reset`
 

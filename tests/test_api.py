@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import config, llm
+from boil import config, embeddings, llm
 from boil.db import Database
 from boil.server import App, Handler
 from http.server import ThreadingHTTPServer
@@ -37,6 +37,9 @@ class ApiTest(unittest.TestCase):
         config.LLM_STATE_PATH = base / "llm_state.json"
         config.TOKEN = ""
         config.PACKS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.old_emb = (embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE)
+        embeddings._CONFIG_OVERRIDE = base / "embedding.json"
+        embeddings._CACHE_OVERRIDE = base / "embedding_cache.json"
         cls.db = Database(base / "api.db")
         cls.app = App(cls.db)
         Handler.app = cls.app
@@ -55,6 +58,7 @@ class ApiTest(unittest.TestCase):
         Handler.app = None
         for key, value in cls.old.items():
             setattr(config, key, value)
+        embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE = cls.old_emb
         cls.tmp.cleanup()
 
     def call(self, method, path, payload=None, raw=False):
@@ -201,6 +205,28 @@ class ApiTest(unittest.TestCase):
         unit = self.call("GET", f"/api/units/{type(self).unit_id}")["data"]
         self.assertIn("heat_label", unit)
         self.assertIn("missing", unit["pn"])
+        self.assertIn("related", unit)
+
+    def test_09_notes_import_and_related(self):
+        notes = self.call("POST", f"/api/units/{type(self).unit_id}/notes",
+                          {"kind": "mnemonic", "content": "把复习想成压路基"})
+        self.assertTrue(notes["ok"])
+        self.assertEqual(notes["data"]["mnemonic"]["content"], "把复习想成压路基")
+        unit = self.call("GET", f"/api/units/{type(self).unit_id}")["data"]
+        self.assertEqual(unit["notes"]["mnemonic"]["content"], "把复习想成压路基")
+        q = self.call("GET", "/api/review?limit=5")["data"]
+        self.assertTrue(any(c.get("mnemonic") == "把复习想成压路基" for c in q["cards"]))
+        search = self.call("GET", "/api/search?q=" + urllib.parse.quote("神经回路"))["data"]
+        self.assertEqual(search["engine"], "local-hash-256")
+        self.assertTrue(search["units"])
+        r, body = self.call("GET", "/api/export", raw=True)
+        exported = json.loads(body)
+        self.assertIn("unit_notes", exported)
+        res = self.call("POST", "/api/import", {"data": exported, "mode": "merge"})
+        self.assertTrue(res["ok"])
+        self.assertGreaterEqual(res["data"]["units"], 8)
+        self.assertGreaterEqual(res["data"]["notes"], 1)
+        self.assertGreaterEqual(res["data"]["goals"], 1)
 
     def test_07_unknown_route(self):
         try:

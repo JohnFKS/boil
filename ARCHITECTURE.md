@@ -34,6 +34,8 @@ boil/
 │   ├── planner.py             # 前置 DAG + 时间预算 + 最少必要路径
 │   ├── heat.py               # T 温度 / PN 缺口 / BoilRecord
 │   ├── advisor.py            # 强度阶梯推荐器 v0（规则 + 理由 + 成本）
+│   ├── embeddings.py         # 云端/本地向量：语义分组/搜索/相关单元
+│   ├── backup.py             # 完整备份导入（表/列白名单）
 │   ├── socratic.py            # 苏格拉底状态机 + 流式 + 报告
 │   ├── feynman.py             # 费曼六维评分 + 缺口
 │   ├── mastery.py             # 四维证据聚合
@@ -63,6 +65,8 @@ boil/
 - **Session / Message**：对话与讲解的容器。
 - **T / PN / BoilRecord**：火候状态、必要步骤缺口、每次模式尝试的前后温度与结果。
 - **Advice**：一个带理由、成本、目标与档位的下一步建议；采纳/否决进入事件日志。
+- **UnitNote**：速记/笔记，来自 mem 的速记与批注思路。
+- **Backup**：带白名单的完整 JSON 导出/导入；API Key 永不进入备份。
 - **Event**：所有上述行为的追加式记录。
 
 内核不包含任何具体学科词汇。它不知道“极限”“二重积分”或“考研”。
@@ -204,7 +208,15 @@ T 是产品状态量，不是科学测量值。阈值 40/80/100 用于推荐与�
 
 约束：每场只给一个建议；必须给理由；可否决且记账。
 
-### 5.4 BoilRecord
+### 5.4 Markdown 解析与 Embedding
+
+- **有标题的 Markdown**：标题/列表是结构真相源，优先按标题切分；LLM 可在配置时做更细抽取。
+- **无标题材料**：`embeddings.semantic_groups` 用向量把相邻主题段落聚成单元；这是“辅助切分”，不替代结构解析。
+- **向量引擎**：可接硅基流动/OpenAI 兼容 `/embeddings`（推荐 `BAAI/bge-m3`，1024 维）；批量 32 条、磁盘缓存、按 index 排序、60 秒失败冷却；未配置或失败时回退本地 `local-hash-256`。
+- **语义搜索/相关单元**：同一向量层用于 `/api/search` 与单元页“相关单元”；设置页显示模式、维度、缓存/调用统计和最后一次错误。
+- **隐私边界**：云端启用后，参与分组/检索的文本会发往所配端点；Key 只存 `data/embedding.json`（0600），不进入备份。
+
+### 5.5 BoilRecord
 
 `socratic` 报告、`feynman`/`benchmark` 评分、`recall` 评分都会写入 `boil_records`：
 
@@ -286,6 +298,8 @@ score = old * (1 - alpha) + evidence * alpha
 ## 11. 可扩展点
 
 - 新增学科：写一个 Subject Pack + 内容包 + 评测器。
+- 替换 embedding：`embeddings.py` 的接口保持稳定，可接真正的语义模型。
+- 新增导入格式：`backup.py` 的表白名单与列过滤可扩展。
 - 新增评分方式：在 `feynman.py` 的维度/权重或独立 Evaluator Pack 中扩展。
 - 新增对话策略：替换 `prompts/socratic_system.md` 或引入 Skill Pack。
 - 新增卡片类型：扩展 Probe kind 与 Scheduler 的探针选择策略。
@@ -301,6 +315,10 @@ score = old * (1 - alpha) + evidence * alpha
 - LLM：本地假端点的普通/流式/JSON/失败可见。
 - live 服务：假端点返回符合 schema 的报告/评分/内容包。
 - 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。
+- 备份：导出 → 合并导入 → 目标/单元/卡片/火候记录/速记一致。
+- Notes：速记保存 → 复习队列带出 mnemonic。
+- Embeddings：本地/云端语义分组、语义搜索、相关单元召回；批量、缓存、失败冷却、降级与错误可见。
+- 数学：数学包公式内容 + KaTeX 本地资源；真实浏览器检查 `.katex`。
 - Advisor：新单元、苏格拉底、费曼、对标、回测优先、低时间音频、前置边界、否决记账。
 - 火候：T 衰减、到期惩罚、PN 缺口、BoilRecord 升温/降温。
 - Pack 质量：原子率、四类探针覆盖、DAG 无环。

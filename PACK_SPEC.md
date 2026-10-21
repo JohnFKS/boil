@@ -225,7 +225,14 @@ python3 tools/import_examgen.py \
 
 原始 OCR 教辅 `date1/` **不会**被导入或分发。
 
-## 9. 自定义 Skill Pack（路线图）
+## 9. Markdown 与数学
+
+- JSON Pack 支持 Markdown 文本；前端会安全渲染基础 Markdown。
+- 行内公式 `$...$`、块公式 `$$...$$`、`\(...\)`、`\[...\]` 由本地 KaTeX 渲染；内容包不需要额外字段。
+- 无标题的纯文本材料会用本地哈希向量做语义分组；有 Markdown 标题时仍按标题结构切分，避免“语义分组覆盖结构”。
+- 数学内容发布前仍需人工核对等价性与边界；KaTeX 只负责显示，不负责正确性。
+
+## 10. 自定义 Skill Pack（路线图）
 
 当前 v1 的提示词在 `prompts/`。未来 Skill Pack 将包含：
 

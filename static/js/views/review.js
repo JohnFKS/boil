@@ -132,6 +132,7 @@ export async function render(el, ctx, params) {
         <div class="flashcard-label">先回忆，再翻面</div>
         <div class="flashcard-text">${escapeHTML(card.front)}</div>
         <div class="flashcard-unit">${escapeHTML(card.unit_title || "")} · ${card.state === "new" ? "新卡" : "到期复习"}</div>
+        ${card.mnemonic ? `<div class="mt-2"><button class="hint-chip" id="mnemonic-btn">${icon("hint", 12)} 速记线索</button><div class="callout gold mt-2" id="mnemonic-box" style="display:none;text-align:left">${escapeHTML(card.mnemonic)}</div></div>` : ""}
         <div class="flashcard-divider"></div>
         <button class="btn btn-primary btn-lg mt-3" id="reveal-btn">${icon("eye", 16)} 显示答案</button>
         <div class="faint tiny mt-2">空格键也可以</div>
@@ -139,6 +140,7 @@ export async function render(el, ctx, params) {
       <div class="flashcard-back" id="flash-back" style="display:none">
         <div class="flashcard-label">答案 · ${card.reps ? `已复习 ${card.reps} 次` : "第一次学习"}</div>
         <div class="flashcard-text prose">${renderMarkdown(card.back)}</div>
+        ${card.mnemonic ? `<div class="callout gold mt-3" style="text-align:left;font-size:11px">速记：${escapeHTML(card.mnemonic)}</div>` : ""}
         <div class="flashcard-unit">${escapeHTML(card.unit_title || "")}</div>
       </div>
     </div>
@@ -151,6 +153,10 @@ export async function render(el, ctx, params) {
     </div>
     <div class="faint tiny mt-2" style="text-align:center">评分后，系统会计算下一次到期时间；选“记得”不等于真的记得。</div>`;
     document.getElementById("reveal-btn")?.addEventListener("click", reveal);
+    document.getElementById("mnemonic-btn")?.addEventListener("click", () => {
+      const box = document.getElementById("mnemonic-box");
+      if (box) box.style.display = box.style.display === "none" ? "block" : "none";
+    });
     document.querySelectorAll("[data-rate]").forEach(btn => btn.addEventListener("click", () => rate(Number(btn.dataset.rate))));
     ctx.renderMath(document.getElementById("flash-back"));
     updateProgress();

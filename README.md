@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-38%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-47%20passing-38d6bd?style=flat-square)](#测试)
 
 ![Boil Dashboard](screenshots/dashboard.png)
 
@@ -98,6 +98,20 @@ Dots 默认开启深度思考；预设为了让苏格拉底对话保持低延迟
 需要更强的推理时，把高级参数改为 `{"chat_template_kwargs":{"enable_thinking":true}}` 并保存。
 Key 只保存在本机 `data/llm.json`，不会进入 Git、导出包或前端代码。
 
+#### 硅基流动 Embedding
+
+设置 → **语义检索（Embedding）**：
+
+```text
+Base URL: https://api.siliconflow.cn/v1
+Model:    BAAI/bge-m3
+```
+
+填写 Key 后保存并点“测一次语义检索”。也可以使用环境变量：
+`BOIL_EMBEDDING_KEY` / `BOIL_EMBEDDING_BASE_URL` / `BOIL_EMBEDDING_MODEL`。
+不配置时使用本地 `local-hash-256`；云端失败会进入 60 秒冷却并降级本地，设置页会显示最后一次错误。
+Embedding Key 单独保存在 `data/embedding.json`（0600），不会进入 Git/导出包。
+
 ### Docker
 
 ```bash
@@ -119,6 +133,15 @@ python3 run.py
 还不是多租户 SaaS，详见 [SECURITY.md](SECURITY.md)。
 
 ---
+
+## Markdown、Embedding 与数据备份
+
+- **Markdown 解析**：标题、列表、段落是结构真相源；有模型时可做更细的语义抽取。
+- **Embedding**：可接**硅基流动**或任意 OpenAI 兼容 `/embeddings`（推荐 `BAAI/bge-m3`，1024 维）；没有标题的材料用它做语义分组，语义搜索与“相关单元”也走这一层。批量请求、磁盘缓存、失败冷却、自动回退本地 `local-hash-256`，错误在设置页可见。
+- **Embedding 隐私**：配置云端后，参与分组/检索的文本会发往该端点；Key 只保存在本地 `data/embedding.json`（0600）。不配置就完全本地、离线。
+- **数学公式**：`$...$`、`$$...$$`、`\(...\)`、`\[...\]` 由本地 KaTeX 渲染，浅色/深色主题均已验证。
+- **数据备份**：设置 → 数据 → 导出全部数据 / 导入备份；支持合并与替换；导出包含目标、单元、卡片、复习日志、对话、解释、火候记录和速记，API Key 永不进入备份。
+- **速记**：来自 mem 的小功能；单元页可写口诀/类比/笔记，复习卡可显示可选速记线索。
 
 ## 火候：不只给工具，给“下一档”
 
@@ -175,12 +198,18 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Audio](screenshots/audio.png) | ![Benchmark](screenshots/benchmark.png) |
 
+### 数学公式
+
+![Math formula](screenshots/math-formula.png)
+
+数学包中的圆盘法/柱壳法公式用 KaTeX 渲染；浏览器实测 `.katex` 节点为 4 个，浅色与深色主题都验证过对比度。
+
 ---
 
 ## 功能
 
 - **目标与路径**：截止日期、每日分钟数、前置 DAG、最少必要路径、暂存单元、动态重排。
-- **内容编译**：把 Markdown/纯文本编译成知识单元、探针、卡片；有模型时做结构抽取，无模型时做确定性切分。
+- **内容编译**：把 Markdown/纯文本编译成知识单元、探针、卡片；有标题时按结构切分，无标题时用本地向量做语义分组；有模型时做更细的结构抽取。
 - **知识地图**：可缩放/平移/筛选的 SVG 图谱；节点状态：未开始、学习中、已烧开、需复习。
 - **苏格拉底对话**：SSE 流式；一次一问；提示阶梯；阶段推进；结束生成四维证据报告。
 - **费曼挑战**：三种讲解对象；计时；六维评分；缺口、术语、参考讲解、追问。
@@ -190,6 +219,10 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 - **Advisor v0**：沿强度阶梯只推进一步；理由可解释；支持时间预算、接受与否决记账。
 - **强度模式**：第 0 档音频浸泡、第 1 档预消化、第 2 档苏格拉底、第 3 档回测、第 4 档费曼、非档位极致对标。
 - **Pack 质量门禁**：原子率、四类探针覆盖率、DAG 无环，在内容库直接可见。
+- **数据备份**：一键导出/导入全部学习数据；支持合并或替换，API Key 永不进入备份。
+- **速记与笔记**：来自 mem 的速记思路；单元页可写口诀/类比/笔记，复习卡按需显示速记线索。
+- **语义层**：可选硅基流动 BAAI/bge-m3；无标题材料语义分组、语义搜索、相关单元；失败自动降级本地哈希向量。
+- **数学公式**：Markdown 中的 `$...$` / `$$...$$` 由本地 KaTeX 渲染，已用真实浏览器验证。
 - **内容包（Learning Pack）**：安装/版本/幂等；更新内容不重置学习进度；JSON 导入/导出。
 - **本地优先**：SQLite；数据导出；API Key 本地存储；无强制账号。
 - **模型无关**：OpenAI 兼容端点；普通 + 流式 + JSON 模式；失败可见。
@@ -325,7 +358,7 @@ curl -X POST http://127.0.0.1:7860/api/onboarding \
 ## 测试
 
 ```bash
-# 38 项单元 / 集成 / HTTP / SSE / LLM 网关测试（stdlib unittest）
+# 47 项单元 / 集成 / HTTP / SSE / LLM 网关测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -343,6 +376,10 @@ python3 -m unittest discover -s tests -v
 - HTTP REST + SSE + 静态资源 + 错误码
 - 真实模型网关（假端点）：普通、流式、JSON 模式、自定义认证头、失败可见
 - live 服务路径：苏格拉底、费曼、编译器
+- 数据备份导出/合并导入、速记笔记、复习卡速记线索
+- 本地/硅基流动 Embedding 语义分组、语义搜索、相关单元
+- 远端 Embedding 批量、缓存、失败冷却、降级与错误可见
+- 数学包公式内容与 KaTeX 资源检查
 
 浏览器验收（需要 Chromium，且服务已在 7861 运行）：
 
@@ -395,6 +432,8 @@ python3 tools/browser_check.py
 - 苏格拉底/费曼的提示词与评分器是 v1，仍需要更大规模的效果验证。
 - T 与 Advisor 是规则版产品启发式，不是学习科学定论；需要在真实数据上校准阈值与成本模型。
 - BoilRecord 已落库，但尚未做策略学习；“建议采纳/否决”数据需要积累后再训练。
+- 云端 Embedding 会把参检文本发往所配端点；不配置时使用本地哈希向量。
+- 数据导入是单用户备份恢复，不是多租户迁移；替换导入会清空当前数据。
 - 没有内置学习效果随机对照实验；路线图中有“学习效果基准”。
 - 音频浸泡、移动原生 App、Pack 市场尚未实现。
 - 内容版权：数学包来自作者生成的模板结构；原始教辅 OCR（`date1/`）未包含。再分发前请自行确认来源权利。

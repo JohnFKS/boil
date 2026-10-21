@@ -21,6 +21,14 @@ if str(ROOT) not in sys.path:
 from boil.packs import derive_key_points, normalize_pack, validate_pack  # noqa: E402
 from boil.utils import split_cn  # noqa: E402
 
+FORMULA_PATCHES = {
+    "T-HS-142-I": "；例如绕 x 轴的圆盘法 $V=\\pi\\int_a^b [f(x)]^2\\,dx$，柱壳法 $V=2\\pi\\int_a^b x\\,|f(x)|\\,dx$。",
+    "T-HS-155-I": "：$\\lim_{\\max\\Delta x_i\\to 0}\\sum_{i=1}^n f(\\xi_i)\\Delta x_i=\\int_a^b f(x)\\,dx$。",
+    "T-HS-122-I": "：$\\int_{-a}^{a} f(x)\\,dx=2\\int_0^a f_{\\mathrm{even}}(x)\\,dx$，奇函数项直接归零。",
+    "T-HS-131-I": "：构造 $F(x)=\\int_a^x f(t)\\,dt$，用 $F'(x)$ 的符号判断单调性；也可用 $\\int_a^b f(x)g(x)\\,dx$ 的配对放缩。",
+    "T-HS-43-I": "：$\\frac{d}{dx}\\int_{a(x)}^{b(x)} f(t)\\,dt=f(b(x))b'(x)-f(a(x))a'(x)$。",
+}
+
 ANALOGIES = {
     "T-HS-43-I": "把定积分看成一个数，就像方程里的未知常数；参数藏在积分号里时，先把它请到上限，再逐层求导。",
     "T-HS-122-I": "先看结构的对称性，就像整理房间先按柜子分类；能免算的，绝不动手。",
@@ -122,6 +130,8 @@ def make_unit(title: str, body: str, index: int, source_file: str) -> dict | Non
     essence = table_value(body, "核心本质")
     if not essence:
         return None
+    if tid in FORMULA_PATCHES:
+        essence = essence.rstrip("。") + FORMULA_PATCHES[tid]
     scope = table_value(body, "适用范围")
     steps = numbered_items(subsection(body, "标准解题步骤"))
     bounds_raw = bullet_items(subsection(body, "失效边界"))

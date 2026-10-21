@@ -1322,3 +1322,13 @@ ul, ol { margin: 0; padding: 0; }
   .hero-visual { display: none; }
   .hero { padding: 22px; }
 }
+
+/* light theme essence card: keep formulas readable */
+[data-theme="light"] .essence-card {
+  background:
+    radial-gradient(520px 300px at 100% 0%, rgba(217,96,46,0.10), transparent 62%),
+    linear-gradient(150deg, #fffdf8, #f4e9da);
+  border-color: rgba(217,96,46,0.2);
+}
+.essence-text { color: var(--text); }
+.essence-text .katex, .essence-text .katex-display { color: var(--text); }

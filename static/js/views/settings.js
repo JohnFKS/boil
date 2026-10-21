@@ -9,6 +9,7 @@ function providerChips(providers) {
 
 export async function render(el, ctx, params) {
   const cfg = await ctx.api.get("/api/settings/llm");
+  const emb = await ctx.api.get("/api/settings/embeddings");
   const goals = await ctx.api.get("/api/goals");
   const goal = goals.active_goal;
   const health = await ctx.api.get("/api/health");
@@ -64,6 +65,32 @@ export async function render(el, ctx, params) {
         </div>
 
         <div class="card settings-card">
+          <div class="between">
+            <div><h3>语义检索（Embedding）</h3><div class="sub">有标题的 Markdown 仍按结构解析；无标题材料、语义搜索与相关单元使用向量。</div></div>
+            <span class="badge ${emb.mode === "cloud" ? "badge-teal" : emb.mode === "fallback" ? "badge-ember" : "badge-gold"}">${emb.mode === "cloud" ? "云端" : emb.mode === "fallback" ? "降级本地" : "本地"}</span>
+          </div>
+          <div class="llm-status ${emb.mode === "cloud" ? "live" : ""} mt-3">
+            <span class="dot"></span>
+            <span>${emb.configured ? `配置：<strong>${escapeHTML(emb.model)}</strong>${emb.dim ? ` · ${emb.dim} 维` : ""}${emb.mode === "fallback" ? " · 云端失败，已降级本地哈希向量" : ""}` : "未配置云端 Embedding，使用本地哈希向量（离线、零依赖）。"}</span>
+          </div>
+          ${emb.last_error ? `<div class="error-box"><strong>上次 Embedding 调用失败：</strong>${escapeHTML(emb.last_error)}</div>` : ""}
+          <div class="callout teal mt-3" style="font-size:11px">推荐：硅基流动 <code>BAAI/bge-m3</code>（1024 维，中文效果好）。不配置也能用；失败会自动回退本地，并在上方显示原因。</div>
+          <div class="form-grid mt-3">
+            <div class="field full"><label>Embedding Base URL</label><input class="input" id="emb-base" value="${escapeAttr(emb.base_url || "")}" placeholder="https://api.siliconflow.cn/v1"></div>
+            <div class="field"><label>Embedding 模型</label><input class="input" id="emb-model" value="${escapeAttr(emb.model || "")}" placeholder="BAAI/bge-m3"></div>
+            <div class="field"><label>Embedding API Key</label><input class="input" id="emb-key" type="password" autocomplete="off" placeholder="${emb.api_key_set ? `已保存 ${escapeHTML(emb.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">单独保存在 data/embedding.json（0600），不会进入前端/导出/仓库。</span></div>
+            <div class="field"><label>超时（秒）</label><input class="input" id="emb-timeout" type="number" min="5" max="120" value="${emb.timeout || 30}"></div>
+          </div>
+          <div class="row mt-3" style="flex-wrap:wrap">
+            <button class="btn btn-primary" id="save-emb">${icon("check", 15)} 保存 Embedding</button>
+            <button class="btn btn-ghost" id="test-emb">${icon("zap", 15)} 测一次语义检索</button>
+            <button class="btn btn-ghost" id="clear-emb">回到本地向量</button>
+          </div>
+          <div id="emb-result"></div>
+          <div class="faint tiny mt-2">${escapeHTML(emb.suggest?.note || "")}</div>
+        </div>
+
+        <div class="card settings-card">
           <div class="between"><div><h3>学习契约</h3><div class="sub">修改每天可投入的时间或截止日期，系统会重排剩余路径。</div></div><span class="badge badge-ember">计划是活的</span></div>
           ${goal ? `<div class="form-grid mt-4">
             <div class="field full"><label>当前目标</label><input class="input" id="goal-title" value="${escapeAttr(goal.title)}"></div>
@@ -83,9 +110,11 @@ export async function render(el, ctx, params) {
           <div class="sub">导出完整学习数据（JSON），或清空本机演示数据。</div>
           <div class="row mt-3" style="flex-wrap:wrap">
             <button class="btn btn-ghost" id="export-data">${icon("download", 15)} 导出全部数据</button>
+            <button class="btn btn-ghost" id="import-data">${icon("upload", 15)} 导入备份</button>
             <button class="btn btn-danger" id="reset-data">${icon("trash", 15)} 清空并重置</button>
+            <input type="file" id="import-file" accept=".json,application/json" hidden>
           </div>
-          <div class="faint tiny mt-2">导出包含目标、单元、卡片、复习日志、对话与解释，不包含 API Key。重置不可撤销。</div>
+          <div class="faint tiny mt-2">导出包含目标、单元、卡片、复习日志、对话、解释、火候记录与速记，不包含 API Key。导入支持合并或替换；替换不可撤销。</div>
         </div>
       </div>
 
@@ -239,6 +268,132 @@ export async function render(el, ctx, params) {
       toast(e.message || "导出失败", "error");
     }
   });
+  el.querySelector("#import-data")?.addEventListener("click", () => {
+    el.querySelector("#import-file")?.click();
+  });
+  el.querySelector("#import-file")?.addEventListener("change", async (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    if (file.size > 12 * 1024 * 1024) return toast("备份文件不能超过 12 MB", "error");
+    let data;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      return toast("备份不是合法 JSON", "error");
+    }
+    const src = data?.data && typeof data.data === "object" ? data.data : data;
+    if (!src || (!Array.isArray(src.goals) && !Array.isArray(src.units))) {
+      return toast("这不是 Boil 备份文件", "error");
+    }
+    const counts = {
+      goals: (src.goals || []).length,
+      units: (src.units || []).length,
+      cards: (src.cards || []).length,
+      sessions: (src.sessions || []).length,
+      records: (src.boil_records || []).length,
+    };
+    const body = `<div class="callout teal"><strong>${escapeHTML(file.name)}</strong><br>${counts.goals} 个目标 · ${counts.units} 个单元 · ${counts.cards} 张卡 · ${counts.sessions} 个会话 · ${counts.records} 条火候记录</div>
+      <div class="callout mt-2"><strong>合并</strong>：保留现有数据，按 ID 更新/插入备份内容。<br><strong>替换</strong>：先清空本机当前数据，再导入备份；不可撤销。</div>
+      <div id="import-error"></div>`;
+    openModal({
+      title: "导入 Boil 备份",
+      subtitle: "先确认数据规模，再选择合并或替换。",
+      body, wide: true,
+      actions: [
+        { label: "取消", kind: "btn-ghost" },
+        {
+          label: "合并导入", kind: "btn-primary", close: false,
+          onClick: async ({ close }) => {
+            try {
+              await doImport(data, "merge");
+              close();
+              return false;
+            } catch (e) {
+              document.getElementById("import-error").innerHTML = `<div class="error-box">${escapeHTML(e.message || "导入失败")}</div>`;
+              return false;
+            }
+          },
+        },
+        {
+          label: "替换导入", kind: "btn-danger", close: false,
+          onClick: async ({ close }) => {
+            const ok = await confirmDialog({
+              title: "替换全部数据？",
+              message: "会先清空当前目标、单元、卡片、会话、火候记录和速记，再导入备份。建议先导出当前数据。",
+              confirmLabel: "清空并替换", danger: true,
+            });
+            if (!ok) return false;
+            try {
+              await doImport(data, "replace");
+              close();
+              return false;
+            } catch (e) {
+              document.getElementById("import-error").innerHTML = `<div class="error-box">${escapeHTML(e.message || "导入失败")}</div>`;
+              return false;
+            }
+          },
+        },
+      ],
+    });
+  });
+
+  async function doImport(data, mode) {
+    const res = await ctx.api.post("/api/import", {
+      data, mode, confirm: mode === "replace" ? "IMPORT" : "",
+    });
+    toast(`导入完成：${res.goals} 个目标 / ${res.units} 个单元 / ${res.cards} 张卡`, "success", 6500);
+    await ctx.reloadAll();
+    ctx.navigate("#/dashboard");
+  }
+
+  el.querySelector("#save-emb")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.innerHTML = "保存中…";
+    try {
+      const payload = {
+        base_url: el.querySelector("#emb-base").value.trim(),
+        model: el.querySelector("#emb-model").value.trim(),
+        timeout: Number(el.querySelector("#emb-timeout").value) || 30,
+      };
+      const key = el.querySelector("#emb-key").value.trim();
+      if (key) payload.api_key = key;
+      await ctx.api.post("/api/settings/embeddings", payload);
+      toast("Embedding 配置已保存。", "success");
+      await ctx.refreshView();
+    } catch (err) {
+      toast(err.message || "保存失败", "error");
+    } finally {
+      btn.disabled = false; btn.innerHTML = `${icon("check", 15)} 保存 Embedding`;
+    }
+  });
+  el.querySelector("#test-emb")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const box = el.querySelector("#emb-result");
+    btn.disabled = true; btn.innerHTML = "测试中…";
+    box.innerHTML = "";
+    try {
+      const res = await ctx.api.post("/api/settings/embeddings/test");
+      box.innerHTML = `<div class="success-box">语义检索连接成功 · ${res.ms}ms · ${escapeHTML(res.model)} · ${res.dim} 维</div>`;
+      toast("Embedding 连接正常。", "success");
+    } catch (err) {
+      box.innerHTML = `<div class="error-box">${escapeHTML(err.message || "连接失败")}${err.detail ? `<br>${escapeHTML(String(err.detail).slice(0, 300))}` : ""}</div>`;
+      toast(err.message || "连接失败", "error");
+    } finally {
+      btn.disabled = false; btn.innerHTML = `${icon("zap", 15)} 测一次语义检索`;
+    }
+  });
+  el.querySelector("#clear-emb")?.addEventListener("click", async () => {
+    try {
+      await ctx.api.post("/api/settings/embeddings", { api_key: "" });
+      toast("已切回本地哈希向量。", "success");
+      await ctx.refreshView();
+    } catch (e) {
+      toast(e.message || "操作失败", "error");
+    }
+  });
+
   el.querySelector("#reset-data")?.addEventListener("click", async () => {
     const ok = await confirmDialog({
       title: "清空全部数据？",

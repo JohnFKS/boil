@@ -5,7 +5,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import config, heat, llm, mastery, planner, socratic
+from . import config, embeddings, heat, llm, mastery, planner, socratic
 from .compiler import compile_material
 from .db import Database, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
@@ -414,6 +414,43 @@ def map_data(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
             "summary": mastery.summary(db, user_id, goal["id"])}
 
 
+def get_unit_notes(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
+    rows = db.query(
+        "SELECT kind, content, updated_at FROM unit_notes WHERE user_id=? AND unit_id=?",
+        (user_id, unit_id),
+    )
+    return {r["kind"]: {"content": r["content"], "updated_at": r["updated_at"]} for r in rows}
+
+
+def save_unit_note(db: Database, user_id: str, unit_id: str, kind: str,
+                   content: str) -> dict[str, Any]:
+    if kind not in ("note", "mnemonic"):
+        raise ValueError("kind 必须是 note 或 mnemonic")
+    content = str(content or "").strip()
+    if len(content) > 4000:
+        raise ValueError("笔记最多 4000 字")
+    ts = now_iso()
+    existing = db.one(
+        "SELECT id, created_at FROM unit_notes WHERE user_id=? AND unit_id=? AND kind=?",
+        (user_id, unit_id, kind),
+    )
+    if not content:
+        db.execute("DELETE FROM unit_notes WHERE user_id=? AND unit_id=? AND kind=?",
+                   (user_id, unit_id, kind))
+    elif existing:
+        db.execute(
+            "UPDATE unit_notes SET content=?, updated_at=? WHERE id=?",
+            (content, ts, existing["id"]),
+        )
+    else:
+        db.insert("unit_notes", {
+            "id": new_id("un"), "user_id": user_id, "unit_id": unit_id,
+            "kind": kind, "content": content, "created_at": ts, "updated_at": ts,
+        })
+    emit(db, "note.saved", {"unit_id": unit_id, "kind": kind, "empty": not bool(content)}, user_id)
+    return get_unit_notes(db, user_id, unit_id)
+
+
 def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
     if not row:
@@ -457,9 +494,12 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     h = heat.heat_for_unit(db, user_id, unit_id)
     pn = heat.pn_state(db, user_id, unit)
     records = heat.history(db, user_id, unit_id=unit_id, limit=6)
+    all_units = get_goal_units(db, unit["goal_id"])
+    related = embeddings.related_units(unit, all_units)
     return {"unit": unit, "mastery": m, "status": st[unit_id],
             "heat": h, "heat_label": heat.heat_label(h), "pn": pn,
-            "records": records,
+            "records": records, "notes": get_unit_notes(db, user_id, unit_id),
+            "related": related,
             "probes": probes, "cards": cards, "sessions": sessions,
             "relations": relations, "attempts": attempts,
             "source": unit.get("source_ref") or {}}
@@ -494,12 +534,22 @@ def review_queue(db: Database, user_id: str, limit: int = 30,
         (*params, limit),
     )
     cards = []
+    unit_ids = list({r["unit_id"] for r in rows})
+    mnemonics = {}
+    if unit_ids:
+        ph = ",".join("?" for _ in unit_ids)
+        for n in db.query(
+            f"SELECT unit_id, content FROM unit_notes WHERE user_id=? AND kind='mnemonic' "
+            f"AND unit_id IN ({ph})", (user_id, *unit_ids),
+        ):
+            mnemonics[n["unit_id"]] = n["content"]
     for r in rows:
         d = dict(r)
         d["preview"] = scheduler.preview_labels(card_from_row(d))
         d["due_label"] = _due_label(d)
         d["retention"] = round4(scheduler.retrievability(float(d.get("stability") or 0),
                                                          _elapsed_days(d)))
+        d["mnemonic"] = mnemonics.get(d["unit_id"], "")
         cards.append(d)
     due_total = db.scalar(
         "SELECT COUNT(*) FROM cards c JOIN units u ON u.id=c.unit_id "
@@ -721,10 +771,11 @@ def import_pack(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def compile_preview(db: Database, title: str, subject: str, text: str,
-                    use_llm: bool = True) -> dict[str, Any]:
+                    use_llm: bool = True, use_embeddings: bool = True) -> dict[str, Any]:
     if len((text or "").strip()) < 60:
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
-    pack, warnings = compile_material(title, subject, text, use_llm=use_llm)
+    pack, warnings = compile_material(title, subject, text, use_llm=use_llm,
+                                      use_embeddings=use_embeddings)
     save_user_pack(pack)
     return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings}
 
@@ -735,18 +786,37 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
 def search(db: Database, user_id: str, q: str) -> dict[str, Any]:
     q = (q or "").strip()
     if not q:
-        return {"units": [], "packs": []}
-    like = f"%{q}%"
-    units = db.query(
-        "SELECT u.id, u.title, u.essence, u.tags_json, u.goal_id FROM units u "
-        "JOIN goals g ON g.id=u.goal_id WHERE g.user_id=? AND g.status='active' "
-        "AND (u.title LIKE ? OR u.essence LIKE ? OR u.tags_json LIKE ?) LIMIT 20",
-        (user_id, like, like, like),
-    )
+        return {"units": [], "packs": [], "engine": embeddings.MODEL}
+    goal = active_goal(db, user_id)
+    units = get_goal_units(db, goal["id"]) if goal else []
+    qlow = q.lower()
+    scored: dict[str, float] = {}
+    for u in units:
+        hay = (str(u.get("title") or "") + " " + str(u.get("essence") or "") + " " +
+               " ".join(str(x) for x in (u.get("tags") or []))).lower()
+        if qlow in hay:
+            scored[u["id"]] = 1.0
+    semantic = embeddings.rank(q, units, embeddings.unit_text)
+    engine = embeddings.last_engine()
+    min_score = 0.20 if engine != embeddings.LOCAL_MODEL else 0.06
+    for score, u in semantic:
+        if score >= min_score:
+            scored[u["id"]] = max(scored.get(u["id"], 0.0), score)
+    by_id = {u["id"]: u for u in units}
+    ranked = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:20]
+    found = []
+    for uid, score in ranked:
+        u = by_id.get(uid)
+        if not u:
+            continue
+        found.append({
+            "id": u["id"], "title": u.get("title"), "essence": u.get("essence"),
+            "tags": u.get("tags") or [], "goal_id": u["goal_id"],
+            "score": round(score, 3),
+        })
     packs = [pack_summary(p) for p in all_available_packs()
              if q.lower() in (p.get("name", "") + p.get("description", "") + " ".join(p.get("tags", []))).lower()]
-    return {"units": units[:20], "packs": packs[:8]}
-
+    return {"units": found, "packs": packs[:8], "engine": engine if units else embeddings.active_model()}
 
 def export_data(db: Database, user_id: str) -> dict[str, Any]:
     user = db.one("SELECT * FROM users WHERE id=?", (user_id,))
@@ -757,6 +827,7 @@ def export_data(db: Database, user_id: str) -> dict[str, Any]:
         "exported_at": now_iso(),
         "app": "Boil",
         "version": config.VERSION,
+        "schema_version": 2,
         "user": user,
         "goals": goals,
         "plans": db.query(f"SELECT * FROM plans WHERE goal_id IN ({placeholders})", tuple(goal_ids)) if goal_ids else [],
@@ -775,6 +846,8 @@ def export_data(db: Database, user_id: str) -> dict[str, Any]:
         "mastery": db.query("SELECT * FROM mastery WHERE user_id=?", (user_id,)),
         "explanations": db.query("SELECT * FROM explanations WHERE user_id=?", (user_id,)),
         "attempts": db.query("SELECT * FROM attempts WHERE user_id=?", (user_id,)),
+        "boil_records": db.query("SELECT * FROM boil_records WHERE user_id=?", (user_id,)),
+        "unit_notes": db.query("SELECT * FROM unit_notes WHERE user_id=?", (user_id,)),
         "events": db.query("SELECT * FROM events WHERE user_id=?", (user_id,)),
         "study_days": db.query("SELECT * FROM study_days WHERE user_id=?", (user_id,)),
         "llm": {k: v for k, v in llm.get_config().items() if k != "api_key"},
@@ -790,7 +863,7 @@ def reset_user(db: Database, user_id: str = config.DEFAULT_USER) -> None:
             db.execute(f"DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE user_id=?)", (user_id,))
             for table in ("sessions", "explanations", "attempts", "evidence", "mastery",
                           "review_logs", "cards", "probes", "relations", "units", "plans",
-                          "goal_packs"):
+                          "goal_packs", "boil_records", "unit_notes"):
                 if table == "probes":
                     db.execute(f"DELETE FROM probes WHERE unit_id IN (SELECT id FROM units WHERE goal_id IN ({ph}))", tuple(goal_ids))
                 elif table in ("relations", "units", "plans", "goal_packs"):

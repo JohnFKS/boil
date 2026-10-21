@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import advisor, config, feynman, llm, mastery, services, socratic
+from . import advisor, backup, config, embeddings, feynman, llm, mastery, services, socratic
 from .compiler import compile_material
 from .db import Database, json_loads
 from .events import recent
@@ -55,6 +55,7 @@ class App:
             ("POST", re.compile(r"^/api/plan/rebuild$"), self.plan_rebuild),
             ("GET", re.compile(r"^/api/map$"), self.map),
             ("GET", re.compile(r"^/api/units/([^/]+)$"), self.unit),
+            ("POST", re.compile(r"^/api/units/([^/]+)/notes$"), self.unit_note),
             ("GET", re.compile(r"^/api/packs$"), self.packs),
             ("GET", re.compile(r"^/api/packs/([^/]+)$"), self.pack_detail),
             ("POST", re.compile(r"^/api/packs/compile$"), self.compile_pack),
@@ -70,9 +71,13 @@ class App:
             ("GET", re.compile(r"^/api/settings/llm$"), self.llm_get),
             ("POST", re.compile(r"^/api/settings/llm$"), self.llm_set),
             ("POST", re.compile(r"^/api/settings/llm/test$"), self.llm_test),
+            ("GET", re.compile(r"^/api/settings/embeddings$"), self.embedding_get),
+            ("POST", re.compile(r"^/api/settings/embeddings$"), self.embedding_set),
+            ("POST", re.compile(r"^/api/settings/embeddings/test$"), self.embedding_test),
             ("GET", re.compile(r"^/api/search$"), self.search),
             ("GET", re.compile(r"^/api/events$"), self.events),
             ("GET", re.compile(r"^/api/export$"), self.export),
+            ("POST", re.compile(r"^/api/import$"), self.import_data),
             ("POST", re.compile(r"^/api/reset$"), self.reset),
         ]
 
@@ -83,6 +88,7 @@ class App:
             "status": "ok", "mode": llm.mode(),
             "llm": llm.public_config(),
             "packs": len(services.all_available_packs()),
+            "embeddings": {k: v for k, v in embeddings.public_config().items() if k not in ("suggest", "stats")},
             "data_dir": str(config.DATA_DIR),
             "uptime_seconds": int(time.time() - STARTED),
             "time": now_iso(),
@@ -136,6 +142,18 @@ class App:
     def unit(self, req, match, query, body):
         return services.unit_detail(self.db, config.DEFAULT_USER, unquote(match.group(1)))
 
+    def unit_note(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        unit_id = unquote(match.group(1))
+        row = self.db.one("SELECT id FROM units WHERE id=?", (unit_id,))
+        if not row:
+            raise ApiError(404, "单元不存在", "not_found")
+        return services.save_unit_note(
+            self.db, config.DEFAULT_USER, unit_id,
+            str(body.get("kind") or "note"), str(body.get("content") or ""),
+        )
+
     def packs(self, req, match, query, body):
         return services.pack_catalog(self.db, config.DEFAULT_USER)
 
@@ -154,7 +172,9 @@ class App:
         subject = str(body.get("subject") or "")
         text = str(body.get("text") or "")
         use_llm = bool(body.get("use_llm", True))
-        return services.compile_preview(self.db, title, subject, text, use_llm)
+        use_embeddings = bool(body.get("use_embeddings", True))
+        return services.compile_preview(self.db, title, subject, text, use_llm,
+                                        use_embeddings=use_embeddings)
 
     def socratic_start(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -259,6 +279,28 @@ class App:
         llm.set_config(body)
         return llm.public_config()
 
+    def embedding_get(self, req, match, query, body):
+        return embeddings.public_config()
+
+    def embedding_set(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        embeddings.set_config(
+            base_url=body.get("base_url"),
+            model=body.get("model"),
+            api_key=body.get("api_key"),
+            enabled=body.get("enabled"),
+            timeout=body.get("timeout"),
+        )
+        return embeddings.public_config()
+
+    def embedding_test(self, req, match, query, body):
+        res = embeddings.probe()
+        if not res.get("ok"):
+            raise ApiError(400, res.get("detail") or "Embedding 连接失败", "embedding_error",
+                           detail=res.get("last_error") or "")
+        return res
+
     def llm_test(self, req, match, query, body):
         try:
             return llm.test_connection()
@@ -277,6 +319,14 @@ class App:
         data = services.export_data(self.db, config.DEFAULT_USER)
         req.send_download(json.dumps(data, ensure_ascii=False, indent=2),
                           "boil-export.json")
+
+    def import_data(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        mode = str(body.get("mode") or "merge")
+        if mode == "replace" and body.get("confirm") != "IMPORT":
+            raise ApiError(400, "替换导入需要 confirm=IMPORT", "bad_request")
+        return backup.import_backup(self.db, config.DEFAULT_USER, body, mode)
 
     def reset(self, req, match, query, body):
         confirm = str((body or {}).get("confirm") or "")
