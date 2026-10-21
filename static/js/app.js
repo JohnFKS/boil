@@ -73,9 +73,9 @@ function navigate(hash, { replace = false } = {}) {
 }
 
 async function loadCore() {
-  state.me = await api.get("/api/me");
+  state.me = await api.get("/api/me", { timeout: 15000 });
   if (state.me?.has_goal || state.me?.goals?.length) {
-    state.dashboard = await api.get("/api/dashboard");
+    state.dashboard = await api.get("/api/dashboard", { timeout: 15000 });
   } else {
     state.dashboard = null;
   }
@@ -300,6 +300,7 @@ async function renderRoute() {
   } catch (e) {
     console.error(e);
     view.innerHTML = errorHTML(e);
+    view.querySelector("[data-reload]")?.addEventListener("click", () => location.reload());
   }
   window.scrollTo({ top: 0, behavior: "instant" });
 }
@@ -311,7 +312,7 @@ function errorHTML(e) {
     <h3>出了点问题</h3>
     <p>${escapeHTML(message)}</p>
     <div class="row" style="justify-content:center;margin-top:16px">
-      <button class="btn btn-primary" onclick="location.reload()">重新加载</button>
+      <button class="btn btn-primary" data-reload>重新加载</button>
       <a class="btn btn-ghost" href="#/dashboard">回到今日</a>
     </div>
   </div>`;
@@ -406,17 +407,50 @@ const ctx = {
   openSearch,
 };
 
+function bootErrorHTML(e) {
+  return `<div class="boot" style="padding:24px">
+    <div class="brand-mark"><span class="kettle"><span class="steam s1"></span><span class="steam s2"></span><span class="steam s3"></span><span class="kettle-handle"></span><span class="kettle-spout"></span><span class="kettle-body"></span><span class="kettle-base"></span></span></div>
+    <h1 style="font-family:var(--font-display);font-size:30px">未能连接到 Boil</h1>
+    <p style="max-width:460px">${escapeHTML(e?.message || "服务没有响应")}<br>请确认 <code>python3 run.py</code> 仍在运行，或检查访问令牌。</p>
+    <div class="row" style="justify-content:center;margin-top:8px">
+      <button class="btn btn-primary" id="boot-retry">重试</button>
+      <button class="btn btn-ghost" id="boot-token">输入访问令牌</button>
+    </div>
+    <p class="faint tiny" style="margin-top:4px">数据默认保存在本机 data/；不会因为刷新丢失。</p>
+  </div>`;
+}
+
 async function boot() {
   applyTheme(state.theme);
+  const app = document.getElementById("app");
+  const watchdog = setTimeout(() => {
+    if (app && app.querySelector(".boot") && !state.me) {
+      window.__boilBootReady?.();
+      app.innerHTML = bootErrorHTML(new Error("启动超时（15 秒）"));
+      bindBootError();
+    }
+  }, 15000);
   try {
     await loadCore();
   } catch (e) {
+    clearTimeout(watchdog);
+    window.__boilBootReady?.();
     if (e.status === 401) {
       askToken();
       return;
     }
+    app.innerHTML = bootErrorHTML(e);
+    bindBootError();
+    return;
   }
+  clearTimeout(watchdog);
   await renderRoute();
+  window.__boilBootReady?.();
+}
+
+function bindBootError() {
+  document.getElementById("boot-retry")?.addEventListener("click", () => boot());
+  document.getElementById("boot-token")?.addEventListener("click", askToken);
 }
 
 function askToken() {

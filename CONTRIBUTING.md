@@ -7,6 +7,7 @@ Boil 是一个本地优先的学习运行时。欢迎内容包、提示词、评
 ```bash
 python3 run.py              # 零依赖运行
 python3 -m unittest discover -s tests -v
+make check && make check-js      # Python 编译 + 前端模块语法
 python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 ```
 

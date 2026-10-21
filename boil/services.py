@@ -1,7 +1,9 @@
 """业务服务层：把 DB、算法、Pack、LLM 组合成 API 可调用的用例。"""
 from __future__ import annotations
 
+import html
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -853,6 +855,50 @@ def export_data(db: Database, user_id: str) -> dict[str, Any]:
         "llm": {k: v for k, v in llm.get_config().items() if k != "api_key"},
     }
     return data
+
+
+def export_anki(db: Database, user_id: str) -> str:
+    rows = db.query(
+        "SELECT c.front, c.back, c.unit_id, u.title AS unit_title, g.subject AS subject "
+        "FROM cards c JOIN units u ON u.id=c.unit_id JOIN goals g ON g.id=u.goal_id "
+        "WHERE c.user_id=? ORDER BY g.subject, u.title, c.created_at",
+        (user_id,),
+    )
+    unit_ids = list({r["unit_id"] for r in rows})
+    mnemonics: dict[str, str] = {}
+    if unit_ids:
+        ph = ",".join("?" for _ in unit_ids)
+        for n in db.query(
+            f"SELECT unit_id, content FROM unit_notes "
+            f"WHERE user_id=? AND kind='mnemonic' AND unit_id IN ({ph})",
+            (user_id, *unit_ids),
+        ):
+            mnemonics[n["unit_id"]] = n["content"]
+
+    def tag(text: str) -> str:
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", str(text or "").strip())
+        return cleaned.strip("_")[:32] or "general"
+
+    def field(text: Any) -> str:
+        return (html.escape(str(text or ""))
+                .replace("\r", "").replace("\t", "    ").replace("\n", "<br>"))
+
+    lines = [
+        "#separator:tab",
+        "#html:true",
+        "#tags column:3",
+        "# Boil 卡片导出：Anki → 文件 → 导入，选择“制表符分隔”",
+    ]
+    for r in rows:
+        front = field(r["front"])
+        back = field(r["back"])
+        source = f"{r['unit_title']}" + (f" · {r['subject']}" if r["subject"] else "")
+        back += f"<br><br><small>来源：{field(source)}</small>"
+        if mnemonics.get(r["unit_id"]):
+            back += f"<br><small>口诀：{field(mnemonics[r['unit_id']])}</small>"
+        tags = " ".join(dict.fromkeys(["Boil", tag(r["subject"]), tag(r["unit_title"])]))
+        lines.append(f"{front}\t{back}\t{tags}")
+    return "\n".join(lines) + "\n"
 
 
 def reset_user(db: Database, user_id: str = config.DEFAULT_USER) -> None:

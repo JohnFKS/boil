@@ -52,17 +52,25 @@ async function parseError(resp) {
   });
 }
 
-export async function request(path, { method = "GET", body = null } = {}) {
+export async function request(path, { method = "GET", body = null, timeout = 90000 } = {}) {
   const opts = {
     method,
     headers: headers(body != null ? { "Content-Type": "application/json" } : {}),
   };
   if (body != null) opts.body = JSON.stringify(body);
+  const controller = new AbortController();
+  opts.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, timeout));
   let resp;
   try {
     resp = await fetch(path, opts);
   } catch (e) {
+    if (e.name === "AbortError") {
+      throw new ApiError("请求超时，请检查 Boil 服务是否仍在运行", { code: "timeout" });
+    }
     throw new ApiError("无法连接 Boil 服务", { code: "network", detail: String(e) });
+  } finally {
+    clearTimeout(timer);
   }
   if (resp.status === 401) {
     const err = await parseError(resp);
@@ -81,8 +89,8 @@ export async function request(path, { method = "GET", body = null } = {}) {
   return payload?.data ?? payload;
 }
 
-export const get = (path) => request(path);
-export const post = (path, body = {}) => request(path, { method: "POST", body });
+export const get = (path, opts = {}) => request(path, opts);
+export const post = (path, body = {}, opts = {}) => request(path, { method: "POST", body, ...opts });
 
 export async function stream(path, body, onEvent, { signal } = {}) {
   if (activeStream) activeStream.abort();

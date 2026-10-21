@@ -77,6 +77,7 @@ class App:
             ("GET", re.compile(r"^/api/search$"), self.search),
             ("GET", re.compile(r"^/api/events$"), self.events),
             ("GET", re.compile(r"^/api/export$"), self.export),
+            ("GET", re.compile(r"^/api/export/anki$"), self.export_anki),
             ("POST", re.compile(r"^/api/import$"), self.import_data),
             ("POST", re.compile(r"^/api/reset$"), self.reset),
         ]
@@ -320,6 +321,11 @@ class App:
         req.send_download(json.dumps(data, ensure_ascii=False, indent=2),
                           "boil-export.json")
 
+    def export_anki(self, req, match, query, body):
+        text = services.export_anki(self.db, config.DEFAULT_USER)
+        req.send_download(text, "boil-anki.txt",
+                          content_type="text/tab-separated-values; charset=utf-8")
+
     def import_data(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
@@ -444,25 +450,43 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, ValueError) as exc:
             raise ApiError(400, "请求体不是合法 JSON", "bad_json", str(exc)[:200]) from exc
 
+    def end_headers(self):
+        # 统一安全头，覆盖 API、SSE、静态资源与错误页。
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+            "media-src 'self' blob:; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'; frame-ancestors 'none'",
+        )
+        super().end_headers()
+
     def send_json(self, status: int, payload: Any):
         body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             self.wfile.write(body)
         except BrokenPipeError:
             pass
 
-    def send_download(self, text: str, filename: str):
+    def send_download(self, text: str, filename: str,
+                      content_type: str = "application/json; charset=utf-8"):
         body = text.encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -504,7 +528,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         if not target.is_file():
-            # SPA 回退（hash 路由不需要，但保留深链）
+            # 带扩展名的资源缺失必须 404，不能回退成 HTML（否则模块会 MIME 报错）。
+            if target.suffix:
+                self.send_error(404)
+                return
+            # 无扩展名的深链回退到 SPA。
             target = config.STATIC_DIR / "index.html"
             if not target.is_file():
                 self.send_error(404)
@@ -521,13 +549,21 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "font/woff2"
         elif target.suffix in (".html",):
             ctype = "text/html; charset=utf-8"
+        stat = target.stat()
+        etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
         data = target.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        cache = "no-cache" if target.name == "index.html" else "public, max-age=3600"
-        self.send_header("Cache-Control", cache)
-        self.send_header("X-Content-Type-Options", "nosniff")
+        # 前端是原生 ES modules，必须每次校验，避免更新后新旧模块混用。
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("ETag", etag)
         self.end_headers()
         if head:
             return

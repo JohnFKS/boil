@@ -1014,6 +1014,28 @@ ul, ol { margin: 0; padding: 0; }
 .session-list .session-row { font-size: 11px; }
 
 /* settings */
+.settings-jump {
+  position: sticky; top: 64px; z-index: 14;
+  display: flex; align-items: center; gap: 5px;
+  margin: 0 0 14px; padding: 6px;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: rgba(13, 19, 27, 0.86);
+  backdrop-filter: blur(14px);
+  overflow-x: auto; scrollbar-width: none;
+}
+.settings-jump::-webkit-scrollbar { display: none; }
+[data-theme="light"] .settings-jump { background: rgba(255, 253, 248, 0.9); }
+.settings-jump-label { flex: none; padding: 0 7px; font-size: 9px; letter-spacing: 0.14em; color: var(--faint); text-transform: uppercase; }
+.jump-chip {
+  flex: none; padding: 6px 11px; border-radius: 8px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--muted); font-size: 11px; white-space: nowrap;
+  transition: color 0.18s, background 0.18s, border-color 0.18s;
+}
+.jump-chip:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+[data-theme="light"] .jump-chip:hover { background: rgba(20,28,38,0.05); }
+.jump-chip.active { color: var(--ember-2); background: var(--ember-soft); border-color: rgba(255,122,69,0.24); }
+.settings-card[id] { scroll-margin-top: 128px; }
 .settings-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr); gap: 18px; align-items: start; }
 .settings-main { display: grid; gap: 16px; }
 .settings-side { display: grid; gap: 14px; }
@@ -1194,6 +1216,9 @@ ul, ol { margin: 0; padding: 0; }
   .modal { border-radius: 16px; }
   .onboarding-panel h2 { font-size: 24px; }
   .heatmap { grid-template-columns: repeat(14, 1fr); }
+  .settings-jump { top: 58px; margin-bottom: 12px; }
+  .settings-jump-label { display: none; }
+  .settings-card[id] { scroll-margin-top: 116px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }

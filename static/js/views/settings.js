@@ -26,9 +26,16 @@ export async function render(el, ctx, params) {
         <span class="badge badge-muted">v${escapeHTML(health.version || "1.0.0")}</span>
       </div>
     </div>
+    <nav class="settings-jump" aria-label="设置分区">
+      <span class="settings-jump-label">跳到</span>
+      <button class="jump-chip active" data-jump="settings-llm">模型连接</button>
+      <button class="jump-chip" data-jump="settings-embeddings">语义检索</button>
+      <button class="jump-chip" data-jump="settings-goal">学习契约</button>
+      <button class="jump-chip" data-jump="settings-data">数据与备份</button>
+    </nav>
     <div class="settings-grid">
       <div class="settings-main">
-        <div class="card settings-card">
+        <div class="card settings-card" id="settings-llm">
           <div class="between">
             <div><h3>模型连接</h3><div class="sub">任意 OpenAI 兼容端点。不配置也能用本地演示引擎完整跑通。</div></div>
             <span class="badge ${mode === "live" ? "badge-teal" : "badge-gold"}">${mode === "live" ? "LIVE" : "DEMO"}</span>
@@ -64,7 +71,7 @@ export async function render(el, ctx, params) {
           <div id="llm-result"></div>
         </div>
 
-        <div class="card settings-card">
+        <div class="card settings-card" id="settings-embeddings">
           <div class="between">
             <div><h3>语义检索（Embedding）</h3><div class="sub">有标题的 Markdown 仍按结构解析；无标题材料、语义搜索与相关单元使用向量。</div></div>
             <span class="badge ${emb.mode === "cloud" ? "badge-teal" : emb.mode === "fallback" ? "badge-ember" : "badge-gold"}">${emb.mode === "cloud" ? "云端" : emb.mode === "fallback" ? "降级本地" : "本地"}</span>
@@ -90,7 +97,7 @@ export async function render(el, ctx, params) {
           <div class="faint tiny mt-2">${escapeHTML(emb.suggest?.note || "")}</div>
         </div>
 
-        <div class="card settings-card">
+        <div class="card settings-card" id="settings-goal">
           <div class="between"><div><h3>学习契约</h3><div class="sub">修改每天可投入的时间或截止日期，系统会重排剩余路径。</div></div><span class="badge badge-ember">计划是活的</span></div>
           ${goal ? `<div class="form-grid mt-4">
             <div class="field full"><label>当前目标</label><input class="input" id="goal-title" value="${escapeAttr(goal.title)}"></div>
@@ -105,16 +112,18 @@ export async function render(el, ctx, params) {
           <div id="plan-result"></div>` : `<div class="callout mt-3">还没有学习目标。<a href="#/onboarding" style="color:var(--ember)">创建一个</a></div>`}
         </div>
 
-        <div class="card settings-card danger-zone">
-          <h3>数据</h3>
-          <div class="sub">导出完整学习数据（JSON），或清空本机演示数据。</div>
+        <div class="card settings-card danger-zone" id="settings-data">
+          <h3>数据与备份</h3>
+          <div class="sub">导出完整学习数据（JSON / Anki），或清空本机演示数据。</div>
           <div class="row mt-3" style="flex-wrap:wrap">
             <button class="btn btn-ghost" id="export-data">${icon("download", 15)} 导出全部数据</button>
+            <button class="btn btn-ghost" id="export-anki">${icon("review", 15)} 导出 Anki 卡片</button>
             <button class="btn btn-ghost" id="import-data">${icon("upload", 15)} 导入备份</button>
             <button class="btn btn-danger" id="reset-data">${icon("trash", 15)} 清空并重置</button>
             <input type="file" id="import-file" accept=".json,application/json" hidden>
           </div>
-          <div class="faint tiny mt-2">导出包含目标、单元、卡片、复习日志、对话、解释、火候记录与速记，不包含 API Key。导入支持合并或替换；替换不可撤销。</div>
+          <div class="faint tiny mt-2">JSON 导出包含目标、单元、卡片、复习日志、对话、解释、火候记录与速记，不包含 API Key。导入支持合并或替换；替换不可撤销。</div>
+          <div class="faint tiny mt-2">Anki 导出为制表符分隔文本：Anki → 文件 → 导入 → 选择 boil-anki.txt，字段含正面、背面与标签。</div>
         </div>
       </div>
 
@@ -155,6 +164,36 @@ export async function render(el, ctx, params) {
   const temp = el.querySelector("#llm-temp");
   const tempLabel = el.querySelector("#temp-label");
   temp?.addEventListener("input", () => { tempLabel.textContent = temp.value; });
+
+  const jumpButtons = [...el.querySelectorAll("[data-jump]")];
+  const jumpTargets = jumpButtons
+    .map(btn => document.getElementById(btn.dataset.jump))
+    .filter(Boolean);
+  if (el._settingsCleanup) el._settingsCleanup();
+  const updateJump = () => {
+    if (!el.isConnected) {
+      window.removeEventListener("scroll", updateJump);
+      return;
+    }
+    const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 12;
+    let current = jumpTargets[0];
+    if (atBottom) {
+      current = jumpTargets[jumpTargets.length - 1];
+    } else {
+      for (const target of jumpTargets) {
+        if (target.getBoundingClientRect().top <= 160) current = target;
+      }
+    }
+    if (!current) return;
+    jumpButtons.forEach(b => b.classList.toggle("active", b.dataset.jump === current.id));
+  };
+  jumpButtons.forEach(btn => btn.addEventListener("click", () => {
+    document.getElementById(btn.dataset.jump)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    jumpButtons.forEach(b => b.classList.toggle("active", b === btn));
+  }));
+  window.addEventListener("scroll", updateJump, { passive: true });
+  el._settingsCleanup = () => window.removeEventListener("scroll", updateJump);
+  updateJump();
 
   el.querySelectorAll("[data-provider]").forEach(btn => btn.addEventListener("click", () => {
     const p = (cfg.providers || [])[Number(btn.dataset.provider)];
@@ -266,6 +305,14 @@ export async function render(el, ctx, params) {
       toast("导出已开始。", "success");
     } catch (e) {
       toast(e.message || "导出失败", "error");
+    }
+  });
+  el.querySelector("#export-anki")?.addEventListener("click", async () => {
+    try {
+      await ctx.api.download("/api/export/anki", "boil-anki.txt");
+      toast("Anki 卡片已导出。", "success");
+    } catch (e) {
+      toast(e.message || "Anki 导出失败", "error");
     }
   });
   el.querySelector("#import-data")?.addEventListener("click", () => {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import tempfile
@@ -85,6 +86,25 @@ class ApiTest(unittest.TestCase):
         self.assertIn(b"--ember", css)
         r, js = self.call("GET", "/js/app.js", raw=True)
         self.assertIn(b"loadCore", js)
+        self.assertEqual(r.headers.get("Cache-Control"), "no-cache")
+        etag = r.headers.get("ETag")
+        self.assertTrue(etag)
+        guard = self.call("GET", "/js/boot-guard.js", raw=True)[1]
+        self.assertIn(b"__boilBootReady", guard)
+        try:
+            self.call("GET", "/js/missing-module.js")
+            self.fail("missing asset should 404")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 404)
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            conn.request("GET", "/js/app.js", headers={"If-None-Match": etag})
+            cached = conn.getresponse()
+            cached.read()
+            self.assertEqual(cached.status, 304)
+            self.assertEqual(cached.getheader("ETag"), etag)
+        finally:
+            conn.close()
 
     def test_02_onboarding_and_views(self):
         out = self.call("POST", "/api/onboarding", {
@@ -227,6 +247,28 @@ class ApiTest(unittest.TestCase):
         self.assertGreaterEqual(res["data"]["units"], 8)
         self.assertGreaterEqual(res["data"]["notes"], 1)
         self.assertGreaterEqual(res["data"]["goals"], 1)
+
+    def test_10_anki_export_and_security_headers(self):
+        r, body = self.call("GET", "/api/export/anki", raw=True)
+        self.assertIn("text/tab-separated-values", r.headers.get("Content-Type", ""))
+        self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+        text = body.decode()
+        self.assertIn("#separator:tab", text)
+        self.assertIn("#html:true", text)
+        self.assertIn("#tags column:3", text)
+        rows = [line for line in text.splitlines() if line and not line.startswith("#")]
+        self.assertTrue(rows)
+        self.assertTrue(all(len(row.split("\t")) == 3 for row in rows))
+        self.assertIn("Boil", rows[0].split("\t")[2])
+        self.assertIn("来源：", rows[0])
+        h = self.call("GET", "/api/health")
+        self.assertTrue(h["ok"])
+        for path in ("/api/health", "/"):
+            resp, _ = self.call("GET", path, raw=True)
+            self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+            self.assertEqual(resp.headers.get("Referrer-Policy"), "no-referrer")
+            self.assertIn("camera=()", resp.headers.get("Permissions-Policy", ""))
+            self.assertIn("script-src 'self'", resp.headers.get("Content-Security-Policy", ""))
 
     def test_07_unknown_route(self):
         try:

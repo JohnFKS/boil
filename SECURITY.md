@@ -13,6 +13,7 @@ Boil v1 是**单用户、本地优先**的学习工具，不是多租户 SaaS。
 - 云端 Embedding Key 单独保存在 `data/embedding.json`（0600）；启用云端 Embedding 后，参与语义分组/检索的文本会发往所配端点（如硅基流动）。不配置则完全本地。
 - 导出包不包含 API Key。
 - 静态文件路径做了目录逃逸校验；请求体上限 12 MB。
+- 所有响应带 CSP（`script-src 'self'`）、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy` 与 `X-Content-Type-Options: nosniff`；前端无内联脚本。
 - SQL 全部参数化。
 
 ## 2. 远程访问
@@ -67,7 +68,7 @@ python3 run.py
 - 数据导入是单用户恢复，不是多租户迁移；替换导入会清空当前数据。
 - 本地 embedding 不调用外部服务；启用云端 Embedding 后材料文本会离开本机；失败会冷却并降级本地。
 - 没有对模型输出做完整的内容安全过滤；不要把它当作高风险决策系统。
-- 浏览器端没有 CSP nonce/哈希；如果部署到公网，请用反向代理加安全头。
+- CSP 使用 `'unsafe-inline'` 允许内联样式（前端大量使用 style 属性）；如需更严格策略，应改为 nonce/哈希并移除内联样式。
 - 单文件 SQLite 适合单用户；高并发多用户需要迁移到 Postgres。
 
 ## 8. 报告漏洞

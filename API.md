@@ -25,6 +25,7 @@ Base URL：`http://127.0.0.1:7860`
   - `X-Boil-Token: <token>`
 - 请求体上限 12 MB；非 GET 请求用 `Content-Type: application/json`。
 - 时间一律 ISO 8601 UTC；计划日期使用服务器本地日期。
+- 所有响应带安全头：CSP、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`、`X-Content-Type-Options: nosniff`。
 
 ---
 
@@ -592,6 +593,12 @@ data: {}
 
 下载 JSON 文件（`Content-Disposition: attachment`），包含目标、计划、Pack、单元、卡片、复习日志、会话、消息、证据、掌握度、解释、火候记录、速记笔记、事件、学习日。
 **不包含** API Key。
+
+### `GET /api/export/anki`
+
+下载 Anki 可导入的制表符分隔文本（`text/tab-separated-values`），列顺序为正面、背面、标签；
+文件头包含 `#separator:tab`、`#html:true`、`#tags column:3`。背面附带来源单元与口诀（若有）。
+导入方式：Anki → 文件 → 导入 → 选择 `boil-anki.txt` → 字段分隔选“制表符”。
 
 ### `POST /api/import`
 

@@ -8,7 +8,8 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-47%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-49%20passing-38d6bd?style=flat-square)](#测试)
+[![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
 
@@ -55,8 +56,11 @@ python3 run.py
 ```
 
 首次启动会创建一个本地用户 `local`，数据落在 `data/boil.db`。
+没有学习目标时会进入 `/#/onboarding`，完成一次开始流程后进入“今日”主页。
 不配置任何模型也能完整体验：演示模式使用本地确定性引擎（切分、追问、关键词评分、FSRS 排程），
 它不会伪装成语义模型；所有页面会明确标注“演示模式”。
+
+如果浏览器一直停在“BOIL · 正在烧水”，先确认 `python3 run.py` 仍在运行，再按 `Ctrl+Shift+R`（Mac：`Cmd+Shift+R`）强制刷新。前端静态资源使用 ETag 协商缓存，正常刷新会立即拿到最新模块；加载失败时页面也会给出可操作的提示。
 
 ### 配置真实模型
 
@@ -141,6 +145,7 @@ python3 run.py
 - **Embedding 隐私**：配置云端后，参与分组/检索的文本会发往该端点；Key 只保存在本地 `data/embedding.json`（0600）。不配置就完全本地、离线。
 - **数学公式**：`$...$`、`$$...$$`、`\(...\)`、`\[...\]` 由本地 KaTeX 渲染，浅色/深色主题均已验证。
 - **数据备份**：设置 → 数据 → 导出全部数据 / 导入备份；支持合并与替换；导出包含目标、单元、卡片、复习日志、对话、解释、火候记录和速记，API Key 永不进入备份。
+- **Anki 导出**：同一处可导出制表符分隔的卡片文本，正面、背面、标签齐全，导入 Anki 时选“制表符分隔”即可，不锁定你的复习数据。
 - **速记**：来自 mem 的小功能；单元页可写口诀/类比/笔记，复习卡可显示可选速记线索。
 
 ## 火候：不只给工具，给“下一档”
@@ -198,6 +203,10 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Audio](screenshots/audio.png) | ![Benchmark](screenshots/benchmark.png) |
 
+| 设置 | 数据与迁移 |
+|---|---|
+| ![Settings](screenshots/settings.png) | ![Backup and Anki](screenshots/settings-data.png) |
+
 ### 数学公式
 
 ![Math formula](screenshots/math-formula.png)
@@ -219,7 +228,8 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 - **Advisor v0**：沿强度阶梯只推进一步；理由可解释；支持时间预算、接受与否决记账。
 - **强度模式**：第 0 档音频浸泡、第 1 档预消化、第 2 档苏格拉底、第 3 档回测、第 4 档费曼、非档位极致对标。
 - **Pack 质量门禁**：原子率、四类探针覆盖率、DAG 无环，在内容库直接可见。
-- **数据备份**：一键导出/导入全部学习数据；支持合并或替换，API Key 永不进入备份。
+- **数据备份**：一键导出/导入全部学习数据；支持合并或替换，API Key 永不进入备份；可另存为 Anki 制表符文本。
+- **MCP 接入**：`python3 -m boil.mcp_server` 通过 stdio 暴露 13 个工具，Claude Desktop 等 agent 可直接查询推荐、复习队列、会话与速记。
 - **速记与笔记**：来自 mem 的速记思路；单元页可写口诀/类比/笔记，复习卡按需显示速记线索。
 - **语义层**：可选硅基流动 BAAI/bge-m3；无标题材料语义分组、语义搜索、相关单元；失败自动降级本地哈希向量。
 - **数学公式**：Markdown 中的 `$...$` / `$$...$$` 由本地 KaTeX 渲染，已用真实浏览器验证。
@@ -355,10 +365,38 @@ curl -X POST http://127.0.0.1:7860/api/onboarding \
 
 ---
 
+## Agent 接入（MCP）
+
+Boil 自带一个零依赖的 MCP stdio 服务，让 Claude Desktop、Cursor 等 agent 直接使用同一份本地学习数据：
+
+```bash
+python3 -m boil.mcp_server
+```
+
+在 MCP 客户端中配置（把路径换成你的仓库位置）：
+
+```json
+{
+  "mcpServers": {
+    "boil": {
+      "command": "python3",
+      "args": ["-m", "boil.mcp_server"],
+      "cwd": "/path/to/boil",
+      "env": {"BOIL_DATA_DIR": "/path/to/boil/data"}
+    }
+  }
+}
+```
+
+提供 13 个工具：`health`、`advice`、`list_units`、`get_unit`、`search`、`review_queue`、`submit_review`、`save_note`、`start_socratic`、`socratic_reply`、`finish_socratic`、`feynman_evaluate`、`insights`。
+评分、费曼等会写入学习证据的工具在描述中要求 agent 先获得用户明确请求；返回结果不包含任何 API Key。
+
+---
+
 ## 测试
 
 ```bash
-# 47 项单元 / 集成 / HTTP / SSE / LLM 网关测试（stdlib unittest）
+# 49 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP 测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -376,8 +414,11 @@ python3 -m unittest discover -s tests -v
 - HTTP REST + SSE + 静态资源 + 错误码
 - 真实模型网关（假端点）：普通、流式、JSON 模式、自定义认证头、失败可见
 - live 服务路径：苏格拉底、费曼、编译器
-- 数据备份导出/合并导入、速记笔记、复习卡速记线索
+- 数据备份导出/合并导入、Anki 导出、速记笔记、复习卡速记线索
+- 安全响应头（CSP / X-Frame-Options / Referrer-Policy / Permissions-Policy）
 - 本地/硅基流动 Embedding 语义分组、语义搜索、相关单元
+- MCP stdio 协议：初始化、工具发现、学习查询、复习、会话、费曼与速记
+- GitHub Actions：Python 3.10/3.12 测试 + 前端模块语法检查
 - 远端 Embedding 批量、缓存、失败冷却、降级与错误可见
 - 数学包公式内容与 KaTeX 资源检查
 
@@ -408,7 +449,9 @@ python3 tools/browser_check.py
 - Pack 质量门禁（原子率/探针覆盖/DAG）
 - Pack 编译/导入/幂等
 - 模型网关（普通/流式/JSON/失败可见）
-- 本地优先 + 导出 + 演示模式
+- 本地优先 + JSON 备份 + Anki 导出 + 演示模式
+- MCP stdio 服务（13 个工具）
+- 安全响应头 + GitHub Actions CI
 - 自研 SPA + 离线 KaTeX
 
 下一阶段：
@@ -416,7 +459,6 @@ python3 tools/browser_check.py
 - **学习效果基准**：7/30 天延迟保持、迁移测试、对照实验；公开方法与局限。
 - **影子模式 / A/B**：新排程器、新评分器用历史事件回放后切换。
 - **语音费曼**：ASR + 评分；音频浸泡复习。
-- **MCP**：把复习、会话、导入暴露给其他 agent。
 - **多设备同步**：事件日志 + 冲突解决。
 - **多用户 / 托管版**：真正的租户隔离、计费、团队看板、SSO。
 - **更多学科包**：数学、编程、语言、职业考试（只做成人高 stakes，不碰 K12 学科培训）。

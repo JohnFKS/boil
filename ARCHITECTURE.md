@@ -36,6 +36,7 @@ boil/
 │   ├── advisor.py            # 强度阶梯推荐器 v0（规则 + 理由 + 成本）
 │   ├── embeddings.py         # 云端/本地向量：语义分组/搜索/相关单元
 │   ├── backup.py             # 完整备份导入（表/列白名单）
+│   ├── mcp_server.py         # MCP stdio 服务（13 个工具）
 │   ├── socratic.py            # 苏格拉底状态机 + 流式 + 报告
 │   ├── feynman.py             # 费曼六维评分 + 缺口
 │   ├── mastery.py             # 四维证据聚合
@@ -66,7 +67,8 @@ boil/
 - **T / PN / BoilRecord**：火候状态、必要步骤缺口、每次模式尝试的前后温度与结果。
 - **Advice**：一个带理由、成本、目标与档位的下一步建议；采纳/否决进入事件日志。
 - **UnitNote**：速记/笔记，来自 mem 的速记与批注思路。
-- **Backup**：带白名单的完整 JSON 导出/导入；API Key 永不进入备份。
+- **Backup**：带白名单的完整 JSON 导出/导入；API Key 永不进入备份；另有只读的 Anki 制表符导出。
+- **MCP Tools**：把同一批服务用例以 stdio JSON-RPC 暴露给 agent，不复制业务逻辑。
 - **Event**：所有上述行为的追加式记录。
 
 内核不包含任何具体学科词汇。它不知道“极限”“二重积分”或“考研”。
@@ -305,7 +307,7 @@ score = old * (1 - alpha) + evidence * alpha
 - 新增卡片类型：扩展 Probe kind 与 Scheduler 的探针选择策略。
 - 新增模型：在 `llm.PROVIDERS` 或自定义端点配置。
 - 新增前端页面：`static/js/views/` + 路由 + nav。
-- 新增集成：MCP 网关（路线图）、Anki 导入、Obsidian/SiYuan 捕获。
+- 新增集成：Anki 导入（当前为导出）、Obsidian/SiYuan 捕获；MCP 已提供 stdio 服务。
 
 ## 12. 测试策略
 

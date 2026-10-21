@@ -328,6 +328,24 @@ def main():
         goto("#/settings")
         wait_for(".settings-grid", "模型连接")
         shot("settings.png")
+        anki = evaluate(
+            "(async()=>{const r=await fetch('/api/export/anki');const t=await r.text();"
+            "return {ok:r.ok,type:r.headers.get('content-type')||'',head:t.slice(0,80)}})()"
+        )
+        if not anki or not anki.get("ok") or "#separator:tab" not in anki.get("head", ""):
+            errors.append(f"anki export failed in browser: {anki}")
+        evaluate("document.querySelector('[data-jump=\"settings-data\"]')?.click()")
+        time.sleep(0.8)
+        jump = evaluate(
+            "(()=>{const r=document.querySelector('#settings-data').getBoundingClientRect();"
+            "const a=document.querySelector('.jump-chip.active');"
+            "return {visible:r.top<innerHeight&&r.bottom>120, active:a?.dataset.jump||''}})()"
+        )
+        if not jump or not jump.get("visible") or jump.get("active") != "settings-data":
+            errors.append(f"settings jump nav failed: {jump}")
+        shot("settings-data.png")
+        evaluate("window.scrollTo(0,0)")
+        time.sleep(0.3)
         shot("settings-full.png", full=True)
 
         goto("#/onboarding")
@@ -340,6 +358,9 @@ def main():
         goto("#/dashboard")
         wait_for(".hero", "学习闭环")
         shot("dashboard-mobile.png")
+        goto("#/settings")
+        wait_for(".settings-jump", "模型连接")
+        shot("settings-mobile.png")
 
         print("\nerrors:")
         if errors:
