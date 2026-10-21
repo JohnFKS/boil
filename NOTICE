@@ -1,0 +1,38 @@
+Boil · 烧水
+Copyright 2026 Boil contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party notices:
+
+1. KaTeX
+   - Files: static/vendor/katex/*
+   - License: MIT
+   - Copyright (c) 2013-2020 Khan Academy and other contributors
+   - License text: static/vendor/katex/LICENSE
+
+2. FSRS / open-spaced-repetition
+   - Boil's scheduler is an independent Python implementation inspired by the
+     FSRS-5 algorithm and public research from the open-spaced-repetition
+     community (https://github.com/open-spaced-repetition).
+   - No source code from the upstream library is copied into this repository.
+
+3. Original project lineage
+   - mem and examgen: original projects by JohnFKS; Boil reuses their ideas and
+     selected author-owned assets.
+   - testlearnweb: a local reimplementation of a third-party site by JohnFKS.
+     Boil learned from its runtime patterns, but rewrote the runtime and
+     frontend. The third-party frontend build is NOT included.
+   - examgen's original textbook OCR (date1/) is NOT included.
+
+4. Content
+   - "学神模型 · 学习力" content pack: based on the author's 学神模型 manuscript;
+     rewritten into teachable units. Licensed CC BY 4.0 in the pack metadata.
+   - "高等数学 · 二重积分通法" pack: generated from author-owned examgen template
+     structures. Original third-party textbook content is not included. Verify
+     source rights before redistribution.
+
+5. UI
+   - The Boil SPA, design system and SVG charts are original to this project.
+
+No warranty. See LICENSE for details.

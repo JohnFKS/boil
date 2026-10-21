@@ -1,0 +1,19 @@
+services:
+  boil:
+    build: .
+    container_name: boil
+    ports:
+      - "7860:7860"
+    environment:
+      BOIL_HOST: 0.0.0.0
+      BOIL_PORT: 7860
+      # 远程访问时取消注释并换成随机长串：
+      # BOIL_TOKEN: "change-me-to-a-long-random-token"
+      # 可选：服务端强制演示模式
+      # BOIL_LLM_OFF: "1"
+    volumes:
+      - boil-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  boil-data:

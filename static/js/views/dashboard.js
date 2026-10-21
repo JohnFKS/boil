@@ -1,0 +1,203 @@
+/* Dashboard: one screen to decide the next best action. */
+import {
+  escapeHTML, icon, pct, relativeTime, ringSVG, radarSVG, statusMeta,
+  eventMeta, daysUntil, formatMinutes, truncate,
+} from "../utils.js";
+
+function greeting() {
+  const h = new Date().getHours();
+  if (h < 6) return "夜深了";
+  if (h < 11) return "早上好";
+  if (h < 14) return "中午好";
+  if (h < 18) return "下午好";
+  return "晚上好";
+}
+
+function miniMapSVG(units) {
+  if (!units?.length) return "";
+  const w = 520, h = 150;
+  const n = units.length;
+  const gap = n > 1 ? (w - 100) / (n - 1) : 0;
+  const nodes = units.map((u, i) => {
+    const x = 50 + i * gap;
+    const y = 64 + (i % 2 ? 18 : -8);
+    const color = statusMeta[u.status]?.color || "var(--faint)";
+    return `<g data-unit="${escapeHTML(u.id)}" style="cursor:pointer">
+      <circle cx="${x}" cy="${y}" r="14" fill="${color}" opacity="${u.status === "new" ? 0.35 : 0.9}"/>
+      <circle cx="${x}" cy="${y}" r="5" fill="var(--panel-solid)"/>
+      <text x="${x}" y="${y + 34}" fill="var(--muted)" font-size="9" text-anchor="middle">${escapeHTML(truncate(u.title, 13))}</text>
+    </g>`;
+  }).join("");
+  const lines = units.slice(1).map((_, i) => {
+    const x1 = 50 + i * gap, x2 = 50 + (i + 1) * gap;
+    const y1 = 64 + (i % 2 ? 18 : -8), y2 = 64 + ((i + 1) % 2 ? 18 : -8);
+    return `<line x1="${x1 + 14}" y1="${y1}" x2="${x2 - 14}" y2="${y2}" stroke="var(--line-strong)" stroke-width="1.2" stroke-dasharray="3 4"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" class="mini-map" style="width:100%;height:180px" role="img" aria-label="知识地图预览">${lines}${nodes}</svg>`;
+}
+
+function stepHTML(index, title, sub, state, href) {
+  const cls = state === "current" ? "current" : state === "done" ? "done" : "";
+  return `<a class="loop-step ${cls}" href="${href}">
+    <span class="step-index">${state === "done" ? icon("check", 13) : String(index).padStart(2, "0")}</span>
+    <span class="loop-step-body"><span class="loop-step-title">${title}</span><span class="loop-step-sub">${sub}</span></span>
+    <span class="badge ${state === "done" ? "badge-teal" : state === "current" ? "badge-ember" : "badge-muted"}">${state === "done" ? "完成" : state === "current" ? "现在" : "待进行"}</span>
+  </a>`;
+}
+
+export async function render(el, ctx, params) {
+  let d = ctx.state.dashboard;
+  if (!d?.has_goal) {
+    try { d = await ctx.api.get("/api/dashboard"); ctx.state.dashboard = d; } catch { /* handled below */ }
+  }
+  if (!d?.has_goal) { ctx.navigate("#/onboarding", { replace: true }); return; }
+  const goal = d.goal, plan = d.plan || {}, counts = d.counts || {}, stats = d.stats || {};
+  const mastery = d.mastery || { facets: {}, average: 0 };
+  const next = d.next_action || {};
+  const due = counts.due || 0;
+  const newCount = counts.new || 0;
+  const unit = d.next_units?.[0] || null;
+  const days = goal.deadline ? daysUntil(goal.deadline) : null;
+  const today = plan.today || null;
+  const progress = plan.progress || { percent: 0, done: 0, total: counts.units || 0 };
+  const facetLabels = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
+  const facetValues = ["recall", "explain", "apply", "transfer"].map(k => mastery.facets?.[k] || 0);
+  const currentUnitId = unit?.id;
+  const mapUnits = d.map_preview?.units || d.next_units?.slice(0, 6) || [];
+  const weakest = mastery.weakest;
+
+  el.innerHTML = `
+    <div class="stagger">
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="hero-kicker"><span class="line"></span> ${escapeHTML(goal.title)}</div>
+          <h1>${greeting()}。<br>今天，把哪壶水<em>烧开</em>？</h1>
+          <p class="hero-sub">${due > 0 ? `有 ${due} 张卡已经到期。先复习，再学新内容——这不是勤奋，是让之前的时间不作废。` : next.kind === "done" ? "这个目标已经全部烧开。你可以去洞察页复盘，或开启一个新目标。" : "今天只需要完成一个小闭环：预消化 → 苏格拉底 → 费曼 → 留下证据。"}</p>
+          <div class="hero-actions">
+            ${next.href ? `<a class="btn btn-primary btn-lg" href="${next.href}">${icon(next.kind === "review" ? "review" : next.kind === "feynman" ? "teach" : "play", 16)} ${escapeHTML(next.cta || "开始")}</a>` : ""}
+            ${due > 0 && currentUnitId ? `<a class="btn btn-ghost btn-lg" href="#/unit/${escapeAttr(currentUnitId)}">先看一眼单元</a>` : ""}
+            <a class="btn btn-ghost btn-lg" href="#/map">${icon("map", 15)} 知识地图</a>
+          </div>
+          <div class="hero-meta">
+            <div class="hero-meta-item"><strong>${progress.done}/${progress.total}</strong><span>已烧开</span></div>
+            <div class="hero-meta-item"><strong>${days !== null ? (days >= 0 ? `${days} 天` : "已到期") : "自定"}</strong><span>目标倒计时</span></div>
+            <div class="hero-meta-item"><strong>${formatMinutes(stats.today_minutes || 0)}</strong><span>今天投入</span></div>
+            <div class="hero-meta-item"><strong>${stats.streak || 0} 天</strong><span>连续学习</span></div>
+          </div>
+        </div>
+        <div class="hero-visual">
+          <div class="ring-wrap">
+            ${ringSVG(progress.percent || 0, { size: 190, stroke: 8 })}
+            <div class="ring-center">
+              <strong>${Math.round(progress.percent || 0)}<small style="font-size:18px">%</small></strong>
+              <span>烧开进度</span>
+              <small>${counts.boiled || 0} / ${counts.units || 0} 单元</small>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="stats-grid">
+        <div class="stat">
+          <span class="stat-icon">${icon("review", 18)}</span>
+          <div><div class="stat-value">${stats.reviews_today || 0}</div><div class="stat-label">今天已复习</div></div>
+        </div>
+        <div class="stat">
+          <span class="stat-icon teal">${icon("flame", 18)}</span>
+          <div><div class="stat-value">${counts.boiled || 0}</div><div class="stat-label">已烧开单元</div></div>
+        </div>
+        <div class="stat">
+          <span class="stat-icon gold">${icon("clock", 18)}</span>
+          <div><div class="stat-value">${formatMinutes(stats.week_minutes || 0)}</div><div class="stat-label">本周投入</div></div>
+        </div>
+        <div class="stat">
+          <span class="stat-icon violet">${icon("target", 18)}</span>
+          <div><div class="stat-value">${pct(stats.retention_30d || 0)}</div><div class="stat-label">30 天保留率</div></div>
+        </div>
+      </div>
+
+      <div class="grid grid-main mt-4">
+        <div class="stack">
+          <div class="card card-pad">
+            <div class="section-head">
+              <div><div class="section-title">今日闭环</div><div class="section-sub">不是五个功能，是一条完整的学习链。每天先走完复习。</div></div>
+              <span class="badge badge-ember">${today?.total_minutes || 0} 分钟</span>
+            </div>
+            <div class="loop-steps">
+              ${stepHTML(1, "复习到期卡", due > 0 ? `${due} 张卡在等你，先还掉` : "今天没有到期复习", due > 0 ? "current" : "done", "#/review")}
+              ${stepHTML(2, "预消化", currentUnitId ? "读一句话本质、类比与边界" : "暂无待学单元", due === 0 && unit ? "current" : "", currentUnitId ? `#/unit/${currentUnitId}` : "#/map")}
+              ${stepHTML(3, "苏格拉底", "一次一个问题，把理解走通", "", currentUnitId ? `#/unit/${currentUnitId}` : "#/map")}
+              ${stepHTML(4, "费曼挑战", "讲给一个外行听，暴露真实缺口", "", currentUnitId ? `#/feynman/${currentUnitId}` : "#/map")}
+              ${stepHTML(5, "留下证据", "复习卡与掌握雷达会记住今天", "", "#/insights")}
+            </div>
+            <div class="callout mt-3">${today?.is_rest ? "今天是计划里的休息日。休息也是学习的一部分；如果手痒，只做复习即可。" : `今日重点：<strong>${escapeHTML(today?.focus || "按自己的节奏来")}</strong>。不要贪多，完成一个闭环比刷十个视频更有用。`}</div>
+          </div>
+
+          <div class="grid grid-2">
+            <div class="card card-pad">
+              <div class="section-head"><div><div class="section-title">掌握雷达</div><div class="section-sub">证据来自复习、对话、讲解与探针</div></div><span class="badge badge-teal">${pct(mastery.average || 0)}</span></div>
+              <div class="radar-wrap">${radarSVG(facetValues, ["回忆", "解释", "应用", "迁移"], { size: 224 })}</div>
+              <div class="radar-legend">
+                ${["recall", "explain", "apply", "transfer"].map((k, i) => `<div><span class="legend-dot" style="background:${["var(--ember)","var(--gold)","var(--teal)","var(--violet)"][i]}"></span>${facetLabels[k]} ${pct(facetValues[i])}</div>`).join("")}
+              </div>
+            </div>
+            <div class="card card-pad">
+              <div class="section-head"><div><div class="section-title">最近发生</div><div class="section-sub">学习证据是长出来的，不是自评的</div></div><a class="badge badge-muted" href="#/insights">洞察 →</a></div>
+              <div class="timeline">
+                ${(d.activity || []).slice(0, 6).map(ev => {
+                  const meta = eventMeta(ev);
+                  return `<div class="timeline-item">
+                    <span class="timeline-dot">${icon(meta.icon, 12)}</span>
+                    <div class="timeline-body"><div class="timeline-title">${escapeHTML(meta.title)}</div><div class="timeline-sub">${relativeTime(ev.created_at)}</div></div>
+                  </div>`;
+                }).join("") || `<div class="empty" style="padding:24px 0"><p>还没有学习记录。开始第一个闭环。</p></div>`}
+              </div>
+            </div>
+          </div>
+
+          <div class="card card-pad">
+            <div class="section-head"><div><div class="section-title">知识地图</div><div class="section-sub">节点是单元，线是前置关系。颜色告诉你哪里该动手。</div></div><a class="btn btn-ghost btn-sm" href="#/map">打开完整地图 ${icon("arrow", 13)}</a></div>
+            ${miniMapSVG(mapUnits)}
+            <div class="row wrap" style="gap:14px;margin-top:6px">
+              ${Object.entries(statusMeta).map(([k, v]) => `<span class="row" style="gap:6px;font-size:10.5px;color:var(--muted)"><span class="map-dot ${k}"></span>${v.label}</span>`).join("")}
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card card-pad">
+            <div class="side-label">下一步建议</div>
+            <div style="display:flex;align-items:center;gap:12px;margin-top:12px">
+              <span class="stat-icon ${next.kind === "review" ? "teal" : next.kind === "feynman" ? "gold" : ""}">${icon(next.kind === "review" ? "review" : next.kind === "feynman" ? "teach" : "play", 18)}</span>
+              <div style="min-width:0"><div style="font-size:14px;font-weight:650">${escapeHTML(next.title || "开始今天的学习")}</div><div class="muted" style="font-size:11px;margin-top:2px">${escapeHTML(next.subtitle || "")}</div></div>
+            </div>
+            ${next.href ? `<a class="btn btn-primary btn-block mt-3" href="${next.href}">${escapeHTML(next.cta || "开始")} ${icon("arrow", 14)}</a>` : ""}
+            <div class="divider"></div>
+            <div class="between"><span class="muted small">复习到期</span><span class="badge ${due ? "badge-ember" : "badge-muted"}">${due} 张</span></div>
+            <div class="between mt-2"><span class="muted small">新卡</span><span class="badge badge-muted">${newCount} 张</span></div>
+            <div class="between mt-2"><span class="muted small">最弱维度</span><span class="badge badge-gold">${weakest ? facetLabels[weakest] : "还没有数据"}</span></div>
+          </div>
+
+          <div class="card card-pad">
+            <div class="section-head" style="margin-bottom:10px"><div><div class="section-title" style="font-size:16px">学习契约</div><div class="section-sub">计划是活的</div></div></div>
+            <div class="facet-row"><span class="muted">模式</span><span style="color:var(--text-2)">${plan.strategy?.mode === "minimum_viable" ? "最少必要路径" : "完整路径"}</span><span class="faint mono">v${plan.version || 1}</span></div>
+            <div class="facet-row"><span class="muted">每日</span><span style="color:var(--text-2)">${goal.daily_minutes} 分钟</span><span></span></div>
+            <div class="facet-row"><span class="muted">暂存</span><span style="color:var(--text-2)">${plan.strategy?.parked?.length || 0} 个单元</span><span></span></div>
+            <p class="small muted" style="margin-top:12px;line-height:1.7">${escapeHTML(plan.strategy?.summary || "还没有生成计划。")}</p>
+            <a class="btn btn-ghost btn-block mt-3" href="#/map">查看路径与暂存</a>
+          </div>
+
+          <div class="card card-pad">
+            <div class="section-head" style="margin-bottom:10px"><div><div class="section-title" style="font-size:16px">今天的时间</div><div class="section-sub">张弛有度，别把弦拉断</div></div><span class="badge badge-teal">${stats.streak || 0} 天</span></div>
+            <div class="row" style="justify-content:space-between"><span class="muted small">今日投入</span><span><strong>${formatMinutes(stats.today_minutes || 0)}</strong></span></div>
+            <div class="progress-line mt-2"><i style="width:${Math.min(100, ((stats.today_minutes || 0) / Math.max(1, goal.daily_minutes)) * 100)}%"></i></div>
+            <div class="row" style="justify-content:space-between;margin-top:8px"><span class="faint tiny">计划 ${goal.daily_minutes} 分钟</span><span class="faint tiny">${stats.week_sessions || 0} 个会话</span></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  el.querySelectorAll("[data-unit]").forEach(node => {
+    node.addEventListener("click", () => ctx.navigate(`#/unit/${node.dataset.unit}`));
+  });
+}

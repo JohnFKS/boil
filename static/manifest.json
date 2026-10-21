@@ -1,0 +1,12 @@
+{
+  "name": "Boil · 烧水",
+  "short_name": "Boil",
+  "description": "开源 AI 学习操作系统：路径、预消化、苏格拉底、费曼与间隔复习。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080b10",
+  "theme_color": "#080b10",
+  "icons": [
+    {"src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}
+  ]
+}

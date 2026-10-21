@@ -1,0 +1,240 @@
+/* Onboarding: choose a pack or compile your own material, then create a goal. */
+import { escapeHTML, icon, toast } from "../utils.js";
+
+const LEVELS = [
+  ["beginner", "刚刚起步"],
+  ["intermediate", "有一些基础"],
+  ["advanced", "想查漏补缺"],
+];
+
+function defaultDate(days = 56) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+export async function render(el, ctx, params) {
+  window.scrollTo({ top: 0, behavior: "instant" });
+  const catalog = await ctx.api.get("/api/packs");
+  const packs = catalog.packs || [];
+  const queryPack = params.query?.get("pack") || "";
+  let selected = packs.find(p => p.id === queryPack) || packs.find(p => p.id === catalog.default_pack) || packs[0];
+  let mode = selected ? "pack" : "material";
+  let step = 1;
+  let materialPack = null;
+  let busy = false;
+  let draft = {
+    name: ctx.state.me?.user?.name || "",
+    goalTitle: "",
+    materialTitle: "",
+    subject: "",
+    text: "",
+    deadline: defaultDate(),
+    daily: 40,
+    level: "beginner",
+  };
+
+  el.innerHTML = `
+    <div class="onboarding">
+      <section class="onboarding-hero">
+        <a class="brand" href="#/dashboard">
+          <span class="brand-mark">
+            <span class="kettle">
+              <span class="steam s1"></span><span class="steam s2"></span><span class="steam s3"></span>
+              <span class="kettle-handle"></span><span class="kettle-spout"></span><span class="kettle-body"></span><span class="kettle-base"></span>
+            </span>
+          </span>
+          <span class="brand-text"><strong>BOIL</strong><small>烧水 · 学习 OS</small></span>
+        </a>
+        <div>
+          <h1>把知识<br><em>烧开</em>，而不是看过。</h1>
+          <p class="lead">AI 负责准备：规划路径、预消化材料、追问、评分。你只负责一件事——真正把它学会。</p>
+          <div class="quote">“慢就是快。一个单元没有烧开，就不急着进入下一个。”</div>
+        </div>
+        <div class="foot">LOCAL-FIRST · OPEN SOURCE · MODEL-AGNOSTIC</div>
+      </section>
+      <section class="onboarding-panel">
+        <div class="step-dots"><span class="step-dot active" data-dot="1"></span><span class="step-dot" data-dot="2"></span><span class="step-dot" data-dot="3"></span></div>
+        <div id="onboarding-body"></div>
+      </section>
+    </div>`;
+
+  const body = el.querySelector("#onboarding-body");
+
+  function updateDots() {
+    el.querySelectorAll("[data-dot]").forEach(d => d.classList.toggle("active", Number(d.dataset.dot) <= step));
+  }
+
+  function renderStep1() {
+    step = 1; updateDots();
+    body.innerHTML = `
+      <div class="onboarding-step active">
+        <h2>你想先烧开哪一壶水？</h2>
+        <p class="sub">选一个内容包，或把你自己的材料编译成学习闭环。之后随时可以换。</p>
+        <div class="pack-grid">
+          ${packs.map(p => `
+            <button class="pack-card ${mode === "pack" && selected?.id === p.id ? "selected" : ""}" data-pack="${escapeHTML(p.id)}">
+              <span class="pack-cover ${escapeHTML(p.cover || "ember")}">${escapeHTML((p.name || "?").slice(0, 1))}</span>
+              <span class="pack-card-body">
+                <span class="pack-card-title">${escapeHTML(p.name)}</span>
+                <span class="pack-card-sub">${escapeHTML(p.description || "")}</span>
+                <span class="pack-card-meta">
+                  <span class="badge badge-muted">${p.unit_count} 个单元</span>
+                  <span class="badge badge-muted">${Math.round((p.estimated_minutes || 0) / 60)} 小时</span>
+                  ${p.installed ? `<span class="badge badge-teal">已安装</span>` : ""}
+                </span>
+              </span>
+              ${mode === "pack" && selected?.id === p.id ? `<span class="badge badge-ember">已选</span>` : ""}
+            </button>`).join("")}
+          <button class="pack-card ${mode === "material" ? "selected" : ""}" data-material>
+            <span class="pack-cover steam">✎</span>
+            <span class="pack-card-body">
+              <span class="pack-card-title">用我的材料创建</span>
+              <span class="pack-card-sub">粘贴讲义、笔记或教材片段，编译成知识单元、探针与复习卡。</span>
+              <span class="pack-card-meta"><span class="badge badge-muted">PDF 文本 / Markdown / 纯文本</span><span class="badge badge-muted">本地优先</span></span>
+            </span>
+            ${mode === "material" ? `<span class="badge badge-ember">已选</span>` : ""}
+          </button>
+        </div>
+        <div class="onboarding-actions">
+          <button class="btn btn-ghost" data-skip ${ctx.state.me?.goals?.length ? "" : "disabled"}>回到今日</button>
+          <button class="btn btn-primary" data-next>下一步 ${icon("arrow", 15)}</button>
+        </div>
+      </div>`;
+    body.querySelectorAll("[data-pack]").forEach(btn => btn.addEventListener("click", () => {
+      mode = "pack"; selected = packs.find(p => p.id === btn.dataset.pack); materialPack = null; renderStep1();
+    }));
+    body.querySelector("[data-material]")?.addEventListener("click", () => { mode = "material"; materialPack = null; renderStep2(); });
+    body.querySelector("[data-next]")?.addEventListener("click", () => {
+      if (mode === "pack" && !selected) return toast("先选一个内容包", "error");
+      renderStep2();
+    });
+    body.querySelector("[data-skip]")?.addEventListener("click", () => ctx.navigate("#/dashboard"));
+  }
+
+  function renderStep2() {
+    step = 2; updateDots();
+    const title = mode === "material" ? (materialPack?.name || draft.materialTitle || "我的学习材料") : (selected?.name || "我的学习目标");
+    body.innerHTML = `
+      <div class="onboarding-step active">
+        <h2>${mode === "material" ? "把材料交给编译器" : "设定你的学习契约"}</h2>
+        <p class="sub">${mode === "material" ? "先编译成可学习的单元，再决定目标与节奏。" : "目标、截止日期与每天可投入的时间，会决定路径的密度。"}</p>
+        <div class="form-grid mt-4">
+          <div class="field"><label>你的称呼</label><input class="input" id="ob-name" value="${escapeHTML(draft.name)}" placeholder="学习者"></div>
+          <div class="field"><label>目标名称</label><input class="input" id="ob-title" value="${escapeHTML(draft.goalTitle || title)}" placeholder="例如：掌握线性代数期末"></div>
+          ${mode === "material" ? `
+            <div class="field full"><label>材料标题</label><input class="input" id="ob-material-title" value="${escapeHTML(materialPack?.name || draft.materialTitle)}" placeholder="例如：第 3 章 导数与微分"></div>
+            <div class="field"><label>学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
+            <div class="field full"><label>材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="把讲义、笔记或教材片段粘贴到这里。至少 60 个字符。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
+          ` : ""}
+          <div class="field"><label>截止日期</label><input class="input" type="date" id="ob-deadline" value="${escapeHTML(draft.deadline)}"></div>
+          <div class="field"><label>每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
+          <div class="field full"><label>当前基础</label><div class="choice-row">${LEVELS.map(([v, l]) => `<button class="choice ${v === draft.level ? "active" : ""}" data-level="${v}">${l}</button>`).join("")}</div></div>
+        </div>
+        <div class="preview-box" id="ob-preview">
+          <strong>${mode === "material" ? "下一步会先编译，不会立刻开始。" : `将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。`}</strong><br>
+          ${mode === "material" ? "编译完成后，你可以预览单元再开始。" : `预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
+        </div>
+        <div class="onboarding-actions">
+          <button class="btn btn-ghost" data-back>上一步</button>
+          <button class="btn btn-primary" data-submit>${mode === "material" ? "编译并预览" : "生成学习路径"} ${icon("arrow", 15)}</button>
+        </div>
+      </div>`;
+    body.querySelectorAll("[data-level]").forEach(b => b.addEventListener("click", () => {
+      draft.level = b.dataset.level;
+      body.querySelectorAll("[data-level]").forEach(x => x.classList.toggle("active", x === b));
+    }));
+    const minutes = body.querySelector("#ob-minutes");
+    const minutesLabel = body.querySelector("#ob-minutes-label");
+    minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });
+    body.querySelector("[data-back]").addEventListener("click", renderStep1);
+    body.querySelector("[data-submit]").addEventListener("click", async () => {
+      if (busy) return;
+      const name = body.querySelector("#ob-name").value.trim();
+      const goalTitle = body.querySelector("#ob-title").value.trim();
+      const deadline = body.querySelector("#ob-deadline").value;
+      const daily = Number(minutes.value);
+      if (!goalTitle) return toast("给这个目标起个名字", "error");
+      draft = { ...draft, name, goalTitle, deadline, daily };
+      busy = true;
+      const btn = body.querySelector("[data-submit]");
+      const old = btn.innerHTML;
+      btn.disabled = true; btn.innerHTML = "正在准备…";
+      try {
+        if (mode === "material") {
+          if (materialPack) {
+            await createGoal({ name, pack_id: materialPack.id, goal_title: goalTitle, deadline, daily_minutes: daily, level: draft.level });
+            return;
+          }
+          const text = body.querySelector("#ob-text").value.trim();
+          if (text.length < 60) throw new Error("材料太短，至少 60 个字符");
+          const materialTitle = body.querySelector("#ob-material-title").value.trim() || goalTitle;
+          const subject = body.querySelector("#ob-subject").value.trim();
+          draft = { ...draft, materialTitle, subject, text };
+          const res = await ctx.api.post("/api/packs/compile", { title: materialTitle, subject, text, use_llm: true });
+          materialPack = res.pack;
+          if (res.warnings?.length) toast(res.warnings[0], "info", 5200);
+          renderStep3();
+          return;
+        }
+        await createGoal({ name, pack_id: selected.id, goal_title: goalTitle, deadline, daily_minutes: daily, level: draft.level });
+      } catch (e) {
+        toast(e.message || "创建失败", "error", 5000);
+        btn.disabled = false; btn.innerHTML = old;
+      } finally {
+        busy = false;
+      }
+    });
+  }
+
+  function renderStep3() {
+    step = 3; updateDots();
+    const units = materialPack?.units || [];
+    body.innerHTML = `
+      <div class="onboarding-step active">
+        <h2>编译完成，先看一眼结构</h2>
+        <p class="sub">这些单元会成为你的知识地图。标题和本质来自材料；没有把握的地方不会硬编。</p>
+        <div class="preview-box">
+          <div class="between"><strong>${escapeHTML(materialPack.name)}</strong><span class="badge badge-teal">${units.length} 个单元</span></div>
+          <div class="preview-units">
+            ${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span>${escapeHTML(u.title)}</span></div>`).join("")}
+          </div>
+        </div>
+        <div class="callout teal mt-3">第一版会以“先理解、再追问、最后复述”的顺序带你走；你可以随时在单元页开始苏格拉底或费曼。</div>
+        <div class="onboarding-actions">
+          <button class="btn btn-ghost" data-back>重新编辑</button>
+          <button class="btn btn-primary" data-start>开始学习 ${icon("arrow", 15)}</button>
+        </div>
+      </div>`;
+    body.querySelector("[data-back]").addEventListener("click", () => { materialPack = null; renderStep2(); });
+    body.querySelector("[data-start]").addEventListener("click", async () => {
+      await createGoal({
+        name: draft.name,
+        pack_id: materialPack.id,
+        goal_title: draft.goalTitle || materialPack.name,
+        deadline: draft.deadline,
+        daily_minutes: draft.daily,
+        level: draft.level,
+      });
+    });
+  }
+
+  async function createGoal(payload) {
+    const btn = body.querySelector("[data-submit], [data-start]");
+    if (btn) { btn.disabled = true; btn.innerHTML = "正在安装…"; }
+    try {
+      const result = await ctx.api.post("/api/onboarding", payload);
+      ctx.state.dashboard = result;
+      ctx.state.me = await ctx.api.get("/api/me");
+      await ctx.loadCatalog(true);
+      if (result.warnings?.length) toast(result.warnings[0], "info", 5000);
+      toast("第一壶水已经架上了。", "success");
+      ctx.navigate("#/dashboard");
+    } catch (e) {
+      toast(e.message || "创建目标失败", "error", 5000);
+      if (btn) { btn.disabled = false; btn.innerHTML = "重试"; }
+    }
+  }
+
+  renderStep1();
+}
