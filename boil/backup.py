@@ -30,6 +30,7 @@ IMPORT_TABLES: list[tuple[str, bool]] = [
     ("events", True),
     ("study_days", True),
     ("unit_notes", True),
+    ("notes", True),
 ]
 
 
@@ -85,6 +86,7 @@ def import_backup(db: Database, user_id: str, payload: dict[str, Any],
         "cards": int(counts.get("cards", 0)),
         "records": int(counts.get("boil_records", 0)),
         "notes": int(counts.get("unit_notes", 0)),
+        "inspirations": int(counts.get("notes", 0)),
     }
 
 

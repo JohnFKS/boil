@@ -13,7 +13,9 @@ import * as feynmanView from "./views/feynman.js";
 import * as reviewView from "./views/review.js";
 import * as libraryView from "./views/library.js";
 import * as insightsView from "./views/insights.js";
+import * as notesView from "./views/notes.js";
 import * as settingsView from "./views/settings.js";
+import { initSelectionMenu } from "./selectionMenu.js";
 
 const THEME_KEY = "boil_theme";
 const state = {
@@ -38,6 +40,7 @@ const PAGE_META = {
   review: { eyebrow: "SPACED REPETITION", title: "复习" },
   library: { eyebrow: "LEARNING PACKS", title: "内容库" },
   insights: { eyebrow: "LEARNING EVIDENCE", title: "洞察" },
+  notes: { eyebrow: "INSPIRATION", title: "灵感库" },
   settings: { eyebrow: "SYSTEM", title: "设置" },
 };
 
@@ -117,6 +120,7 @@ function navItems() {
     { key: "review", icon: "review", label: "复习", badge: due || null },
     { key: "library", icon: "library", label: "内容库" },
     { key: "insights", icon: "insights", label: "洞察" },
+    { key: "notes", icon: "spark", label: "灵感库" },
     { key: "settings", icon: "settings", label: "设置" },
   ];
 }
@@ -204,7 +208,7 @@ function shellHTML() {
       </div>
     </div>
     <nav class="mobile-nav" aria-label="移动导航">
-      ${navItems().slice(0, 5).map(item => `
+      ${navItems().slice(0, 6).map(item => `
         <a href="#/${item.key}" class="${state.route === item.key ? "active" : ""}">
           <span class="nav-icon">${icon(item.icon, 17)}</span><span>${item.label}</span>
         </a>`).join("")}
@@ -288,7 +292,7 @@ async function renderRoute() {
   const module = {
     dashboard: dashboardView, map: mapView, unit: unitView, socratic: socraticView,
     feynman: feynmanView, review: reviewView, library: libraryView,
-    insights: insightsView, settings: settingsView,
+    insights: insightsView, notes: notesView, settings: settingsView,
   }[name];
   if (!module) {
     view.innerHTML = `<div class="empty"><div class="empty-icon">${icon("compass", 22)}</div><h3>找不到这个页面</h3><p>回到今日，继续烧水。</p><a class="btn btn-primary mt-3" href="#/dashboard">回到今日</a></div>`;
@@ -444,6 +448,7 @@ async function boot() {
     return;
   }
   clearTimeout(watchdog);
+  initSelectionMenu(ctx);
   try {
     await renderRoute();
     window.__boilBootReady?.();

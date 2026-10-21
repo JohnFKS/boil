@@ -15,7 +15,7 @@ function messageHTML(m, index) {
   return `<div class="msg ${isUser ? "user" : "assistant"}" data-msg="${index}">
     <span class="msg-avatar">${icon(isUser ? "brain" : "spark", 14)}</span>
     <div>
-      <div class="msg-bubble">${isUser ? streamingText(m.content) : renderMarkdown(m.content)}</div>
+      <div class="msg-bubble" data-selectable data-source="socratic">${isUser ? streamingText(m.content) : renderMarkdown(m.content)}</div>
       <div class="msg-meta">${isUser ? "你" : "教练"} · ${formatDateTime(m.created_at)}${m.meta?.engine === "demo" ? " · 演示引擎" : ""}</div>
     </div>
   </div>`;
@@ -54,7 +54,7 @@ function chatHTML(data) {
             <button class="btn btn-ghost btn-sm" data-hint>${icon("hint", 14)} 给点提示</button>
           </div>
         </div>
-        <div class="chat-body" id="chat-body">
+        <div class="chat-body" id="chat-body" data-unit-id="${escapeAttr(unit?.id || "")}">
           ${messages.map(messageHTML).join("")}
           <div id="stream-anchor"></div>
         </div>

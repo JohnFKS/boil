@@ -44,8 +44,9 @@ boil/
 │   ├── srs/fsrs.py            # FSRS-5 四档调度
 │   └── config.py / utils.py
 ├── content/packs/             # 内置内容包
-├── prompts/                   # 苏格拉底 / 费曼 / 编译器提示词
+├── prompts/                   # 苏格拉底 / 费曼 / 编译器 / 元信息 / 洞察解读提示词
 ├── static/                    # 自研 SPA（无构建链）+ 本地 KaTeX
+│   └── js/selectionMenu.js    # 全局划词浮条 + 右键菜单 → 灵感笔记
 ├── tests/                     # unittest：核心 / API / LLM / live
 ├── tools/                     # examgen 导入器、浏览器验收
 ├── data/                      # 运行时数据（gitignore）
@@ -104,16 +105,30 @@ boil/
 ### 4.1 Onboarding
 
 ```
+POST /api/packs/suggest（可选，编译前先出标题/学科/目标名）
+  → merge_material_documents → LLM 或本地规则 → {title, subject, goal_title, description, source}
+
+POST /api/packs/compile
+  → merge_material_documents（多文件 + 粘贴文本，上限 200k 字符）
+  → compiler.compile_material
+      LLM 路径：units + outline + study_plan + digest + generated_by="model"
+      本地路径：同构字段 + generated_by="rules"（形状一致，只是叙事更朴素）
+  → normalize_pack（顶层新字段原样保留）→ 保存到 data/packs/
+
 POST /api/onboarding
   → ensure_user
   → 选择/编译 Pack
-  → 安装 Pack（事务）
+  → 安装 Pack（事务；manifest_json 保存完整 Pack，units 表带 angle 列）
   → units + relations
-  → planner.build_plan
+  → planner.build_plan(ai_outline=…)   # AI 决定顺序叙事，代码决定日期算术
+  → goal.meta_json 存 ai_digest / ai_outline / ai_study_plan / ai_generated_by
   → plans 插入新版本
   → event: goal.created / plan.built / pack.installed
-  → 返回 dashboard
+  → 返回 dashboard（含 digest，前端据此渲染「材料总览」卡）
 ```
+
+呈现纪律：凡是 AI 生成的内容（总览、大纲、阶段、单元 angle、洞察解读），响应里都带
+`source`/`generated_by` 字段，前端渲染成「AI 分析」或「本地规则」badge。规则回退绝不冒充模型输出。
 
 ### 4.2 苏格拉底
 
@@ -249,13 +264,29 @@ score = old * (1 - alpha) + evidence * alpha
 
 ## 7. 规划器
 
-输入：单元顺序、前置关系、重要度、估算分钟数、每日分钟数、截止日期。
+输入：单元顺序、前置关系、重要度、估算分钟数、每日分钟数、截止日期、可选 `ai_outline`。
 
 - 拓扑排序保证前置；环时按 order_index 兜底。
+- `ai_outline` 只重写 `order_index`（LLM 建议的学习顺序），**前置依赖仍由拓扑排序裁决**：AI 提方案，代码做计算与校验，模型不能绕过依赖关系。
 - 每日新内容预算 = 每日分钟 - 复习预算 - 10% buffer；最多 2 个新单元/天。
 - 每 7 天安排一个休息日。
 - 时间不够时，按重要度选高权重单元，并自动补前置；其余进入 `parked`（暂存）。
 - 计划是版本化的；重排从今天开始，不累积历史欠账。
+- `plan.outline` 透传 AI 大纲，重新排期（`/api/plan/rebuild`）时从 `goal.meta.ai_outline` 取回，顺序不会丢。
+
+### 7.1 灵感笔记（notes）
+
+与 `unit_notes` 分开：`unit_notes` 是「每个单元每类一条」的速记/笔记，`notes` 是可以跨页面无限累积的划词记录，带 `quote`（引用原文快照）、`content`、`source`（来源视图）、可空 `unit_id`/`goal_id`。
+
+```
+前端 selectionMenu.js
+  → selectionchange（划词浮条）/ contextmenu（右键）
+  → 只在 [data-selectable] 容器内触发；输入框/textarea 内不触发
+  → POST /api/notes {quote, content, unit_id?, source}
+  → 事件 boil:note-saved → #/notes 视图自动刷新
+```
+
+引用存的是**文字快照而不是字符偏移**，因此材料重排、单元重新安装都不会让笔记失效（后续 E2 会按引文在单元页把所有出现位置高亮出来）。
 
 ## 8. LLM 网关
 

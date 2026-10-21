@@ -84,9 +84,10 @@ export async function render(el, ctx, params) {
     </div>
 
     <div class="unit-grid">
-      <div class="unit-main">
+      <div class="unit-main" data-selectable data-unit-id="${escapeAttr(u.id)}" data-source="unit">
         <div class="essence-card">
           <div class="essence-label">${icon("spark", 13)} 一句话本质</div>
+          ${u.angle ? `<div class="unit-angle">${icon("compass", 12)} ${escapeHTML(u.angle)}${u.source_ref?.kind === "llm" ? "" : `<span class="badge badge-muted">本地规则</span>`}</div>` : ""}
           <div class="essence-text">${escapeHTML(u.essence || "这个单元还没有本质描述。")}</div>
           <div class="essence-foot">
             <span>${icon("clock", 12)} 建议先花 10 分钟预消化</span>

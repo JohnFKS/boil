@@ -222,7 +222,7 @@ export async function render(el, ctx, params) {
           </div>
         </div>
       </div>
-      <div class="map-side" id="map-side">${defaultSide(data)}</div>
+      <div class="map-side" id="map-side" data-selectable data-source="map">${defaultSide(data)}</div>
     </div>`;
 
   const side = el.querySelector("#map-side");

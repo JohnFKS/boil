@@ -91,11 +91,45 @@ def _select_units(units: list[dict[str, Any]], relations: list[dict[str, Any]],
     return selected, parked, "minimum_viable"
 
 
+def _apply_outline_order(units: list[dict[str, Any]],
+                         ai_outline: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """按 AI 大纲的标题顺序重排 order_index；前置依赖仍由拓扑排序兜住。"""
+    if not ai_outline:
+        return units
+    wanted: list[str] = []
+    for entry in ai_outline:
+        if not isinstance(entry, dict):
+            continue
+        for title in (entry.get("unit_titles") or []):
+            name = str(title or "").strip()
+            if name and name not in wanted:
+                wanted.append(name)
+    if not wanted:
+        return units
+
+    def rank(unit: dict[str, Any]) -> int:
+        title = str(unit.get("title") or "").strip()
+        if title in wanted:
+            return wanted.index(title)
+        hit = next((i for i, w in enumerate(wanted) if w and (w in title or title in w)), None)
+        return len(wanted) if hit is None else hit
+
+    ordered = sorted(range(len(units)), key=lambda i: (rank(units[i]), i))
+    rescheduled = []
+    for new_index, i in enumerate(ordered):
+        u = dict(units[i])
+        u["order_index"] = new_index
+        rescheduled.append(u)
+    return rescheduled
+
+
 def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
                daily_minutes: int = 40, start: date | None = None,
                deadline: date | None = None, version: int = 1,
-               goal_id: str = "", plan_id: str = "") -> dict[str, Any]:
+               goal_id: str = "", plan_id: str = "",
+               ai_outline: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     daily_minutes = int(clamp(int(daily_minutes or 40), 10, 240))
+    units = _apply_outline_order(units, ai_outline)
     start = start or datetime.now().astimezone().date()
     if deadline and deadline >= start:
         total_days = (deadline - start).days + 1
@@ -211,6 +245,7 @@ def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
         },
         "days": days,
         "milestones": milestones,
+        "outline": ai_outline or [],
     }
 
 

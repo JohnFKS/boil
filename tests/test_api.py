@@ -292,12 +292,144 @@ class ApiTest(unittest.TestCase):
             self.assertIn("camera=()", resp.headers.get("Permissions-Policy", ""))
             self.assertIn("script-src 'self'", resp.headers.get("Content-Security-Policy", ""))
 
+    def test_12_compile_outline_and_plan(self):
+        comp = self.call("POST", "/api/packs/compile", {
+            "title": "大纲测试", "subject": "学习科学", "use_llm": False,
+            "text": (
+                "## 记忆的形成\n学习会形成可提取的记忆，模仿与练习共同塑造回路。\n- 合书复述\n\n"
+                "## 间隔复习\n分散练习提高长期保持。\n- 使用复习卡片\n\n"
+                "## 知识迁移\n变式练习帮助识别问题结构。\n- 换情境\n- 举反例\n"
+            ),
+        })
+        self.assertTrue(comp["ok"])
+        pack = comp["data"]["pack"]
+        self.assertEqual(pack["generated_by"], "rules")
+        self.assertTrue(pack["outline"])
+        self.assertTrue(pack["study_plan"])
+        self.assertTrue(pack["digest"]["overview"])
+        titles = {u["title"] for u in pack["units"]}
+        covered = {t for entry in pack["outline"] for t in entry["unit_titles"]}
+        self.assertTrue(titles <= covered)
+        goal = self.call("POST", "/api/onboarding", {
+            "name": "大纲测试者", "pack_id": pack["id"],
+            "goal_title": "学会这三件事", "daily_minutes": 40, "deadline": "2026-12-31",
+        })["data"]
+        dash = self.call("GET", "/api/dashboard")["data"]
+        self.assertTrue(dash["plan"].get("outline"), "计划里要带上 AI 大纲")
+        meta = goal["goal"]["meta"]
+        self.assertEqual(meta["ai_generated_by"], "rules")
+        self.assertTrue(meta["ai_digest"]["overview"])
+        self.assertTrue(meta["ai_outline"])
+        self.assertTrue(meta["ai_study_plan"])
+
+    def test_13_ai_synthesis_surfaces(self):
+        comp = self.call("POST", "/api/packs/compile", {
+            "title": "AI 合成测试", "subject": "学习科学", "use_llm": False,
+            "text": (
+                "## 提取练习\n反复提取才强化记忆，重读只会带来懂了的错觉。\n- 合书复述\n\n"
+                "## 间隔安排\n复习要排在快要忘的时候。\n- 到期优先\n"
+            ),
+        })["data"]["pack"]
+        self.call("POST", "/api/onboarding", {
+            "name": "合成测试者", "pack_id": comp["id"], "goal_title": "学会提取与安排",
+            "daily_minutes": 40, "deadline": "2026-12-31",
+        })
+        unit_id = self.call("GET", "/api/map")["data"]["nodes"][0]["id"]
+        u = self.call("GET", "/api/units/" + urllib.parse.quote(unit_id))["data"]["unit"]
+        self.assertTrue(u["angle"], "每个单元要有怎么学的导读")
+        dash = self.call("GET", "/api/dashboard")["data"]
+        self.assertTrue(dash["digest"]["overview"])
+        self.assertEqual(dash["generated_by"], "rules")
+        self.assertTrue(dash["study_plan_phases"])
+        syn = self.call("POST", "/api/insights/synthesize", {})["data"]
+        self.assertEqual(syn["source"], "rules")
+        self.assertTrue(syn["summary"])
+        self.assertTrue(syn["suggestions"])
+        self.assertTrue(syn["risks"])
+        self.assertIsInstance(syn["warnings"], list)
+
+    def test_15_inspiration_notes(self):
+        unit_id = self.call("GET", "/api/map")["data"]["nodes"][0]["id"]
+        created = self.call("POST", "/api/notes", {
+            "quote": "提取一次，记忆痕迹就被强化一次",
+            "content": "可以把它变成每天早上的第一个动作。",
+            "unit_id": unit_id, "source": "unit",
+        })["data"]
+        note_id = created["id"]
+        self.assertTrue(note_id)
+        self.assertEqual(created["note"]["unit_title"], self.call("GET", "/api/map")["data"]["nodes"][0]["title"])
+        loose = self.call("POST", "/api/notes", {"content": "只有想法没有引用", "source": "dashboard"})["data"]
+        self.assertTrue(loose["id"])
+        listed = self.call("GET", "/api/notes")["data"]
+        self.assertEqual(listed["total"], 2)
+        self.assertIn("提取一次", json.dumps(listed, ensure_ascii=False))
+        filtered = self.call("GET", "/api/notes?unit_id=" + urllib.parse.quote(unit_id))["data"]
+        self.assertEqual(len(filtered["notes"]), 1)
+        searched = self.call("GET", "/api/notes?q=" + urllib.parse.quote("早上"))["data"]
+        self.assertEqual(len(searched["notes"]), 1)
+        r, body = self.call("GET", "/api/notes/export", raw=True)
+        markdown = body.decode()
+        self.assertIn("attachment", r.headers.get("Content-Disposition", ""))
+        self.assertIn("提取一次", markdown)
+        self.assertIn("只有想法没有引用", markdown)
+        try:
+            self.call("POST", "/api/notes", {"quote": "", "content": "   "})
+            self.fail("empty note should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        long_note = self.call("POST", "/api/notes", {"quote": "y" * 3000})["data"]
+        self.assertEqual(len(long_note["note"]["quote"]), 2000)
+        self.call("POST", "/api/notes/delete", {"id": note_id})
+        self.call("POST", "/api/notes/delete", {"id": long_note["id"]})
+        self.call("POST", "/api/notes/delete", {"id": loose["id"]})
+        self.assertEqual(self.call("GET", "/api/notes")["data"]["total"], 0)
+        try:
+            self.call("POST", "/api/notes/delete", {"id": "no-such-note"})
+            self.fail("missing note should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/notes/delete", {})
+            self.fail("missing id should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")
             self.fail("should 404")
         except urllib.error.HTTPError as exc:
             self.assertEqual(exc.code, 404)
+
+    def test_11_suggest_meta(self):
+        out = self.call("POST", "/api/packs/suggest", {
+            "text": "## 记忆的形成\n学习会形成可提取的记忆，模仿与练习共同塑造神经回路。\n"
+                    "合书复述比重复阅读更有效，因为提取本身会改变记忆的强度。",
+        })
+        self.assertTrue(out["ok"])
+        data = out["data"]
+        self.assertEqual(data["source"], "rules")
+        self.assertTrue(data["title"])
+        self.assertTrue(data["goal_title"])
+        multi = self.call("POST", "/api/packs/suggest", {
+            "text": "",
+            "documents": [
+                {"name": "睡眠与巩固.md", "text": "## 睡眠如何巩固记忆\n快速眼动睡眠期间海马体回放白天的经历。"},
+                {"name": "交错练习.txt", "text": "交错练习帮助识别题型，需要先辨别再选择方法。"},
+            ],
+        })
+        self.assertTrue(multi["ok"])
+        self.assertTrue(multi["data"]["title"])
+        try:
+            self.call("POST", "/api/packs/suggest", {"text": "太短了"})
+            self.fail("short material should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/packs/suggest", {"text": "x" * 80, "documents": "not-a-list"})
+            self.fail("documents must be a list")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
 
 
 if __name__ == "__main__":

@@ -87,7 +87,7 @@ export async function render(el, ctx, params) {
         <div class="callout mt-3">${escapeHTML(pack.description || "")}</div>
         <div class="row wrap mt-3"><span class="badge badge-teal">${units.length} 个单元</span><span class="badge badge-muted">${formatMinutes(units.reduce((a, u) => a + (u.estimated_minutes || 45), 0))}</span><span class="badge badge-muted">${escapeHTML(pack.license || "")}</span></div>
         ${pack.quality ? `<div class="callout teal mt-3"><strong>质量门禁</strong> · 原子率 ${pct(pack.quality.atomic_rate)} · 探针覆盖 ${pct(pack.quality.probe_coverage)} · DAG ${pack.quality.dag_ok ? "无环" : "有环"}<br><span class="small">原子单元 ${pack.quality.atomic_units}/${pack.quality.total_units}；探针覆盖指 recall/explain/apply/boundary 四类齐全的单元比例。</span>${(pack.quality.issues || []).length ? `<br><span class="small muted">待修：${pack.quality.issues.map(escapeHTML).join("；")}</span>` : ""}</div>` : ""}
-        <div class="preview-units mt-3" style="max-height:320px">${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span><strong>${escapeHTML(u.title)}</strong><br><span class="faint">${escapeHTML(truncate(u.essence || "", 90))}</span></span></div>`).join("")}</div>
+        <div class="preview-units mt-3" data-selectable data-source="library" style="max-height:320px">${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span><strong>${escapeHTML(u.title)}</strong><br><span class="faint">${escapeHTML(truncate(u.essence || "", 90))}</span></span></div>`).join("")}</div>
         ${pack.source?.system ? `<div class="source-line mt-3"><span class="badge badge-violet">${escapeHTML(pack.source.system)}</span><span>${escapeHTML(pack.source.kind || "")}</span><span class="faint">${escapeHTML(pack.source.note || "")}</span></div>` : ""}`;
       openModal({
         title: pack.name, subtitle: "Learning Pack · " + pack.version, body, wide: true,
@@ -173,7 +173,7 @@ export async function render(el, ctx, params) {
     const units = pack.units || [];
     const body = `<div class="callout teal">${escapeHTML(pack.description || "")}</div>
       <div class="row wrap mt-3"><span class="badge badge-teal">${units.length} 个单元</span><span class="badge badge-muted">${escapeHTML(pack.license || "user-provided")}</span><span class="badge badge-violet">${escapeHTML(pack.source?.system || "compiler")}</span></div>
-      <div class="preview-units mt-3" style="max-height:300px">${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span><strong>${escapeHTML(u.title)}</strong><br><span class="faint">${escapeHTML(truncate(u.essence || "", 100))}</span></span></div>`).join("")}</div>`;
+      <div class="preview-units mt-3" data-selectable data-source="library" style="max-height:300px">${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span><strong>${escapeHTML(u.title)}</strong><br><span class="faint">${escapeHTML(truncate(u.essence || "", 100))}</span></span></div>`).join("")}</div>`;
     openModal({
       title: "预览内容包", subtitle: pack.name, body, wide: true,
       actions: [

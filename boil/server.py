@@ -56,9 +56,14 @@ class App:
             ("GET", re.compile(r"^/api/map$"), self.map),
             ("GET", re.compile(r"^/api/units/([^/]+)$"), self.unit),
             ("POST", re.compile(r"^/api/units/([^/]+)/notes$"), self.unit_note),
+            ("GET", re.compile(r"^/api/notes$"), self.notes_list),
+            ("POST", re.compile(r"^/api/notes$"), self.notes_create),
+            ("POST", re.compile(r"^/api/notes/delete$"), self.notes_delete),
+            ("GET", re.compile(r"^/api/notes/export$"), self.notes_export),
             ("GET", re.compile(r"^/api/packs$"), self.packs),
             ("GET", re.compile(r"^/api/packs/([^/]+)$"), self.pack_detail),
             ("POST", re.compile(r"^/api/packs/compile$"), self.compile_pack),
+            ("POST", re.compile(r"^/api/packs/suggest$"), self.pack_suggest),
             ("POST", re.compile(r"^/api/packs/import$"), self.pack_import),
             ("POST", re.compile(r"^/api/socratic/start$"), self.socratic_start),
             ("POST", re.compile(r"^/api/socratic/stream$"), self.socratic_stream),
@@ -68,6 +73,7 @@ class App:
             ("GET", re.compile(r"^/api/review$"), self.review),
             ("POST", re.compile(r"^/api/review/([^/]+)$"), self.review_rate),
             ("GET", re.compile(r"^/api/insights$"), self.insights),
+            ("POST", re.compile(r"^/api/insights/synthesize$"), self.insights_synthesize),
             ("GET", re.compile(r"^/api/settings/llm$"), self.llm_get),
             ("POST", re.compile(r"^/api/settings/llm$"), self.llm_set),
             ("POST", re.compile(r"^/api/settings/llm/test$"), self.llm_test),
@@ -155,6 +161,31 @@ class App:
             str(body.get("kind") or "note"), str(body.get("content") or ""),
         )
 
+    def notes_list(self, req, match, query, body):
+        return services.list_notes(
+            self.db, config.DEFAULT_USER,
+            unit_id=_q(query, "unit_id") or None,
+            q=_q(query, "q") or None,
+            limit=int(_q(query, "limit") or 200),
+        )
+
+    def notes_create(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return services.create_note(self.db, config.DEFAULT_USER, body)
+
+    def notes_delete(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        note_id = str(body.get("id") or "").strip()
+        if not note_id:
+            raise ApiError(400, "缺少 id", "bad_request")
+        return services.delete_note(self.db, config.DEFAULT_USER, note_id)
+
+    def notes_export(self, req, match, query, body):
+        text = services.export_notes_markdown(self.db, config.DEFAULT_USER)
+        req.send_download(text, "boil-notes.md", content_type="text/markdown; charset=utf-8")
+
     def packs(self, req, match, query, body):
         return services.pack_catalog(self.db, config.DEFAULT_USER)
 
@@ -180,6 +211,15 @@ class App:
         return services.compile_preview(self.db, title, subject, text, use_llm,
                                         use_embeddings=use_embeddings,
                                         documents=documents)
+
+    def pack_suggest(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        text = str(body.get("text") or "")
+        documents = body.get("documents")
+        if documents is not None and not isinstance(documents, list):
+            raise ApiError(400, "documents 必须是数组", "bad_request")
+        return services.suggest_meta(text, documents)
 
     def socratic_start(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -274,6 +314,12 @@ class App:
 
     def insights(self, req, match, query, body):
         return services.insights(self.db, config.DEFAULT_USER, _q(query, "goal_id") or None)
+
+    def insights_synthesize(self, req, match, query, body):
+        goal_id = None
+        if isinstance(body, dict):
+            goal_id = str(body.get("goal_id") or "") or None
+        return services.insights_synthesize(self.db, config.DEFAULT_USER, goal_id)
 
     def llm_get(self, req, match, query, body):
         return llm.public_config()

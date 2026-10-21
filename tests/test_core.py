@@ -10,9 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import backup, config, embeddings, feynman, llm, mastery, planner, services, socratic
+from boil import backup, compiler, config, embeddings, feynman, llm, mastery, planner, services, socratic
 from boil.compiler import compile_heuristic, compile_material
-from boil.db import Database
+from boil.db import Database, SCHEMA_VERSION
 from boil.packs import (all_available_packs, install_pack, validate_pack)
 from boil.srs.fsrs import Scheduler, interval_label
 
@@ -138,6 +138,34 @@ class PlannerTest(unittest.TestCase):
                                   start=datetime(2026, 10, 21).date())
         self.assertTrue(plan["days"])
 
+    def test_outline_reorders_without_relations(self):
+        order = ["单元 3", "单元 1", "单元 0", "单元 2", "单元 4", "单元 5"]
+        outline = [{"title": "先抓重点", "summary": "从 3 开始", "unit_titles": order}]
+        plan = planner.build_plan(self.units(), [], daily_minutes=60,
+                                  start=datetime(2026, 10, 21).date(),
+                                  deadline=datetime(2026, 12, 31).date(),
+                                  goal_id="g3", ai_outline=outline)
+        ids = [x["id"] for d in plan["days"] for x in d["new_units"]]
+        self.assertEqual(ids, ["u3", "u1", "u0", "u2", "u4", "u5"])
+        self.assertEqual(plan["outline"], outline)
+
+    def test_outline_cannot_break_prerequisites(self):
+        outline = [{"title": "倒序尝试", "unit_titles": [f"单元 {i}" for i in range(5, -1, -1)]}]
+        plan = planner.build_plan(self.units(), self.relations(), daily_minutes=60,
+                                  start=datetime(2026, 10, 21).date(),
+                                  deadline=datetime(2026, 12, 31).date(),
+                                  goal_id="g4", ai_outline=outline)
+        ids = [x["id"] for d in plan["days"] for x in d["new_units"]]
+        self.assertEqual(ids, [f"u{i}" for i in range(6)])
+
+    def test_outline_matching_tolerates_wording_drift(self):
+        outline = [{"title": "近似标题", "unit_titles": ["单元 1 的扩展", "单元 0"]}]
+        plan = planner.build_plan(self.units(3), [], daily_minutes=60,
+                                  start=datetime(2026, 10, 21).date(),
+                                  goal_id="g5", ai_outline=outline)
+        ids = [x["id"] for d in plan["days"] for x in d["new_units"]]
+        self.assertEqual(ids[:2], ["u1", "u0"])
+
 
 class CompilerTest(TempCase):
     def test_heuristic_compile(self):
@@ -179,6 +207,135 @@ class CompilerTest(TempCase):
         pack, warnings = compile_material("测试", "数学", "## 概念\n这是核心概念。\n- 步骤一\n注意边界。", use_llm=False)
         self.assertTrue(validate_pack(pack) == [])
         self.assertIsInstance(warnings, list)
+
+    def test_heuristic_emits_outline_plan_and_digest(self):
+        text = """# 极限的定义
+极限描述的是趋近过程，而不是到达。
+- 先理解任意 ε 的含义
+
+## 连续与可导
+连续要求函数值、极限都存在且相等。
+- 先检查定义域
+
+## 中值定理
+闭区间连续、开区间可导则存在导数等于平均变化率的点。
+"""
+        pack = compile_heuristic("高数笔记", "高等数学", text)
+        self.assertEqual(validate_pack(pack), [])
+        self.assertEqual(pack["generated_by"], "rules")
+        self.assertTrue(pack["outline"])
+        self.assertTrue(pack["study_plan"])
+        self.assertTrue(pack["digest"]["overview"])
+        self.assertTrue(pack["digest"]["advice"])
+        titles = {u["title"] for u in pack["units"]}
+        covered = {t for entry in pack["outline"] for t in entry["unit_titles"]}
+        self.assertTrue(titles <= covered, "大纲必须覆盖全部单元")
+        for phase in pack["study_plan"]:
+            self.assertGreater(phase["minutes"], 0)
+
+    def test_normalize_plan_fields_matches_drifting_titles(self):
+        units = [{"title": "记忆的形成", "essence": "学习形成可提取记忆"},
+                 {"title": "知识迁移", "essence": "变式练习"}]
+        data = {"outline": [{"title": "第一部分", "summary": "先立地基",
+                             "unit_titles": ["记忆的形成与提取", "不存在的东西"]}],
+                "study_plan": [{"phase": "地基", "unit_titles": ["记忆的形成"],
+                                "focus": "理解本质", "minutes": "120"}],
+                "digest": {"overview": "两个单元。", "advice": ["先复述", "再复习"]}}
+        fields = compiler._normalize_plan_fields(data, units)
+        self.assertEqual(fields["outline"][0]["unit_titles"], ["记忆的形成"])
+        self.assertEqual(fields["outline"][1]["title"], "知识迁移")
+        self.assertEqual(fields["study_plan"][0]["minutes"], 120)
+        self.assertEqual(len(fields["digest"]["advice"]), 2)
+
+
+class MigrationTest(TempCase):
+    def test_legacy_database_gains_angle_column(self):
+        cols = lambda: {r["name"] for r in self.db.query("PRAGMA table_info(units)")}
+        self.assertIn("angle", cols())
+        self.db.execute("ALTER TABLE units DROP COLUMN angle")
+        self.assertNotIn("angle", cols())
+        self.db.init_schema()
+        self.assertIn("angle", cols())
+
+    def test_init_schema_is_idempotent(self):
+        for _ in range(3):
+            self.db.init_schema()
+        version = self.db.one("SELECT value FROM meta WHERE key='schema_version'")
+        self.assertEqual(version["value"], str(SCHEMA_VERSION))
+        self.assertIn("angle", {r["name"] for r in self.db.query("PRAGMA table_info(units)")})
+
+
+class AiPathTest(TempCase):
+    """走 model 分支：这些断言能抓出“异常被回退吞掉”的 bug。"""
+
+    def setUp(self):
+        super().setUp()
+        self._llm_old = (llm.enabled, llm.chat_json)
+
+    def tearDown(self):
+        llm.enabled, llm.chat_json = self._llm_old
+        super().tearDown()
+
+    def test_suggest_meta_model_path(self):
+        llm.enabled = lambda: True
+        llm.chat_json = lambda messages, **kw: {
+            "title": "  记忆与复习策略  ", "subject": "学习科学",
+            "goal_title": "掌握复习节奏", "description": "讲提取练习与间隔安排"}
+        out = services.suggest_meta("## 记忆\n提取练习强化记忆，间隔复习对抗遗忘，交错练习促进迁移。" * 3)
+        self.assertEqual(out["source"], "model")
+        self.assertEqual(out["title"], "记忆与复习策略")
+        self.assertEqual(out["subject"], "学习科学")
+
+    def test_suggest_meta_falls_back_when_model_fails(self):
+        llm.enabled = lambda: True
+
+        def boom(messages, **kw):
+            raise RuntimeError("网关挂了")
+        llm.chat_json = boom
+        out = services.suggest_meta("## 极限\n极限描述趋近过程而不是到达，需要先固定 epsilon 再找 delta，不能当成固定常数。" * 2)
+        self.assertEqual(out["source"], "rules")
+        self.assertTrue(out["title"])
+
+    def test_insights_synthesize_model_path(self):
+        self.onboard()
+        llm.enabled = lambda: True
+        seen = {}
+
+        def fake_json(messages, **kw):
+            seen["prompt"] = messages[1]["content"]
+            return {"summary": "五个单元都还没积累证据。",
+                    "suggestions": ["先做第一次提取练习", "把最弱单元讲一遍", "明天复习"],
+                    "risks": ["长时间不动手会维持在新卡状态"]}
+        llm.chat_json = fake_json
+        out = services.insights_synthesize(self.db, "local")
+        self.assertEqual(out["source"], "model")
+        self.assertEqual(out["warnings"], [])
+        self.assertTrue(out["summary"].startswith("五个单元"))
+        self.assertEqual(len(out["suggestions"]), 3)
+        self.assertIn("材料总览", seen["prompt"])
+        self.assertIn("单元总数", seen["prompt"])
+
+    def test_compile_material_model_path_carries_plan_fields(self):
+        llm.enabled = lambda: True
+        llm.chat_json = lambda messages, **kw: {
+            "name": "模型包", "description": "两个单元", "subject": "学习科学",
+            "outline": [{"title": "第一部分", "summary": "先立地基",
+                         "unit_titles": ["提取练习"]}],
+            "study_plan": [{"phase": "地基", "unit_titles": ["提取练习"],
+                            "focus": "理解本质", "minutes": 90}],
+            "digest": {"overview": "这份材料讲提取与复习。", "advice": ["先复述"]},
+            "units": [{"title": "提取练习", "angle": "先合书复述再核对",
+                       "essence": "提取强化记忆", "steps": ["合上书回忆"],
+                       "key_points": ["提取"], "probes": [], "cards": []}]}
+        pack, warnings = services.compile_material("材料", "学习科学", "提取练习强化记忆。" * 20,
+                                                   use_llm=True, use_embeddings=False)
+        self.assertEqual(warnings, [])
+        self.assertEqual(pack["generated_by"], "model")
+        self.assertEqual(pack["units"][0]["angle"], "先合书复述再核对")
+        self.assertEqual(pack["digest"]["overview"], "这份材料讲提取与复习。")
+        self.assertEqual([e["title"] for e in pack["outline"]], ["第一部分"])
+        errors = validate_pack(pack)
+        self.assertEqual(errors, [])
 
 
 class ServiceTest(TempCase):
@@ -283,6 +440,51 @@ class ServiceTest(TempCase):
         # no duplicate cards
         count = self.db.scalar("SELECT COUNT(*) FROM cards WHERE unit_id=?", (before["unit_id"],), 0)
         self.assertEqual(count, 2)
+
+    def test_inspiration_notes_survive_export_import(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        services.create_note(self.db, "local", {
+            "quote": "提取一次，记忆痕迹就被强化一次",
+            "content": "早上第一件事就合书复述。",
+            "unit_id": unit_id, "source": "unit",
+        })
+        services.create_note(self.db, "local", {"content": "只有一条想法", "source": "insights"})
+        listed = services.list_notes(self.db, "local")
+        self.assertEqual(listed["total"], 2)
+        markdown = services.export_notes_markdown(self.db, "local")
+        self.assertIn("提取一次", markdown)
+        self.assertIn("只有一条想法", markdown)
+        self.assertIn(out["next_units"][0]["title"], markdown, "导出要带上所属单元")
+
+        payload = services.export_data(self.db, "local")
+        self.assertEqual(len(payload["notes"]), 2)
+        services.reset_user(self.db, "local")
+        self.assertEqual(services.list_notes(self.db, "local")["total"], 0,
+                         "重置必须清掉灵感笔记")
+        result = backup.import_backup(self.db, "local", payload, mode="replace")
+        self.assertEqual(result["inspirations"], 2, "导入必须恢复灵感笔记")
+        restored = services.list_notes(self.db, "local")
+        self.assertEqual(restored["total"], 2)
+        linked = [n for n in restored["notes"] if n["unit_id"]]
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0]["unit_title"], out["next_units"][0]["title"])
+        searched = services.list_notes(self.db, "local", q="早上")
+        self.assertEqual(len(searched["notes"]), 1)
+        filtered = services.list_notes(self.db, "local", unit_id=linked[0]["unit_id"])
+        self.assertEqual(len(filtered["notes"]), 1)
+
+    def test_note_validation(self):
+        with self.assertRaises(ValueError):
+            services.create_note(self.db, "local", {"quote": "", "content": "   "})
+        with self.assertRaises(ValueError):
+            services.delete_note(self.db, "local", "missing-note")
+        big = services.create_note(self.db, "local", {"quote": "字" * 3000})
+        self.assertEqual(len(big["note"]["quote"]), 2000)
+        unknown = services.create_note(self.db, "local", {
+            "quote": "引用", "content": "内容", "unit_id": "no-such-unit", "source": "恶意来源"})
+        self.assertIsNone(unknown["note"]["unit_id"])
+        self.assertEqual(unknown["note"]["source"], "")
 
     def test_notes_backup_and_semantic_search(self):
         out = self.onboard()

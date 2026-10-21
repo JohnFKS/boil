@@ -127,8 +127,8 @@ export async function render(el, ctx, params) {
     revealed = false;
     revealTime = 0;
     const preview = card.preview || {};
-    slot.innerHTML = `<div class="card flashcard" id="flashcard">
-      <div class="flashcard-front" id="flash-front">
+    slot.innerHTML = `<div class="card flashcard" id="flashcard" data-unit-id="${escapeAttr(card.unit_id || "")}">
+      <div class="flashcard-front" id="flash-front" data-selectable data-source="review">
         <div class="flashcard-label">先回忆，再翻面</div>
         <div class="flashcard-text">${escapeHTML(card.front)}</div>
         <div class="flashcard-unit">${escapeHTML(card.unit_title || "")} · ${card.state === "new" ? "新卡" : "到期复习"}</div>
@@ -137,7 +137,7 @@ export async function render(el, ctx, params) {
         <button class="btn btn-primary btn-lg mt-3" id="reveal-btn">${icon("eye", 16)} 显示答案</button>
         <div class="faint tiny mt-2">空格键也可以</div>
       </div>
-      <div class="flashcard-back" id="flash-back" style="display:none">
+      <div class="flashcard-back" id="flash-back" style="display:none" data-selectable data-source="review">
         <div class="flashcard-label">答案 · ${card.reps ? `已复习 ${card.reps} 次` : "第一次学习"}</div>
         <div class="flashcard-text prose">${renderMarkdown(card.back)}</div>
         ${card.mnemonic ? `<div class="callout gold mt-3" style="text-align:left;font-size:11px">速记：${escapeHTML(card.mnemonic)}</div>` : ""}

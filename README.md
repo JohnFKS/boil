@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-49%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-66%20passing-38d6bd?style=flat-square)](#测试)
 [![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
@@ -141,11 +141,15 @@ python3 run.py
 ## Markdown、Embedding 与数据备份
 
 - **多文件材料**：开始页支持一次拖入/选择多个 `.md`、`.json`、`.txt`，JSON 会按键值铺平成可读文本，所有文件合并到同一个主题后编译；文件清单可逐项移除，单文件 2 MB、合并 180,000 字符以内。
+- **导入即分析**：材料一交给编译器，点「AI 生成信息」就能先拿到标题、学科、目标名与一句话描述，不必等编译；没配置模型时按本地规则给回退结果。
+- **编译时生成大纲与计划**：模型读完整份材料后，除了单元还会输出「学习大纲」（为什么这样排序）、「阶段计划」（2–4 个阶段与每阶段重点、分钟数）和「材料总览」。AI 只决定顺序与叙事，**日期与时间预算仍由代码计算，前置依赖由拓扑排序强制保证**。
+- **AI 呈现 + 诚实标签**：仪表盘的材料总览、单元页的「怎么学」导读、洞察页的本周解读，都是模型读完全部材料与证据之后的产物；每一条都带「AI 分析」或「本地规则」标签，规则回退绝不冒充模型输出，失败原因显示在警告里。
+- **划词灵感笔记**：在任意学习内容上划选文字（或右键选中内容），可立即「存为灵感」或复制。单元、对话、费曼报告、复习卡、洞察、地图、内容库都支持；灵感带引用原文快照与所属单元，可在「灵感库」页搜索、筛选、删除、导出 Markdown，并随完整备份一起导出/恢复。
 - **Markdown 解析**：标题、列表、段落是结构真相源；有模型时可做更细的语义抽取。
 - **Embedding**：可接**硅基流动**或任意 OpenAI 兼容 `/embeddings`（推荐 `BAAI/bge-m3`，1024 维）；没有标题的材料用它做语义分组，语义搜索与“相关单元”也走这一层。批量请求、磁盘缓存、失败冷却、自动回退本地 `local-hash-256`，错误在设置页可见。
 - **Embedding 隐私**：配置云端后，参与分组/检索的文本会发往该端点；Key 只保存在本地 `data/embedding.json`（0600）。不配置就完全本地、离线。
 - **数学公式**：`$...$`、`$$...$$`、`\(...\)`、`\[...\]` 由本地 KaTeX 渲染，浅色/深色主题均已验证。
-- **数据备份**：设置 → 数据 → 导出全部数据 / 导入备份；支持合并与替换；导出包含目标、单元、卡片、复习日志、对话、解释、火候记录和速记，API Key 永不进入备份。
+- **数据备份**：设置 → 数据 → 导出全部数据 / 导入备份；支持合并与替换；导出包含目标、单元、卡片、复习日志、对话、解释、火候记录、速记和灵感笔记，API Key 永不进入备份。
 - **Anki 导出**：同一处可导出制表符分隔的卡片文本，正面、背面、标签齐全，导入 Anki 时选“制表符分隔”即可，不锁定你的复习数据。
 - **速记**：来自 mem 的小功能；单元页可写口诀/类比/笔记，复习卡可显示可选速记线索。
 
@@ -212,6 +216,18 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Settings](screenshots/settings.png) | ![Backup and Anki](screenshots/settings-data.png) |
 
+| 划词菜单 | 灵感库 |
+|---|---|
+| ![Selection menu](screenshots/selection-menu.png) | ![Notes](screenshots/notes.png) |
+
+| AI 生成标题 | 大纲与阶段计划 |
+|---|---|
+| ![AI suggest](screenshots/onboarding-ai-suggest.png) | ![Outline and plan](screenshots/onboarding-outline-plan.png) |
+
+| AI 洞察解读 | 保存灵感 |
+|---|---|
+| ![Insights AI](screenshots/insights-ai-summary.png) | ![Note popover](screenshots/note-popover.png) |
+
 ### 数学公式
 
 ![Math formula](screenshots/math-formula.png)
@@ -223,7 +239,7 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 ## 功能
 
 - **目标与路径**：截止日期、每日分钟数、前置 DAG、最少必要路径、暂存单元、动态重排。
-- **内容编译**：把 Markdown/JSON/纯文本（支持多文件合并）编译成知识单元、探针、卡片；有标题时按结构切分，无标题时用本地向量做语义分组；有模型时做更细的结构抽取。
+- **内容编译**：把 Markdown/JSON/纯文本（支持多文件合并）编译成知识单元、探针、卡片与大纲/阶段计划；有标题时按结构切分，无标题时用本地向量做语义分组；有模型时做更细的结构抽取。
 - **知识地图**：可缩放/平移/筛选的 SVG 图谱；节点状态：未开始、学习中、已烧开、需复习。
 - **苏格拉底对话**：SSE 流式；一次一问；提示阶梯；阶段推进；结束生成四维证据报告。
 - **费曼挑战**：三种讲解对象；计时；六维评分；缺口、术语、参考讲解、追问。
@@ -401,7 +417,7 @@ python3 -m boil.mcp_server
 ## 测试
 
 ```bash
-# 49 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP 测试（stdlib unittest）
+# 66 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP 测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 

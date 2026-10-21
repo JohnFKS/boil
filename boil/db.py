@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS units (
   importance INTEGER NOT NULL DEFAULT 3,
   estimated_minutes INTEGER NOT NULL DEFAULT 45,
   order_index INTEGER NOT NULL DEFAULT 0,
+  angle TEXT NOT NULL DEFAULT '',
   source_ref_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -258,6 +259,19 @@ CREATE TABLE IF NOT EXISTS unit_notes (
   UNIQUE(user_id, unit_id, kind)
 );
 
+CREATE TABLE IF NOT EXISTS notes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  goal_id TEXT,
+  unit_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'inspiration',
+  quote TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS boil_records (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -284,7 +298,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_
 CREATE INDEX IF NOT EXISTS idx_evidence_user_unit ON evidence(user_id, unit_id);
 CREATE INDEX IF NOT EXISTS idx_mastery_user ON mastery(user_id, unit_id);
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, seq);
+CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_unit ON notes(user_id, unit_id);
 """
+
+# 旧库升级用：新库由 SCHEMA 直接带上，旧库启动时幂等补列。
+EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "units": [("angle", "TEXT NOT NULL DEFAULT ''")],
+}
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -321,6 +342,11 @@ class Database:
             conn = self._connect()
             try:
                 conn.executescript(SCHEMA)
+                for table, columns in EXTRA_COLUMNS.items():
+                    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                    for name, ddl in columns:
+                        if name not in existing:
+                            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

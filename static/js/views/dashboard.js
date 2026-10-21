@@ -62,6 +62,8 @@ export async function render(el, ctx, params) {
   const progress = plan.progress || { percent: 0, done: 0, total: counts.units || 0 };
   const facetLabels = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
   const facetValues = ["recall", "explain", "apply", "transfer"].map(k => mastery.facets?.[k] || 0);
+  const digest = d.digest || goal?.meta?.ai_digest || {};
+  const byModel = (d.generated_by || goal?.meta?.ai_generated_by) === "model";
   const currentUnitId = unit?.id;
   const mapUnits = d.map_preview?.units || d.next_units?.slice(0, 6) || [];
   const weakest = mastery.weakest;
@@ -116,7 +118,7 @@ export async function render(el, ctx, params) {
         </div>
       </div>
 
-      <div class="grid grid-main mt-4">
+      <div class="grid grid-main mt-4" data-selectable data-source="dashboard">
         <div class="stack">
           <div class="card card-pad">
             <div class="section-head">
@@ -132,6 +134,17 @@ export async function render(el, ctx, params) {
             </div>
             <div class="callout mt-3">${today?.is_rest ? "今天是计划里的休息日。休息也是学习的一部分；如果手痒，只做复习即可。" : `今日重点：<strong>${escapeHTML(today?.focus || "按自己的节奏来")}</strong>。不要贪多，完成一个闭环比刷十个视频更有用。`}</div>
           </div>
+
+          ${digest.overview ? `
+          <div class="card card-pad">
+            <div class="section-head">
+              <div><div class="section-title">材料总览</div><div class="section-sub">读完全部材料后的整体判断</div></div>
+              <span class="badge ${byModel ? "badge-teal" : "badge-muted"}">${byModel ? "AI 分析" : "本地规则"}</span>
+            </div>
+            <p class="digest-copy">${escapeHTML(digest.overview)}</p>
+            ${(digest.advice || []).length ? `<ul class="digest-advice">${digest.advice.map(a => `<li>${escapeHTML(a)}</li>`).join("")}</ul>` : ""}
+            ${(d.study_plan_phases || []).length ? `<div class="phase-strip">${d.study_plan_phases.map(p => `<span class="phase-chip"><strong>${escapeHTML(p.phase || "")}</strong>${escapeHTML(p.focus || "")}</span>`).join("")}</div>` : ""}
+          </div>` : ""}
 
           <div class="grid grid-2">
             <div class="card card-pad">

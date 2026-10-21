@@ -185,7 +185,11 @@ export async function render(el, ctx, params) {
           <div class="field"><label>你的称呼</label><input class="input" id="ob-name" value="${escapeHTML(draft.name)}" placeholder="学习者"></div>
           <div class="field"><label>目标名称</label><input class="input" id="ob-title" value="${escapeHTML(draft.goalTitle || title)}" placeholder="例如：掌握线性代数期末"></div>
           ${mode === "material" ? `
-            <div class="field full"><label>材料标题</label><input class="input" id="ob-material-title" value="${escapeHTML(materialPack?.name || draft.materialTitle)}" placeholder="例如：第 3 章 导数与微分"></div>
+            <div class="field full">
+              <label>材料标题 <button class="btn btn-ghost btn-sm" id="ob-suggest" type="button">${icon("wand", 13)} AI 生成信息</button></label>
+              <input class="input" id="ob-material-title" value="${escapeHTML(materialPack?.name || draft.materialTitle)}" placeholder="例如：第 3 章 导数与微分">
+              <span class="hint" id="ob-suggest-hint"></span>
+            </div>
             <div class="field"><label>学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
             <div class="field full">
               <label>材料文件（可多选）</label>
@@ -309,6 +313,43 @@ export async function render(el, ctx, params) {
         files.splice(index, 1);
         refreshFiles();
       });
+
+      body.querySelector("#ob-suggest")?.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const btn = event.currentTarget;
+        const pasted = body.querySelector("#ob-text")?.value.trim() || "";
+        if (!files.length && pasted.length < 60) {
+          return toast("先上传材料文件，或粘贴至少 60 字文本", "error");
+        }
+        btn.disabled = true;
+        const label = btn.innerHTML;
+        btn.innerHTML = "分析中…";
+        try {
+          const res = await ctx.api.post("/api/packs/suggest", {
+            text: pasted, documents: files.map(f => ({ name: f.name, text: f.text })),
+          });
+          const fillIfEmpty = (selector, value) => {
+            const field = body.querySelector(selector);
+            if (field && value && !field.value.trim()) field.value = value;
+          };
+          fillIfEmpty("#ob-material-title", res.title);
+          fillIfEmpty("#ob-subject", res.subject);
+          fillIfEmpty("#ob-title", res.goal_title);
+          const hint = body.querySelector("#ob-suggest-hint");
+          if (hint) hint.textContent = res.description || "";
+          if (res.source === "model") {
+            toast("AI 已生成标题与主题，可直接修改。", "success", 4200);
+          } else {
+            toast("未配置模型，已按本地规则生成。", "info", 4200);
+          }
+        } catch (err) {
+          toast(err.message || "生成失败", "error", 5000);
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = label;
+        }
+      });
     }
 
     body.querySelector("[data-back]").addEventListener("click", renderStep1);
@@ -360,17 +401,58 @@ export async function render(el, ctx, params) {
   function renderStep3() {
     step = 3; updateDots();
     const units = materialPack?.units || [];
+    const digest = materialPack?.digest || {};
+    const outline = materialPack?.outline || [];
+    const phases = materialPack?.study_plan || [];
+    const byModel = materialPack?.generated_by === "model";
+    const sourceBadge = byModel
+      ? `<span class="badge badge-teal">AI 分析</span>`
+      : `<span class="badge badge-muted">本地规则</span>`;
+    const minutesTotal = phases.reduce((n, p) => n + (Number(p.minutes) || 0), 0);
     body.innerHTML = `
       <div class="onboarding-step active">
         <h2>编译完成，先看一眼结构</h2>
-        <p class="sub">这些单元会成为你的知识地图。标题和本质来自材料；没有把握的地方不会硬编。</p>
+        <p class="sub">标题、大纲与计划都是读完全部材料后生成的；没有把握的地方不会硬编。</p>
         <div class="preview-box">
           <div class="between"><strong>${escapeHTML(materialPack.name)}</strong><span class="badge badge-teal">${units.length} 个单元</span></div>
+          ${digest.overview ? `
+            <div class="digest-block mt-3">
+              <div class="between"><strong>材料总览</strong>${sourceBadge}</div>
+              <p>${escapeHTML(digest.overview)}</p>
+              ${(digest.advice || []).length ? `<ul class="digest-advice">${digest.advice.map(a => `<li>${escapeHTML(a)}</li>`).join("")}</ul>` : ""}
+            </div>` : ""}
+        </div>
+        ${outline.length ? `
+          <div class="preview-box mt-3">
+            <div class="between"><strong>学习大纲</strong>${sourceBadge}</div>
+            <ol class="outline-list">
+              ${outline.map(o => `
+                <li>
+                  <span class="outline-title">${escapeHTML(o.title)}</span>
+                  ${o.summary ? `<span class="outline-summary">${escapeHTML(o.summary)}</span>` : ""}
+                  ${(o.unit_titles || []).length ? `<span class="outline-units">${o.unit_titles.map(escapeHTML).join(" · ")}</span>` : ""}
+                </li>`).join("")}
+            </ol>
+          </div>` : ""}
+        ${phases.length ? `
+          <div class="preview-box mt-3">
+            <div class="between"><strong>阶段计划</strong><span class="hint">${minutesTotal ? `约 ${Math.round(minutesTotal / 60)} 小时内容量` : ""}</span></div>
+            ${phases.map(p => `
+              <div class="phase-row">
+                <span class="phase-name">${escapeHTML(p.phase || "")}</span>
+                <span class="phase-body">
+                  <strong>${escapeHTML(p.focus || "")}</strong>
+                  <span class="phase-meta">${(p.unit_titles || []).length} 个单元${p.minutes ? ` · ${p.minutes} 分钟` : ""}</span>
+                </span>
+              </div>`).join("")}
+          </div>` : ""}
+        <details class="mt-3" open>
+          <summary>全部 ${units.length} 个单元</summary>
           <div class="preview-units">
             ${units.map((u, i) => `<div class="preview-unit"><span class="n">${String(i + 1).padStart(2, "0")}</span><span>${escapeHTML(u.title)}</span></div>`).join("")}
           </div>
-        </div>
-        <div class="callout teal mt-3">第一版会以“先理解、再追问、最后复述”的顺序带你走；你可以随时在单元页开始苏格拉底或费曼。</div>
+        </details>
+        <div class="callout teal mt-3">大纲决定学习顺序，日期仍按你每天的可用时间计算；时间不够时系统会保留复习时间并明确暂存哪些单元。</div>
         <div class="onboarding-actions">
           <button class="btn btn-ghost" data-back>重新编辑</button>
           <button class="btn btn-primary" data-start>开始学习 ${icon("arrow", 15)}</button>

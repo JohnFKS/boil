@@ -1,0 +1,691 @@
+# Boil 改进计划（执行手册）
+
+> 版本：1.1 · 2026-10-21（任务 A/B/C/D 已执行完成，见各节末尾的 ✅ 与「第 11 节 执行记录」）
+> 本文档是**给执行模型（包括低阶模型）的分步执行手册**。请完整阅读「第 0 节 执行规范」后再动手。
+> 来源：对 `mem`、`examgen`、`testlearnweb` 三个兄弟项目的深度研究 + Boil 现有代码核对。
+> 所有「现状」小节里的 文件:行号 都已核对过，直接引用即可。
+
+---
+
+## 0. 执行规范（必读）
+
+### 0.1 项目基本信息
+
+- 仓库：`/workspace/testweb3/boil`（本地 git 仓库，远程 `https://github.com/JohnFKS/boil.git`）
+- 后端：Python 3.10+ **纯标准库**（`ThreadingHTTPServer` + SQLite WAL + REST/SSE），禁止引入任何 pip 依赖
+- 前端：`static/` 下**原生 ES Modules**，无构建链，无 CDN（KaTeX 已本地化）
+- 启动：`python run.py`（默认端口 7860，数据在 `data/`）
+- 测试：`python -m unittest discover -s tests -v`（当前 66 个全绿）
+- JS 语法检查：`make check-js`
+- 浏览器回归：需要**两个**服务实例——日常使用的 `python3 run.py`（7860）与验收用的 `BOIL_PORT=7861 python3 run.py`；然后 `python3 tools/browser_check.py`（CDP 驱动，默认打 7861，截图输出到 `screenshots/`）
+
+### 0.2 硬性红线
+
+1. **API Key 永远不出现在代码、日志、URL、导出文件、git 仓库**。Key 只存在于本地 `data/llm.json`、`data/embedding.json`（0600 权限，已被 .gitignore）。绝不要 `git add data/`。
+2. **未经用户明确指示不得 `git commit` / `git push`**。
+3. **不引入第三方依赖**（后端 pip、前端 npm/CDN 都不行）。
+4. **演示模式（未配置 LLM）必须永远可用**：每个 AI 功能都要有本地规则回退，且回退内容要带 `source: "rules"` 标签，**不许把规则输出冒充 AI 输出**（借鉴 testlearn 的诚实原则）。
+5. 前端渲染任何用户/模型文本一律过 `escapeHTML()`（`static/js/utils.js`），防止 XSS。CSP 已开 `script-src 'self'`，禁止 inline 事件处理器（onclick= 等）。
+6. 每完成一个任务：跑一遍第 9 节的回归清单，全绿才算完成。
+
+### 0.3 代码风格（与现状保持一致）
+
+- Python：4 空格缩进；模块/函数顶部一行中文 docstring；无类型注解以外的花哨写法；错误用现有 `PackError`/`LLMError`/`ValueError` 体系。
+- JS：ES Modules、`const` 优先、模板字符串拼 HTML、事件用 `addEventListener` + `data-*` 委托；清理函数挂在 `el._xxxCleanup` 上（参考 settings.js 的 `_settingsCleanup` 模式）。
+- SQL：新表必须 `CREATE TABLE IF NOT EXISTS`，写进 `boil/db.py` 的 `SCHEMA_SQL`；对已存在的旧库加列用「PRAGMA table_info 检查 + ALTER TABLE」的幂等模式（见任务 C 的 `angle` 列）。
+- API 路由：加到 `boil/server.py` 的 `ROUTES` 表（`("POST", re.compile(r"^/api/xxx$"), self.handler)`），handler 命名与现有保持一致。
+
+### 0.4 执行顺序
+
+按任务编号顺序执行：**A → B → C → D → E 批次 → F 批次**。
+A/B/D 相互独立可单独执行；C 依赖 B（digest 字段在 B 中生成）。每个任务都是自包含的：包含目标、现状、改动点、验收标准。
+
+---
+
+## 1. 三项目深度对比清单
+
+### 1.1 总览
+
+| 维度 | Boil（本项目） | mem | examgen | testlearnweb |
+|---|---|---|---|---|
+| 定位 | AI 学习 OS（材料→编译→苏格拉底/费曼→FSRS 复习） | 本地单用户记忆工具（卡片+标注+口诀） | 考研数学「通法」归纳流水线（研究工具） | 商业产品 Zero 的逆向研究 + Python 复刻后端 |
+| 后端 | Python 纯 stdlib + SQLite WAL | Flask + requests + SQLite | Node 纯 stdlib + JSONL 文件 | Python 纯 stdlib + JSON 文件 |
+| 前端 | 原生 ES Modules SPA | 原生 JS + CDN 库 | 原生 JS SPA（单文件 3096 行） | Next.js 静态导出（React） |
+| LLM 网关 | OpenAI 兼容，chat_json + 流式 + parse_json_loose | 重试编排 + 网关兼容技巧大全 | 双模式（真实/agent）+ 内容寻址缓存 | 流式 + 三态 thinking + 降级审计 |
+| 复习调度 | FSRS-5 + 四维掌握度 + 热度 | FSRS-5 简化版（3 键） | 无 | FSRS（复刻） |
+| 检索 | SiliconFlow 嵌入 + 本地哈希回退 | LIKE + 标签（无 FTS/向量） | bigram 检索注入 | 前端搜索 + 聊天记录搜索 |
+| 数据安全 | CSP 等安全头 + 导出/导入 | 备份快照 + 恢复前快照 | 原子写 + 追加式决策日志 | 备份排除密钥 + 路径穿越防护 |
+
+### 1.2 Boil 已领先的部分（不要倒退）
+
+- SQLite WAL + 完整 review_log 状态迁移审计（与 mem 同级）
+- 四维掌握度（回忆/解释/应用/迁移）+ 热度模型 —— 三个项目都没有
+- 嵌入语义分组编译（mem/examgen 均无向量能力）
+- 纯 stdlib + 零依赖（mem 有 Flask/requests）
+- 前端零 CDN（mem 依赖 CDN）
+- MCP server 已有 13 个工具
+
+### 1.3 mem 可迁移清单（源码：`/workspace/testweb3/_work/mem/`）
+
+| # | 功能 | 源位置 | 价值 | 批次 |
+|---|---|---|---|---|
+| m1 | 右键标注（选中→右键→存标注） | `memory_anchor/static/js/annotations.js:256-284` | 任务 D 的直接参考 | **P0（并入任务 D）** |
+| m2 | 引文快照高亮（存 quote，渲染时高亮全部出现位置，无偏移量脆弱性） | `annotations.js:143-217` | 高 | P1（E2） |
+| m3 | 复习先回忆再翻面（textarea + 「写不出来正好说明没懂」文案） | `static/js/review.js:529-548` | 高 | P1（E1） |
+| m4 | ~~评分按钮显示真实下次间隔~~（Boil 已有：`srs/fsrs.py:265 preview_labels` + review.js:129-151） | `review.py:217-244` | 已具备 | — |
+| m5 | 记忆口诀 AI 生成（严格任务边界 prompt：只给记忆钩子，禁止复述内容） | `app/ai.py:704-749` | 高 | P1（E3） |
+| m6 | LLM 网关兼容技巧（finish_reason=length 自动 4 倍 max_tokens 重试；response_format 400 降级；「元回复」检测重试；垃圾字面量守卫） | `app/ai.py:366-514` | 高 | P1（E4） |
+| m7 | 可选 AI 三态契约（未配置=入口完全隐藏不置灰；连续 2 次失败熔断） | `static/js/utils.js:460-496` | 高 | P1（E5） |
+| m8 | 记忆健康度 = 全部已学卡当前可提取性均值 | `app/routes/stats.py:35-42` | 中 | P1（E6） |
+| m9 | ~~365 天学习热力图~~（Boil 已有：services.py insights 的 heatmap + insights.js `heatmapHTML`） | `stats.py:72-109` | 已具备 | — |
+| m10 | 错因分类标签（固定 6 类，复习时强制选择，持久化到卡+日志） | `review.js:806-856`、`utils.js:340-343` | 中 | P2（F1） |
+| m11 | 复习队列侧栏（跳转/只复习选中/提前复习未到期） | `review.js:65-92, 196-309` | 中 | P2（F2） |
+| m12 | 键盘复习（空格翻面、1/2/3 评分、全局快捷键） | `app.js:39-75` | 中 | P2（F3） |
+| m13 | 备份恢复前先快照当前库 | `app/routes/backup.py:94-123` | 中 | P2（F4） |
+| m14 | 粘贴格式清洗（网页/Word/PDF 复制的脏 markdown 归一化） | `app/markdown_fix.py` | 中 | P2（F5） |
+| m15 | AI 诊断面板（网络异常分类 + HTTP 状态建议 + 掩码 key + 可复制诊断） | `app/ai.py:102-273` | 中 | P2（F6） |
+| m16 | 幂等加列迁移（PRAGMA table_info + ALTER TABLE） | `app/db.py:142-165` | 已并入任务 C | — |
+
+### 1.4 examgen 可迁移清单（源码：`/workspace/testweb3/_work/examgen/`）
+
+examgen 是「只归纳不生成题」的知识挖掘流水线，它的**机器层**几乎全部可迁移：
+
+| # | 功能 | 源位置 | 价值 | 批次 |
+|---|---|---|---|---|
+| e1 | **内容寻址 LLM 缓存**：`sha256(skill+model+messages)` 为键，重复调用零成本确定性重放 | `src/llm/agentProvider.js` | 极高（编译重跑免费） | P1（E7） |
+| e2 | JSON 宽松解析（括号匹配提取 + 截断补全猜测 + 二次「修正器」LLM 调用） | `src/llm/index.js:60-131` | 高（Boil 已有 parse_json_loose，可补截断补全+修正器） | P1（并入 E4） |
+| e3 | 代码强制决策层（模型提方案，阈值判断在代码里，冲突记录进日志） | `src/skills/essenceMatch.js:64-140` | 高 | P2（F7，单元合并） |
+| e4 | LLM-as-judge 三维评审 + 证据注入 + 可执行补丁 + 无操作跳过 | `src/skills/qa.js:13-44`、`src/pipeline/orchestrator.js:292-384` | 高 | P2（F8，内容质检） |
+| e5 | 确定性优先、LLM 兜底（bigram 预匹配 ≥0.45 先解决大部分，残差才进模型） | `src/skills/qa.js:47-55` | 高 | P2（F8） |
+| e6 | 逐字锚点材料修复（LLM 给 8-30 字锚点，代码做切片手术） | `src/ingest/repair.js` | 中 | P2（F9） |
+| e7 | merged-chain 合并语义（合并不删除，`merged_into` 链 + UI 横幅跳转） | `src/store/library.js`、`web/app.js` §12 | 中 | P2（F7） |
+| e8 | 传输层健壮性（重试状态码集 + 指数退避 + AbortController 超时 + json_object 400 降级） | `src/llm/openai.js:53-95` | 高（并入 E4） | — |
+| e9 | 检索式知识注入（只注入 top-5 讲义片段 + top-4 公式，不整章粘贴） | `src/ingest/markdown.js:49-77` | 中 | P2（F10） |
+| e10 | 输出前校验器（id 集合相等、长度下限、数字污染检测） | `tools/validateAnswers.js` | 中 | P2（F8） |
+| e11 | 真实数据锚点浏览器测试（断言从 API 现场取，不用 fixture） | `tools/browserCheck.js` | 已是 Boil 做法 | — |
+
+### 1.5 testlearnweb 可迁移清单（源码：`/workspace/testweb3/_work/testlearnweb/`）
+
+**重要澄清**：testlearnweb 没有真正的 `contextmenu` 右键事件；它的「右键菜单」其实是**划词工具条**（selectionchange 时浮出 6 个动作：标记/笔记/记忆/追问/批注/复制）。真正的右键标注在 mem 里（m1）。任务 D 会两者都做：**划词浮条为主（testlearn 交互）+ 右键菜单为辅（mem 交互）**。
+
+| # | 功能 | 源位置 | 价值 | 批次 |
+|---|---|---|---|---|
+| t1 | 划词工具条（selectionchange 浮条 + 定位钳制 + 翻转 + 隐藏时机） | `frontend/_next/static/chunks/4142b3f3c7ba4160.js` 字节 22582-33000；文档 `HANDOVER.md` §9.17 (L998-1046) | 极高（任务 D 核心） | **P0（任务 D）** |
+| t2 | AI 提炼记忆卡：预览→确认→入库（绝不静默保存） | `localbackend/handlers_learn.py:513-570` | 高 | P2（F11） |
+| t3 | 引文快照 + 前后缀消歧的高亮重锚定 | 同 chunk 字节 69210 | 高 | P2（F12，与 m2 二选一先做 m2） |
+| t4 | engine: "model"/"rules" 诚实标签 + llm_errors 贯穿 | `localbackend/agent.py` | 高（并入任务 C 原则） | — |
+| t5 | LLM 网关：始终流式请求上游再拼回非流式形状（防空闲网关 504）；空内容 200 视为错误；thinking 三态与降级标记 | `localbackend/llm.py`、`ARCHITECTURE.md` §5 | 高 | P2（F13） |
+| t6 | 追问侧线程（带 ±800 字符锚点上下文） | `localbackend/stream.py:164-241` | 中 | P2（F14） |
+| t7 | SSE 重连（request_id + last_seq 缓冲重放，最多 2 次退避） | `localbackend/server.py`、BACKEND.md §三 | 中 | P2（F15） |
+| t8 | 学习风格测试→人设→教学策略 | `engine.py` STYLE_Q、`agent.ai_persona` | 中 | P2（F16） |
+| t9 | 学习计划 5 步流 + 软确认 | `engine.py`、PROMPTS.md §三 | 中（任务 B 已覆盖核心） | — |
+| t10 | 番茄钟学习循环 | 前端 chunk studyCycle | 低 | P3 |
+| t11 | 记忆差异化 UI（本轮改了什么 + 撤销） | `memory/{tid}/diff-state` | 低 | P3 |
+| t12 | 移动端划词劫持（touch 后包 span 去原生菜单） | 同 t1 chunk | 低 | P3 |
+
+### 1.6 明确不迁移的（避免执行模型跑偏）
+
+- mem 的 Flask/CDN 技术栈、SiYuan 插件（Boil 不做外部笔记软件耦合）
+- examgen 的题库业务层（它没有学习者侧）；JSONL 换掉 SQLite（Boil 的 SQLite 更好）
+- testlearnweb 的 React 前端、邮件 OTP/JWT 认证、OSS 上传、计费/推荐（本地单用户不需要）
+- 任何需要引入依赖才能实现的功能
+
+---
+
+## 2. 任务总览
+
+| 任务 | 名称 | 优先级 | 规模 | 依赖 |
+|---|---|---|---|---|
+| A | 导入界面 AI 即时生成标题/学科/目标名 | P0 | 小（后端 1 函数 + 1 路由；前端 1 按钮） | 无 |
+| B | 编译时 AI 生成大纲 + 阶段计划 + 材料总览 | P0 | 中（prompt + compiler + planner + step3 UI） | 无 |
+| C | 全站内容 AI 合成 + engine 诚实标签 | P0 | 中（angle 列迁移 + 仪表盘/单元/洞察三处呈现） | B |
+| D | 划词灵感笔记（选择浮条 + 右键菜单 + 灵感库页） | P0 | 大（新表 + 3 路由 + 新前端模块 + 7 个视图挂 data-selectable） | 无 |
+| E | P1 迁移批次（回忆优先、口诀 AI、网关加固、缓存、健康度、AI 熔断、高亮重现） | P1 | 每项小-中 | A-D 之后按序 |
+| F1-F16 | P2 迁移批次 | P2 | 每项小-中 | E 之后 |
+
+---
+
+## 3. 任务 A：导入界面 AI 即时生成元信息
+
+**用户需求**：在导入教材界面（onboarding step2 材料模式），AI 立即生成材料标题、学科、目标名称等信息——不用等编译。
+
+### 3.1 现状
+
+- 表单字段在 [static/js/views/onboarding.js:185-201](file:///workspace/testweb3/boil/static/js/views/onboarding.js#L185)：`#ob-name`（称呼）、`#ob-title`（目标名称）、`#ob-material-title`（材料标题）、`#ob-subject`（学科）、`#ob-drop`/`#ob-files`（文件）、`#ob-text`（粘贴文本）
+- 目前只有本地规则回填：加文件后取第一个文件名填材料标题（onboarding.js:271-274）
+- 编译接口 `POST /api/packs/compile`（server.py:61）→ `services.compile_preview`（services.py:808）→ `merge_material_documents`（services.py:778）
+- LLM 工具：`llm.enabled()`（llm.py:172）、`llm.chat_json(messages, model, temperature, max_tokens)`（llm.py:489）、`llm.load_prompt(name)`（llm.py:496，读 `prompts/` 目录）
+
+### 3.2 后端改动
+
+**新增 `boil/prompts/meta_suggest.md`**（注意：`{text}` 占位符会被 replace）：
+
+```markdown
+下面是学习材料的开头部分。请分析后给出元信息。
+
+材料：
+---
+{text}
+---
+
+只输出一个 JSON 对象，不要输出其它任何内容：
+{
+  "title": "材料标题，8-20 字，概括材料主题，不要书名号",
+  "subject": "学科或主题，2-8 字，例如：高等数学 / 认知心理学",
+  "goal_title": "适合作为学习目标名称的短语，8-20 字，动词开头，例如：掌握导数与微分",
+  "description": "一句话（30 字以内）概括这份材料最值得学的是什么"
+}
+```
+
+**`boil/services.py` 新增函数**（放在 `merge_material_documents` 之后）：
+
+```python
+def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any]:
+    """材料元信息即时生成：优先真实模型，失败回退本地规则。"""
+    merged, docs = merge_material_documents(documents, text)
+    if len(merged) < 60:
+        raise ValueError("材料太短，至少 60 个字符")
+    sample = merged[:6000]
+    if llm.enabled():
+        try:
+            prompt = llm.load_prompt("meta_suggest.md").replace("{text}", sample)
+            data = llm.chat_json([
+                {"role": "system", "content": "你是学习材料的元信息提取器。只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ], model=llm.model_name(), temperature=0.3, max_tokens=500)
+            def _s(v, limit):
+                return re.sub(r"\s+", " ", str(v or "")).strip()[:limit]
+            title = _s(data.get("title"), 40)
+            if title:
+                return {"title": title, "subject": _s(data.get("subject"), 20),
+                        "goal_title": _s(data.get("goal_title"), 40),
+                        "description": _s(data.get("description"), 80), "source": "model"}
+        except Exception:
+            pass
+    # 本地规则回退：取第一个 markdown 标题或首句
+    m = re.search(r"^#{1,4}\s+(.+)$", merged, re.M)
+    first_line = (m.group(1) if m else merged.splitlines()[0]).strip()
+    title = re.sub(r"^[\s>#*•\-]+", "", first_line)[:28] or "我的学习材料"
+    return {"title": title, "subject": "", "goal_title": f"掌握{title[:16]}",
+            "description": "", "source": "rules"}
+```
+
+**`boil/server.py`**：ROUTES 表加一行（放在 compile 旁边）：
+
+```python
+("POST", re.compile(r"^/api/packs/suggest$"), self.pack_suggest),
+```
+
+handler（**签名照抄 server.py:169 的 `compile_pack`：`(self, req, match, query, body)`，body 已被框架解析为 dict，校验失败抛 `ApiError(400, ...)`**）：
+
+```python
+def pack_suggest(self, req, match, query, body):
+    if not isinstance(body, dict):
+        raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+    text = str(body.get("text") or "")
+    docs = body.get("documents")
+    if docs is not None and not isinstance(docs, list):
+        raise ApiError(400, "documents 必须是数组", "bad_request")
+    return services.suggest_meta(text, docs)
+```
+
+（先读 server.py 里 `compile_pack` 的实际实现，模仿它的 body 读取与错误处理结构，上面的代码是示意。）
+
+### 3.3 前端改动（onboarding.js renderStep2 的 material 分支）
+
+1. 在「材料标题」label 所在 field 里加一个按钮（用已有的 `icon("wand", 14)` 图标）：
+
+```html
+<div class="field full">
+  <label>材料标题 <button class="btn btn-ghost btn-xs" id="ob-suggest" type="button" title="AI 分析材料并生成标题、学科、目标名">✦ AI 生成信息</button></label>
+  <input class="input" id="ob-material-title" ...>
+</div>
+```
+
+（不用 emoji 的话直接文案「AI 生成信息」+ `icon("wand", 13)`；`btn-xs` 样式如果不存在就在 app.css 加一个小号变体。）
+
+2. 绑定事件（在 renderStep2 的 material 分支里，与 drop 事件并列）：
+
+```js
+body.querySelector("#ob-suggest")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const pasted = body.querySelector("#ob-text").value.trim();
+  if (!files.length && pasted.length < 60) return toast("先上传文件或粘贴至少 60 字文本", "error");
+  btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = "分析中…";
+  try {
+    const res = await ctx.api.post("/api/packs/suggest", {
+      text: pasted, documents: files.map(f => ({ name: f.name, text: f.text })),
+    });
+    const fill = (sel, val) => { const el2 = body.querySelector(sel); if (el2 && val && !el2.value.trim()) el2.value = val; };
+    fill("#ob-material-title", res.title); fill("#ob-subject", res.subject); fill("#ob-title", res.goal_title);
+    const hint2 = body.querySelector("#ob-suggest-hint");
+    if (hint2) hint2.textContent = res.description || "";
+    toast(res.source === "model" ? "AI 已生成，可直接修改" : "未配置模型，已用本地规则生成", res.source === "model" ? "success" : "info");
+  } catch (err) {
+    toast(err.message || "生成失败", "error");
+  } finally { btn.disabled = false; btn.innerHTML = old; }
+});
+```
+
+3. 在 file-drop 下方 hint 附近加 `<div class="hint" id="ob-suggest-hint"></div>` 用来显示 description。
+4. **空值才填**（上面 `fill` 的逻辑）：用户已手写的不要覆盖。
+
+### 3.4 验收标准
+
+1. `python -m unittest discover -s tests -v` 全绿；在 `tests/test_api.py` 加 `test_11_suggest_meta`：
+   - `POST /api/packs/suggest` body `{"text": "（60 字以上的任意文本）"}` → 200，返回字段含 title/subject/goal_title/source，演示模式下 `source == "rules"`；
+   - body `{"text": "短"}` → 400。
+2. 起服务后打开 `#/onboarding` → 选「用我的材料创建」→ 粘贴一段文本 → 点「AI 生成信息」→ 材料/学科/目标名空字段被填上，出现 toast。
+3. `make check-js` 通过。
+
+### 3.5 已知坑
+
+- `merge_material_documents` 会做 200k 上限校验和 `## 文件名` 合并——直接复用，别重写。
+- api.js 的 `post` 默认 90s 超时，足够。
+- 不要自动触发（不要 debounce 自动调用）：显式按钮可控且省 token，这是 v1 决策。
+
+**✅ 完成于 2026-10-21**：`prompts/meta_suggest.md` + `services.suggest_meta` + `POST /api/packs/suggest` + onboarding「AI 生成信息」按钮全部落地。真实模型实测 1.1s 返回且 `source` 为 `model`，标题/学科/目标名正确回填，已填字段不被覆盖。测试：`test_11_suggest_meta`（rules 路径）+ `AiPathTest.test_suggest_meta_model_path` / `test_suggest_meta_falls_back_when_model_fails`（model 路径与异常回退）。
+
+---
+
+## 4. 任务 B：编译时 AI 生成大纲与计划
+
+**用户需求**：编译时 AI 生成大纲（这份材料的学习路线结构）和计划（阶段划分），而不只是单元列表。
+
+### 4.1 现状
+
+- 编译主链：`compile_material`（compiler.py:283）→ prompt `prompts/compiler_extract.md` → `llm.chat_json` → `_normalize_llm_units`（compiler.py:209）→ `normalize_pack`（packs.py:209，`dict(pack)` 所以**新增顶层字段会原样保留**）
+- 计划生成：`planner.build_plan(units, relations, daily_minutes, start, deadline, goal_id, version)`（planner.py:94），目前是纯本地拓扑排序 + 时间装箱，无 LLM
+- onboarding 创建目标：services.py:97-166，`build_plan` 调用在 services.py:157
+- 编译预览页 step3：onboarding.js:360-390，只显示单元标题列表
+- `compile_preview`（services.py:808）返回 `{pack, warnings}`，pack 是完整 dict
+
+### 4.2 后端改动
+
+**1. 修改 `boil/prompts/compiler_extract.md`**：在要求的 JSON 输出结构里（保持现有 units 数组不变）**新增三个顶层字段**：
+
+```
+"outline": [ {"title": "第一部分标题", "summary": "一句话说明这部分为什么排在前面", "unit_titles": ["对应单元标题1", "单元标题2"]} ],
+"study_plan": [ {"phase": "阶段名（如：地基→框架→精装修）", "unit_titles": [...], "focus": "这个阶段的核心目标，20 字内", "minutes": 240} ],
+"digest": {"overview": "150 字以内的材料总览：这份材料讲什么、主线是什么、最适合怎么学", "advice": ["学习建议，3-5 条，每条 30 字内"]}
+```
+
+prompt 里同时要求：outline 覆盖全部单元、顺序即推荐学习顺序；study_plan 的 minutes 总和 ≈ 全部单元 estimated_minutes 之和。
+
+**2. `boil/compiler.py`**：
+- `_normalize_llm_units`：从 `data` 读取三个新字段并清洗（`outline` 每项 `{title, summary, unit_titles[]}`，cap 12 项；`study_plan` 每项 `{phase, unit_titles[], focus, minutes}`，cap 8 项；`digest.overview` ≤ 400 字、`advice` ≤ 5 条）。**关键**：`unit_titles` 与实际 units 的 title 不要求严格一致（模型可能微调措辞），但要尽力对应；清洗时把找不到对应的 unit_titles 条目原样保留（仅作展示）。挂到 pack 顶层 `outline` / `study_plan` / `digest`。
+- `compile_heuristic`：本地路径也生成同构字段（outline = 单元顺序 + essence 首句做 summary；study_plan = 按每 3 个单元一个阶段；digest.overview = 前 2 个单元 essence 拼接），并加 `"source": "rules"` 标记；LLM 路径加 `"source": "model"`。这样两条路径输出形状一致。
+
+**3. `boil/planner.py` `build_plan` 加可选参数** `ai_outline: list[dict] | None = None`：
+- 若提供且非空：按 `ai_outline` 里的 unit_titles 顺序重排 units（找不到的排最后），阶段（phase）信息写进 plan 的 day 条目 `note` 字段或 plan 顶层 `phases`；
+- 否则维持现有拓扑排序逻辑（**不要删现有逻辑**，它处理 relations 依赖）。
+- plan dict 顶层加 `outline`（透传）与 `digest`（透传），`today_plan`/`progress` 不受影响。
+
+**4. `boil/services.py` `onboarding`**（services.py:157 附近）：
+- `planner.build_plan(..., ai_outline=pack.get("outline"))`；
+- goal 的 `meta_json` 追加 `"ai_digest": pack.get("digest") or {}` 和 `"ai_outline": pack.get("outline") or []`（注意 meta_json 现在已有 warnings/pack_name/material 三个键，合并而不是覆盖）。
+
+**5. `boil/services.py` `compile_preview`**：返回体加 `"outline": pack.get("outline") or []`、`"digest": pack.get("digest") or {}`（pack 里已有，这里是显式透传给前端用）。
+
+**6. 安装持久化核对**：确认 `install_pack` 把 pack 存进 `packs.manifest_json` 后，`dashboard`/`unit_detail` 能取回 outline/digest。若 manifest_json 只存部分字段，把 outline/digest 一并存入（读 `boil/packs.py` 的 install 相关代码后决定）。目标 meta_json 里的 ai_digest 是仪表盘的主要数据源。
+
+### 4.3 前端改动（onboarding.js renderStep3）
+
+step3 预览升级为三块（在现有单元列表上方）：
+
+1. **材料总览卡**：`digest.overview` 文本 + `digest.advice` 列表 + 角标（`source === "model"` 显示「AI 分析」badge，否则「本地规则」badge-teal/muted）。
+2. **学习大纲**：outline 逐条显示 `title + summary`，右侧对应单元数 badge。
+3. **阶段计划**：study_plan 逐条 `phase + focus + X 单元 · Y 分钟`。
+4. 原单元列表保留在大纲下方（可折叠 `<details open>`）。
+
+数据从 `materialPack.digest` / `materialPack.outline` / `materialPack.study_plan` 直接读（compile 响应的 pack 里就有）。
+
+### 4.4 验收标准
+
+1. 新测试 `test_12_compile_outline_plan`（tests/test_api.py）：
+   - 演示模式 `POST /api/packs/compile` → pack 含非空 `outline`、`study_plan`、`digest.overview`，且 `digest.source == "rules"`；
+   - `planner.build_plan(units, [], ai_outline=[{...倒序 unit_titles...}])` 返回的 plan 中单元顺序遵循 outline（写进 tests/test_planner.py 或就近）。
+2. 浏览器：onboarding 材料模式编译后 step3 显示总览 + 大纲 + 阶段三块。
+3. 创建目标后 `GET /api/dashboard` 响应里能拿到 goal 的 ai_digest（任务 C 会用到）。
+
+### 4.5 已知坑
+
+- `normalize_pack` 是 `dict(pack)` 起手（packs.py:210），顶层新字段会保留；但**units 的每项是白名单式 setdefault**，往 unit 上加字段要显式加（任务 C 的 angle 就是这种情况）。
+- LLM 一次调用输出变长（8000 max_tokens 可能不够装 outline+plan）：把 `compile_material` 里的 `max_tokens` 提到 12000；若仍截断，parse_json_loose 的截断补全会兜底。
+- study_plan 的 minutes 只是建议值，**真实排期仍由 planner 按每日分钟数计算**——AI 只决定顺序与阶段叙事，不做日期算术（这是 examgen「代码强制决策」原则：LLM 提方案，代码做计算）。
+
+**✅ 完成于 2026-10-21**：`compiler_extract.md` 增加 `outline`/`study_plan`/`digest` 三个顶层字段；`compiler._normalize_plan_fields`（模型路径，带标题漂移容错）与 `_fallback_plan_fields`（本地路径，同构形状）两条路径输出一致；`planner.build_plan(ai_outline=…)` 只重写 `order_index`，前置依赖仍由拓扑排序裁决；goal meta 落 `ai_digest`/`ai_outline`/`ai_study_plan`/`ai_generated_by`；`compile_material` 的 `max_tokens` 提到 12000；step3 渲染总览+大纲+阶段+折叠单元清单。真实模型实测：5 条大纲、4 个阶段（基础原理→时间管理→进阶策略→生理支持）、badge「AI 分析」。测试：`test_12_compile_outline_plan` + 3 个 planner 排序测试 + 2 个 compiler 字段测试 + `AiPathTest.test_compile_material_model_path_carries_plan_fields`。
+
+---
+
+## 5. 任务 C：全站内容 AI 合成 + engine 诚实标签
+
+**用户需求**：每一个呈现给用户的内容都必须是 AI 在分析完所有素材后生成的。
+
+**落地解释**（与现状的差距）：单元内容已走 LLM 编译；缺的是（1）材料级的综合呈现（仪表盘总览），（2）单元级的「怎么学」导读，（3）洞察页的 AI 解读。同时立下「engine 标签」原则：所有 AI 生成内容都要标注来源，规则回退不冒充 AI。
+
+### 5.1 现状
+
+- dashboard（services.py:213）返回 goal（含 meta_json）+ advisor + next_units 等；前端 dashboard.js 渲染
+- unit_detail（services.py:456）：units 表**没有 angle 列**（db.py:76-99），单元页无导读
+- insights（services.py:645）：纯本地统计
+- db.py 无迁移机制：`SCHEMA_SQL` + `CREATE TABLE IF NOT EXISTS`，旧库不会自动加列 → 需要引入幂等加列
+
+### 5.2 数据库改动（boil/db.py）
+
+1. `SCHEMA_SQL` 的 units 表加一列：`angle TEXT NOT NULL DEFAULT ''`（单元导读：AI 建议这个单元怎么学）。
+2. 新增幂等迁移函数并在 `init_db()` 末尾调用（mem 的模式，db.py 参考 `_ensure_columns` 思路）：
+
+```python
+def _ensure_column(db, table: str, column: str, ddl: str) -> None:
+    cols = {row[1] for row in db.query(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+```
+
+调用：`_ensure_column(db, "units", "angle", "angle TEXT NOT NULL DEFAULT ''")`。（先看 db.py 里 Database 类的实际方法名：`execute`/`query`，照现有调用方式写。）
+
+3. `install_pack` 写 units 时带上 `angle`（packs.py 的 install 循环里加一列）；`unit_detail` 的 SELECT 加 angle；`_unit_card`（services.py:322）可带 angle 摘要（不必须）。
+
+### 5.3 编译侧改动
+
+- `prompts/compiler_extract.md` 的**每个 unit** 的 schema 加：`"angle": "给学习者的一句话导读：这个单元该怎么学、和材料主线的关系，30 字内"`。
+- `compiler.py` `_normalize_llm_units`：`u["angle"] = str(raw.get("angle") or "")[:80]`；`compile_heuristic` 的 `_heuristic_unit`：angle = `f"先抓住{title[:12]}的本质，再验证边界。"`（规则回退）。
+- packs.py `normalize_pack` 的 unit 白名单里加 `u.setdefault("angle", "")`。
+
+### 5.4 三个呈现点
+
+**1. 仪表盘「材料总览」卡（dashboard.js）**
+- `services.dashboard`：goal 的 meta_json 解出 `ai_digest`，放进返回体 `digest`（含 overview/advice/source）；没有则 `{"overview": "", "source": "rules"}`。
+- dashboard.js 在 advisor 卡下方渲染 digest 卡：标题「材料总览」+ source badge（AI 分析 / 本地规则）+ overview 段落 + advice 列表。空 overview 时整卡不渲染。
+
+**2. 单元页「怎么学」导读（unit.js）**
+- `unit_detail` 返回 unit.angle；unit.js 在 essence 区块顶部渲染一行带 spark 图标的导读（无则不渲染）。
+
+**3. 洞察页「AI 解读」（insights.js）**
+- 新路由 `("POST", re.compile(r"^/api/insights/synthesize$"), self.insights_synthesize)`。
+- `services.insights_synthesize(db, user_id, goal_id)`：
+  - 收集输入：`insights(db, user_id, goal_id)` 的统计（各 facet 均值、due 数、完成度）+ goal 的 ai_digest.overview + 最弱 3 个单元标题；
+  - `llm.chat_json`（新 prompt `prompts/insights_synth.md`，含 `{stats}` `{overview}` `{weak_units}` 占位符）→ `{"summary": "80 字内本周综合解读", "suggestions": ["3 条可执行建议"], "risks": ["2 条风险提醒"]}`；
+  - 回退规则：summary = 弱 facet 模板句，suggestions = 固定 3 条（复习到期卡/补最弱单元/做一次费曼），`source: "rules"`；
+  - 结果不落库（或写 events 表 type=`insight.synthesized` 便于审计），直接返回。
+- insights.js 顶部加「AI 解读」按钮（配置了 LLM 才显示，参考 m7 的 aiEnabled 判定：`ctx.state.settings`？看 settings 视图怎么读 llm 状态，`/api/settings/llm` 有 `mode`），点击后渲染三块内容。
+
+### 5.5 engine 标签总原则（贯穿验收）
+
+- 任何 AI/规则双路径输出，响应里必须有 `source: "model" | "rules"`；
+- 前端渲染对应 badge：`badge-teal「AI 分析」` / `badge-muted「本地规则」`；
+- LLM 失败回退时把原因写进 warnings（现有模式）。
+
+### 5.6 验收标准
+
+1. `test_13_ai_synthesis`：旧库迁移幂等（建库→手工 DROP COLUMN 不行，直接测二次 init 不炸）；compile 出的 pack units 每个有 angle；`GET /api/dashboard` 有 digest 字段；`POST /api/insights/synthesize` 演示模式返回 source=="rules" 的三字段。
+2. 浏览器：仪表盘见「材料总览」卡（带 AI/规则 badge）；单元页见导读行；洞察页点「AI 解读」出内容。
+3. 已有 49 测试不回归。
+
+### 5.6 已知坑
+
+- **不要**把 advisor（本地建议阶梯）改成 LLM——它是确定性安全网；AI 内容是增量卡片，不是替换。
+- insights_synthesize 的 stats JSON 序列化后塞 prompt，控制在 2000 字内（只传数字摘要）。
+- 洞察 AI 调用可能 20-60s：前端按钮要有 loading 态，api.post 超时传 `{timeout: 120000}`。
+
+**✅ 完成于 2026-10-21**：`db.py` 新增 `EXTRA_COLUMNS` + 幂等加列（`units.angle`，`SCHEMA_VERSION` 升到 4），旧库启动自动补列并有回归测试；编译两条路径都产出 angle；仪表盘「材料总览」卡、单元页 angle 导读、洞察页「生成解读」（`POST /api/insights/synthesize` + `prompts/insights_synth.md`）全部带 AI/规则 badge。真实模型实测：解读同时引用材料主线与实际数据（「本周未开始学习，5 个单元均未接触，掌握度与热度均为 0。材料涵盖提取练习、合意困难等…」）。测试：`test_13_ai_synthesis_surfaces` + 2 个 migration 测试 + `AiPathTest.test_insights_synthesize_model_path`。
+
+**执行时修正**：`json_dumps()` 不接受 `ensure_ascii` 参数（它内部已固定 `ensure_ascii=False`）。这个 bug 在 demo 模式下测不出来——是「降级必须带 warning」的纪律把它暴露在 UI 上的。因此补了 `AiPathTest`：**所有 AI 功能都要有用例打桩 `llm.enabled` / `llm.chat_json` 覆盖 model 分支**，否则异常会被回退静默吞掉。
+
+---
+
+## 6. 任务 D：划词灵感笔记（选择浮条 + 右键菜单）
+
+**用户需求**：在每一个可能复制的界面添加右键菜单，随时把灵感存入笔记。参考 testlearn 的划词工具条 + mem 的右键标注。
+
+### 6.1 现状
+
+- 现有笔记仅限单元页两种固定 kind（速记/我的笔记，unit_notes 表，db.py:250，UNIQUE(user_id,unit_id,kind)）——**不适合跨页面自由灵感**，需要新表
+- 前端无任何 selection/contextmenu 处理；utils.js 有 toast/escapeHTML/icon；app.js 有视图挂载点
+- 复制面（要挂 data-selectable 的地方）：unit.js 内容区、socratic.js 消息气泡、feynman.js 报告、insights.js、dashboard.js digest 卡、map.js、review.js 卡片正反面、library.js
+
+### 6.2 数据库（boil/db.py SCHEMA_SQL 追加）
+
+```sql
+CREATE TABLE IF NOT EXISTS notes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  goal_id TEXT,
+  unit_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'inspiration',
+  quote TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id, created_at DESC);
+```
+
+kind 固定 `'inspiration'`（v1 只有一种；将来扩展 highlight/annotation）。
+
+### 6.3 后端（boil/services.py + server.py）
+
+```python
+def list_notes(db, user_id, unit_id=None, q=None, limit=200):
+    # SELECT * FROM notes WHERE user_id=? [AND unit_id=?] [AND (quote LIKE ? OR content LIKE ?)] ORDER BY created_at DESC LIMIT ?
+def create_note(db, user_id, payload):
+    # quote=strip[:2000], content=strip[:4000], unit_id/goal_id 可选, source=strip[:100]
+    # 校验：quote 与 content 至少一个非空，否则 ValueError("引用和笔记至少填一个")
+def delete_note(db, user_id, note_id):  # 删不存在返回 False
+```
+
+路由三条（server.py ROUTES）。**注意：本服务只实现了 `do_GET`/`do_POST`（server.py:362-366），没有 `do_DELETE`——删除用 POST 动作端点，与现有 `/api/reset` 风格一致**。handler 签名统一是 `(self, req, match, query, body)`（照抄 server.py:169 `compile_pack`），校验失败抛 `ApiError`：
+
+```
+("GET",  re.compile(r"^/api/notes$"), self.notes),
+("POST", re.compile(r"^/api/notes$"), self.note_create),
+("POST", re.compile(r"^/api/notes/delete$"), self.note_delete),   # body: {"id": "..."}
+```
+
+### 6.4 前端核心：新模块 `static/js/selectionMenu.js`
+
+```js
+/* 全局划词菜单：selectionchange 浮条 + contextmenu 右键，选中 [data-selectable] 内文本时出现。 */
+import { escapeHTML, toast } from "./utils.js";
+
+export function initSelectionMenu(ctx) { /* 幂等：window.__boilSelMenu 已存在则返回 */ }
+```
+
+实现要点（顺序照做）：
+
+1. **触发条件**（selectionchange 回调，全文档只挂一次）：
+   - `sel = window.getSelection()`；`sel.isCollapsed || !sel.toString().trim()` → 隐藏返回；
+   - 文本长度 4–2000 之外 → 隐藏；
+   - `range = sel.getRangeAt(0)`；`container = (range.commonAncestorContainer.nodeType===1 ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement)?.closest("[data-selectable]")`；无 → 隐藏；
+   - 记录 `state = {text: sel.toString(), unitId: container.dataset.unitId || "", source: container.dataset.source || container.closest("[data-view]")?.dataset.view || ""}`。
+2. **定位**：`rect = range.getBoundingClientRect()`；菜单 `position: fixed`，`left = clamp(rect.left + rect.width/2 - 菜单宽/2, 8, innerWidth-菜单宽-8)`；`top = rect.top > 72 ? rect.top - 44 : rect.bottom + 8`（顶栏 64px，贴顶翻转）。
+3. **菜单 DOM**（单例，append 到 body，`mousedown` 上 `e.preventDefault()` 保住选区）：
+
+```
+[存为灵感] [复制]   ← v1 两个按钮；按钮样式 class="sel-menu-btn"
+```
+
+4. **右键菜单**（用户点名要的交互）：`document.addEventListener("contextmenu", e => { if (当前有活跃选区 && 选区文本包含点击目标) { e.preventDefault(); 在 e.clientX/e.clientY 处显示同一菜单; } })`。判断「选区包含点击目标」：`sel.rangeCount && sel.getRangeAt(0).intersectsNode(e.target)` 或简单用 `sel.containsNode(e.target, true)`。
+5. **隐藏时机**：scroll（>10px）、mousedown 在菜单外、Escape、selectionchange 变空。全部用 `hideMenu()`，注意右键菜单打开后 300ms 内忽略这些隐藏事件（避免刚打开就被 contextmenu 的默认逻辑关掉）。
+6. **复制**：`navigator.clipboard.writeText(state.text)` → toast「已复制」→ hide。
+7. **存为灵感**：hide 浮条 → 在选区附近弹**保存气泡**（一个 fixed 小卡片，含：引用预览（`escapeHTML(state.text)` 截 200 字、只读样式）、textarea「你的灵感 / 备注」（autofocus）、保存/取消按钮）。保存 → `ctx.api.post("/api/notes", { quote: state.text, content: textarea值, unit_id: state.unitId || undefined, source: state.source })` → toast「已存入灵感库」；失败 toast 错误。Enter=保存（Shift+Enter 换行）、Escape=取消。
+8. **app.js 接入**：`import { initSelectionMenu } from "./selectionMenu.js"`，在 boot 成功后 `initSelectionMenu(ctx)`（ctx 需要 api + toast；看 app.js 怎么构造传给视图的 ctx，391 行附近有 navigate 等，照做）。
+
+### 6.5 各视图挂 data-selectable
+
+| 视图 | 挂载点 | 附加 data-* |
+|---|---|---|
+| unit.js | essence/steps/boundaries/misconceptions/faq 内容容器 | `data-selectable data-unit-id="${u.id}" data-source="unit"` |
+| socratic.js | 每条消息气泡（AI 与用户都挂） | `data-selectable data-unit-id="${unitId}" data-source="socratic"` |
+| feynman.js | 评估报告容器 | `data-selectable data-unit-id="${unitId}" data-source="feynman"` |
+| insights.js | 统计卡与 AI 解读区 | `data-selectable data-source="insights"` |
+| dashboard.js | digest 总览卡 + advisor 卡 | `data-selectable data-source="dashboard"` |
+| map.js | 地图节点说明区 | `data-selectable data-source="map"` |
+| review.js | 卡片正反面容器 | `data-selectable data-unit-id="${unitId}" data-source="review"` |
+| library.js | 预览内容区 | `data-selectable data-source="library"` |
+
+原则：挂在**文本内容的最外层展示容器**上（不是整个页面壳），输入框/按钮区不挂。
+
+### 6.6 新视图：灵感库 `static/js/views/notes.js`
+
+- 路由 `#/notes`，app.js：import + 注册到路由表（看 app.js 里 `#/insights` 等怎么注册，照抄一份）；`navItems()`（app.js:111）加 `{key:"notes", label:"灵感库", icon:"spark"}`（icon 用已有的 `spark` 或 `edit`）。
+- 页面：标题 + 统计（N 条）+ 筛选（全部 / 按单元下拉 / 搜索框 debounce 300ms）+ 笔记列表。每条卡片：引用块（左侧竖线样式 `.note-quote`）+ 笔记内容 + 元信息（来源视图 · 所属单元标题 · 相对时间）+ 删除按钮（确认后 `POST /api/notes/delete` body `{"id": ...}`）。
+- 空状态文案：「在任何学习页面划选一段文字，点“存为灵感”，它就会出现在这里。」
+- 导出按钮：前端拼 markdown（`## 引用\n> quote\n\ncontent\n`）用 `URL.createObjectURL(new Blob(...))` 下载 `boil-notes.md`。
+
+### 6.7 CSS（static/css/app.css 追加）
+
+`.selection-menu`（fixed、z-index 高于顶栏、圆角、阴影、flex、backdrop-blur，风格对齐 `.settings-jump`/现有卡片）、`.sel-menu-btn`、`.note-popover`、`.note-quote`（border-left 3px + 灰底斜体）、`.note-card`、移动端宽度适配（max-width: min(320px, calc(100vw - 24px))）。
+
+### 6.8 验收标准
+
+1. `test_14_notes_api`：POST 建 note（带/不带 unit_id）→ GET 列表过滤 unit_id/q → `POST /api/notes/delete` 后 GET 不再出现；quote/content 全空 POST → 400。
+2. 浏览器（tools/browser_check.py 加一条或手工 agent-browser）：
+   - 打开单元页 → 通过 JS `Range`+`Selection` API 选中 essence 段落部分文本（参考 testlearn 的 `probe_selection_crash.py` 的 TreeWalker 选法，或简单 `document.createRange().selectNodeContents(el)` 后 `sel.removeAllRanges(); sel.addRange(range)`）→ 断言 `.selection-menu` 可见 → 点击「存为灵感」→ 填内容保存 → 导航 `#/notes` → 断言新笔记出现且引用文本匹配。
+   - 右键：构造选区后在选区中心 `dispatchEvent(new MouseEvent("contextmenu", {bubbles:true, cancelable:true, clientX, clientY}))` → 断言菜单出现在光标处且 `preventDefault` 生效（原生菜单不出）。
+3. Escape / 点击空白 / 滚动 都能关闭菜单；输入框内选择文本不触发（input/textarea 在 [data-selectable] 之外或显式排除：触发条件里加 `container.tagName === "INPUT" || "TEXTAREA"` 时跳过——实际 closest 会找到容器，需再查 `sel.anchorNode` 所在元素是否 INPUT/TEXTAREA，是则隐藏）。
+4. 已有回归全绿（49+ 新增）。
+
+### 6.9 已知坑
+
+- **事件命名冲突**：socratic.js 若有全局 selectionchange 逻辑（无，已确认），无冲突。
+- 移动端 iOS 长按选择：selectionchange 也能触发浮条；右键菜单在触屏不可用（可接受，浮条覆盖主要路径）。
+- KaTeX 公式内选择：v1 不特殊处理（testlearn 的 formula 锚定是 F12/批注功能，属 P2 的 F12）。
+- 保存气泡的 textarea 里 Enter 触发保存时要防 IME 组合输入：`if (e.isComposing) return`。
+
+**✅ 完成于 2026-10-21**：`notes` 表 + `list_notes`/`create_note`/`delete_note`/`export_notes_markdown` + 三条路由 + `static/js/selectionMenu.js`（划词浮条 + 右键菜单 + 保存气泡）+ 8 个视图挂 `data-selectable`（unit/socratic/feynman/review/insights/dashboard/map/library）+ `#/notes` 灵感库（搜索 debounce、按单元筛选、确认后删除、导出 Markdown、空状态引导）+ 侧边栏与移动导航入口。浏览器实测：划词浮条出现、右键菜单在选区内弹出、保存后落库并带 `source=unit` 与 unit_title、搜索命中正文、删除后列表与服务端同步、控制台零报错。测试：`test_15_inspiration_notes` + 2 个 ServiceTest 用例；`tools/browser_check.py` 新增 3 张截图与 5 组断言（现 26 张，零错误）。
+
+**执行时修正（低阶模型尤其容易再踩）**：
+1. **右键命中判定不能只用 `Range.containsNode(target)`**：被点击的元素通常是选区的**祖先**（例如包着文本的 div），`containsNode` 判定恒假，右键菜单永远不会弹出。改成按选区的 `getClientRects()` 做几何命中判定。
+2. **`unit_id` 可能含中文**（编译器把标题写进 id）。Python 测试里拼 URL 必须 `urllib.parse.quote`，否则 `UnicodeEncodeError`；前端本来就用的是 `encodeURIComponent`。
+3. **新增数据表必须同步三处白名单，否则会静默丢数据**：`backup.IMPORT_TABLES`（导入）、`services.export_data`（导出）、`services.reset_user`（重置）。已用 `test_inspiration_notes_survive_export_import` 把这条不变量钉住——以后加表先加这个测试。
+4. **选区的单元归属用 `closest("[data-unit-id]")` 向上找**：页面级容器标 `data-unit-id`、内容块标 `data-selectable`，两者解耦，这样复习卡、对话气泡都能追溯所属单元而不必重复标注。
+5. **SPA 只改 hash 不会重新加载模块**：验证前端改动必须整页 reload，否则跑的是旧代码（本次一度误判 step3 没渲染）。
+6. `selectionchange` 是异步派发的：同一次 `eval` 里设置选区再读菜单状态会读到旧值，要分两步断言。
+
+---
+
+## 7. P1 迁移批次（任务 E，A-D 完成后按序执行）
+
+每项都遵循同一格式：改哪里 / 怎么改 / 验收。规模都不大，低阶模型可一次一项。
+
+### E1 复习先回忆再翻面（源 mem m3）
+- review.js 卡片正面：现有「显示答案」按钮上方加 `<textarea id="rv-recall" class="textarea" placeholder="先不看答案，用自己的话回忆一下——写不出来正好说明这里还没懂。">`；翻面后答案区顶部渲染「你的回忆」块（对照排版：你的回忆在上、标准答案在下）。
+- 后端：`services.rate_card`（services.py:577）目前只写 `review_logs`，不写 attempts——加可选参数 `recall: str = ""`：非空时 `db.insert("attempts", {..., "kind": "recall", "response": recall[:4000], ...})`（attempts 表结构见 db.py:162-174，id 用 `new_id("at")`）；review.js 评分时把 textarea 内容一起 POST。
+- 验收：翻面前可见 textarea；评分后 attempts 表有记录；空回忆可选（不强制）。
+
+### E2 引文高亮重现（源 mem m2）
+- unit.js 渲染完内容后：取该单元的 notes（GET /api/notes?unit_id=）遍历 quote，用 TreeWalker 文本索引 + Range.surroundContents 包 `<mark class="note-hl">`（全部出现位置；跳过 code/katex 节点；一次渲染只处理不重叠的前 20 处）。
+- CSS `.note-hl { background: rgba(250,204,21,.25); border-radius:2px; padding:0 1px; box-decoration-break: clone; }`（box-decoration-break 防多行断裂，testlearn 实证必需）。
+- 验收：存过灵感的引用文本在单元页被高亮；无 notes 时零开销。
+
+### E3 单元口诀 AI 生成（源 mem m5）
+- **现状**：口诀的存储与展示已有——`unit_notes` 表 kind='mnemonic'（db.py:250），单元页可编辑（unit.js:180），复习队列已透出（services.py:544-554）。缺的只是 AI 生成。
+- 新 prompt `prompts/mnemonic.md`——**严格任务边界**（照抄 mem 的四条规则：只给记忆钩子（口诀/谐音/类比/反差），禁止复述或总结内容、禁止新增知识、公式 `$...$` 原样保留、每条 ≤40 字共 ≤200 字）；
+- 单元页「速记」textarea 旁加「AI 帮我编口诀」按钮（LLM 未配置不渲染）→ 新端点 `POST /api/units/{id}/mnemonic`（读单元 essence/steps/boundaries 拼材料，**服务端取数不信前端传文**，mem 的信任边界原则）→ 结果填入 textarea（用户确认后才保存，绝不静默写入）。
+- 验收：演示模式按钮不出现；配置模型后点击 → textarea 填充 1-3 条口诀。
+
+### E4 LLM 网关加固（源 mem m6 + examgen e2/e8）
+boil/llm.py 的 `chat`/`chat_json` 增加四个机制（全部带注释级小改动，别重构）：
+1. `finish_reason == "length"` → 以 `max(4×, 800)` 的 max_tokens 重试一次，取更长结果；
+2. 响应 400 且 body 提到 `response_format`/`json_object` → 去掉该参数重试一次；
+3. `parse_json_loose` 增强：解析失败时做「截断补全」猜测（末尾补 `"}]`/`]"` 配平——照 examgen `src/llm/index.js:60-131` 的括号计数逻辑用 Python 重写）；仍失败再抛；
+4. 垃圾字面量守卫：`chat_json` 结果若是 `"undefined"/"null"/"None"/"NaN"/"无"` 等字符串 → 视为失败走重试。
+- 验收：tests/test_llm.py（若没有则建）用本地假服务器（http.server 线程）覆盖 1/2/4 三种场景。
+
+### E5 可选 AI 熔断（源 mem m7）
+- api.js 记录连续 AI 端点失败次数（`window.__boilAiFails`）；≥2 → `ctx.state.aiBroken = true` 并 toast「AI 暂不可用，已临时切换本地模式」；
+- 所有「AI 按钮」（suggest/mnemonic/insights synthesize）渲染前检查 `ctx.state.aiBroken`，broken 则不渲染；成功调用清零计数。
+- 验收：模拟两次失败后按钮消失；成功后恢复。
+
+### E6 记忆健康度（源 mem m8）
+- **现状澄清**：insights 已有「30 天保留率」（复习成功率，services.py insights 的 retention_30d）——那是**历史成功率**；这里要加的是**当前可提取性均值**（此刻平均还能想起多少），两者不同。
+- services.insights 加 `memory_health`：全部非 new 卡当前可提取性 `R(t)=(1+FACTOR·t/S)^DECAY` 的均值（FACTOR/DECAY/公式直接用 `boil/srs/fsrs.py:31-32` 的常量与 `Scheduler.retrievability`（fsrs.py:116），别复制 mem 的）；
+- insights.js 顶部指标卡加一项（百分比 + 一句话解释「所有已学内容此刻平均还能想起多少」）。
+- 验收：有复习记录时数值 ∈ (0,1)；无记录显示「—」。
+
+### E7 内容寻址 LLM 缓存（源 examgen e1）
+- llm.py 加模块级 `CACHE_DIR = <data>/llm_cache/`；`chat_json` 计算键 `sha256(json.dumps({model, messages, max_tokens}))`；命中则直接返回缓存（**仅缓存 chat_json，不缓存流式**）；
+- settings 加开关（meta 表 KV `llm_cache_enabled`，默认开）；缓存文件 `{key}.json` 存 `{result, created_at}`；
+- **风险控制**：compile 这类确定性调用收益最大；socratic/feynman 含会话状态本来就不会命中。注意 messages 里若含时间戳等易变内容会导致永不命中——compile prompt 是稳定的，没问题。
+- 验收：同一 compile 请求第二次 LLM 调用计数为 0（llm.py 加 `stats()` 返回 calls/cache_hits，settings 页展示）。
+
+---
+
+## 8. P2 迁移批次（任务 F，E 之后，按价值排序）
+
+| # | 功能 | 源 | Boil 落点要点 |
+|---|---|---|---|
+| F1 | 错因标签（6 类固定 taxonomy，评分时选，持久化） | mem m10 | cards 表加 `mistake_tags`（幂等加列）；rate_card body 接收；insights 按标签聚合 |
+| F2 | 复习队列侧栏（跳转/只练选中/加未到期卡） | mem m11 | review.js 纯前端改造，数据已有 |
+| F3 | 键盘复习（空格翻面、1/2/3 评分、`/` 聚焦搜索） | mem m12 | 全局 keydown，输入焦点时忽略 |
+| F4 | 导入恢复前快照（import_data 前先把当前库导出到 data/backups/） | mem m13 | services.import_data 开头加 |
+| F5 | 粘贴清洗（全角空格/CR/LaTeX 定界符/富文本项目符号归一） | mem m14 | 新 boil/markdown_fix.py 纯函数 + onboarding textarea paste 事件 + 单测 |
+| F6 | LLM 诊断面板（异常分类+HTTP建议+可复制诊断） | mem m15 | settings.js LLM 卡片下加「诊断」折叠区，读 llm.last_error() 结构化展示 |
+| F7 | 单元合并链（merged_into + UI 横幅跳转） | examgen e3/e7 | units 表加 `merged_into`；map/unit 渲染横幅；代码强制阈值合并（编译去重时 similarity 在代码里算） |
+| F8 | 内容质检（LLM-as-judge 三维评审 + 可执行补丁 + 输出前校验器） | examgen e4/e5/e10 | 编译后自动跑：确定性检查（空字段/长度/重复标题）→ 残差交 LLM 评审 → 修补丁；结果进 warnings |
+| F9 | 逐字锚点材料修复（切分质量差时 LLM 给锚点、代码做手术） | examgen e6 | compiler.py heuristic 路径：当某 section > 3000 字时触发 |
+| F10 | 检索式知识注入（编译长材料时只注入相关片段而非全文） | examgen e9 | compile_material 超过 24k 字时分批：先 outline pass 再每单元 retrieval pass |
+| F11 | AI 提炼卡片：预览→确认→入库 | testlearn t2 | 划词菜单加第三个动作「做卡片」→ 预览 front/back → 确认后进 cards 表 |
+| F12 | 公式感知高亮锚定（KaTeX TeX 源 + 出现序号） | testlearn t3 | E2 的增强版，做不做看 E2 用下来的断裂率 |
+| F13 | 网关：始终流式请求上游再拼回（防空闲网关 504） | testlearn t5 | llm.chat 内部改 stream:true + 前端无感；SSE 已有基础 |
+| F14 | 追问侧线程（划词「问 AI」，带 ±800 字上下文） | testlearn t6 | selectionMenu 第三动作 + socratic side session |
+| F15 | SSE 断线重连（request_id + last_seq 重放） | testlearn t7 | socratic.js stream 加重试；server 侧事件缓冲已有 events 表 |
+| F16 | 学习风格测试→教学策略人设 | testlearn t8 | onboarding 可选第 4 步；结果写 goal meta，socratic prompt 注入 |
+
+P3（远期，本计划不展开）：番茄钟、记忆 diff/撤销、移动端划词劫持、多用户认证。
+
+---
+
+## 9. 回归清单（每个任务完成后必跑）
+
+```bash
+cd /workspace/testweb3/boil
+python -m unittest discover -s tests -v          # 全部通过（当前 66）
+make check-js                                    # JS 语法
+python run.py &                                   # 起服务（或确认已运行）
+python tools/browser_check.py                     # 23+ 截图零报错
+# 手工冒烟：#/onboarding 全流程（上传→建议→编译→总览/大纲→开始）→ dashboard → unit → review → #/notes
+```
+
+浏览器检查注意：tools/browser_check.py 的截图断言列表要随新 UI 同步扩展（新任务各节的验收标准里已写明要加什么断言）。
+
+---
+
+## 10. 完成定义（DoD）
+
+一个任务算「完成」当且仅当：
+1. 第 9 节回归清单全绿；
+2. 演示模式（不配置 LLM）下该功能的全部路径可用且有 rules 标签；
+3. 真实模式（data/llm.json 已配置，勿外泄 key）下手工冒烟通过一次；
+4. 本文档对应小节末尾追加一行「✅ 完成于 YYYY-MM-DD + 简短结果」（如改动与本文档描述有出入，更新本文档而不是留下代码与文档的分歧）；
+5. 相关文档同步：新端点进 API.md，新表/列进 ARCHITECTURE.md，用户可见功能进 README.md。
+
+（最后：未经用户明确指示，不 commit / 不 push。）
+
+---
+
+## 11. 执行记录
+
+### 2026-10-21 · 任务 A/B/C/D 完成
+
+| 项 | 结果 |
+|---|---|
+| 单元测试 | 49 → **66** 全绿（新增 17 个） |
+| JS 语法检查 | `make check-js` 通过 |
+| 浏览器回归 | `tools/browser_check.py` **26 张截图，errors: none** |
+| 控制台错误 | 全 7 个路由 0 报错 |
+| 真实模型冒烟 | suggest 1.1s / compile 约 60s / insights synthesize 约 25s，均 `source=model` |
+
+**新增文件**：`prompts/meta_suggest.md`、`prompts/insights_synth.md`、`static/js/selectionMenu.js`、`static/js/views/notes.js`、`IMPROVEMENT_PLAN.md`
+**新增端点**：`POST /api/packs/suggest`、`POST /api/insights/synthesize`、`GET/POST /api/notes`、`POST /api/notes/delete`、`GET /api/notes/export`
+**数据库**：`SCHEMA_VERSION` 2 → 4；新表 `notes`；`units` 新列 `angle`（旧库启动时幂等补列）
+**新增导航**：侧边栏与底部移动导航的「灵感库」（`#/notes`）
+
+**下一批（E 批次）待办的起点**：E1 复习先回忆再翻面 → E2 引文高亮重现 → E3 口诀 AI 生成 → E4 网关加固 → E5 AI 熔断 → E6 记忆健康度 → E7 内容寻址缓存。
+
+执行 E2 时注意：`notes` 已带 `unit_id`，前端可直接 `GET /api/notes?unit_id=…` 取引用做高亮，无需后端改动。
+执行 E3 时注意：口诀的存储与展示已存在（`unit_notes` kind=`mnemonic`，复习队列已透出），只缺 AI 生成；服务端取单元内容，不要信前端传的原文。
+执行 E5 时注意：`insights_synthesize`、`suggest_meta` 已把失败写进 `warnings`/回退 `rules`，熔断只需在前端计数并隐藏入口。

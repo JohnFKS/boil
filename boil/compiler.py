@@ -12,7 +12,7 @@ from typing import Any
 from . import llm
 from .packs import PackError, derive_key_points, normalize_pack, validate_pack
 from .embeddings import semantic_groups
-from .utils import new_id, now_iso, slugify, split_cn
+from .utils import clamp, new_id, now_iso, slugify, split_cn
 
 PROBE_TEMPLATES = {
     "recall": "不看材料，用自己的话说明「{title}」最核心的一句话是什么？",
@@ -23,6 +23,101 @@ PROBE_TEMPLATES = {
 
 HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$", re.M)
 NUMBERED_RE = re.compile(r"^\s*(?:\d+[.、)]|[-*•])\s+(.+)$")
+
+
+def _norm_text(value: Any, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _clean_titles(raw: Any, limit: int = 40) -> list[str]:
+    out: list[str] = []
+    for item in (raw or []):
+        title = _norm_text(item, limit)
+        if title and title not in out:
+            out.append(title)
+    return out[:12]
+
+
+def _match_unit_titles(raw_titles: list[str], known: list[str]) -> list[str]:
+    """把大纲里的标题对应回真实单元标题：先精确，再互相包含。"""
+    matched: list[str] = []
+    for title in raw_titles:
+        if not title:
+            continue
+        if title in known and title not in matched:
+            matched.append(title)
+            continue
+        hit = next((k for k in known if k and (title in k or k in title)), None)
+        if hit and hit not in matched:
+            matched.append(hit)
+    return matched
+
+
+def _normalize_plan_fields(data: dict[str, Any], units: list[dict[str, Any]]) -> dict[str, Any]:
+    """清洗模型给出的大纲/阶段/总览；大纲补齐所有未被覆盖的单元。"""
+    known = [str(u.get("title") or "") for u in units]
+    by_title = {str(u.get("title") or ""): u for u in units}
+    outline: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    for raw in (data.get("outline") or [])[:12]:
+        if not isinstance(raw, dict):
+            continue
+        title = _norm_text(raw.get("title"), 40)
+        if not title:
+            continue
+        titles = _match_unit_titles(_clean_titles(raw.get("unit_titles")), known)
+        placed.update(titles)
+        outline.append({"title": title, "summary": _norm_text(raw.get("summary"), 140),
+                        "unit_titles": titles})
+    for title in known:
+        if title and title not in placed:
+            unit = by_title[title]
+            outline.append({"title": title, "summary": _norm_text(unit.get("essence"), 140),
+                            "unit_titles": [title]})
+    study_plan: list[dict[str, Any]] = []
+    for raw in (data.get("study_plan") or [])[:8]:
+        if not isinstance(raw, dict):
+            continue
+        phase = _norm_text(raw.get("phase"), 24)
+        if not phase:
+            continue
+        try:
+            minutes = int(clamp(int(raw.get("minutes") or 0), 0, 6000))
+        except (TypeError, ValueError):
+            minutes = 0
+        study_plan.append({"phase": phase, "focus": _norm_text(raw.get("focus"), 60),
+                           "unit_titles": _match_unit_titles(_clean_titles(raw.get("unit_titles")), known),
+                           "minutes": minutes})
+    digest_raw = data.get("digest") if isinstance(data.get("digest"), dict) else {}
+    overview = _norm_text(digest_raw.get("overview"), 400)
+    advice = [_norm_text(a, 80) for a in (digest_raw.get("advice") or []) if _norm_text(a, 80)][:5]
+    return {"outline": outline, "study_plan": study_plan,
+            "digest": {"overview": overview, "advice": advice}}
+
+
+def _fallback_plan_fields(units: list[dict[str, Any]]) -> dict[str, Any]:
+    """本地编译器用的同构字段：只陈述材料里已有的顺序与本质，不做推断。"""
+    outline = [{"title": str(u.get("title") or ""),
+                "summary": _norm_text(u.get("essence"), 140),
+                "unit_titles": [str(u.get("title") or "")]} for u in units[:12]]
+    phases = []
+    for i in range(0, len(units), 3):
+        group = units[i:i + 3]
+        phases.append({
+            "phase": f"阶段 {i // 3 + 1}",
+            "focus": _norm_text(group[0].get("title"), 60),
+            "unit_titles": [str(u.get("title") or "") for u in group],
+            "minutes": sum(int(u.get("estimated_minutes") or 40) for u in group),
+        })
+    titles = "；".join(_norm_text(u.get("title"), 30) for u in units[:4])
+    return {
+        "outline": outline,
+        "study_plan": phases,
+        "digest": {
+            "overview": f"这份材料被切分为 {len(units)} 个单元：{titles}。先吃透每个单元的本质，再用探针验证。",
+            "advice": ["每个单元先合书复述，再答探针", "答不出的单元第二天优先复习", "阶段末做一次费曼讲解"],
+        },
+    }
 
 
 def _clean_line(line: str) -> str:
@@ -160,6 +255,7 @@ def _heuristic_unit(title: str, body: str, index: int, subject: str) -> dict[str
     unit = {
         "id": f"unit-{index + 1}-{slugify(title, 'unit')}",
         "title": title,
+        "angle": _norm_text(f"先合书复述「{title[:12]}」的本质，再逐条验证步骤与边界", 60),
         "essence": essence,
         "analogy": analogy,
         "example": example,
@@ -203,6 +299,8 @@ def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool 
         "cover": "steam",
         "units": units,
     }
+    pack.update(_fallback_plan_fields(units))
+    pack["generated_by"] = "rules"
     return normalize_pack(pack, source="compiler")
 
 
@@ -216,6 +314,7 @@ def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict
         u = {
             "id": f"unit-{i + 1}-{slugify(raw.get('title', f'unit-{i + 1}'), 'unit')}",
             "title": str(raw.get("title") or f"知识单元 {i + 1}"),
+            "angle": _norm_text(raw.get("angle"), 80),
             "essence": str(raw.get("essence") or ""),
             "analogy": str(raw.get("analogy") or ""),
             "example": str(raw.get("example") or ""),
@@ -277,6 +376,8 @@ def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict
         "cover": "steam",
         "units": units,
     }
+    pack.update(_normalize_plan_fields(data, units))
+    pack["generated_by"] = "model"
     return normalize_pack(pack, source="compiler")
 
 
@@ -294,7 +395,7 @@ def compile_material(title: str, subject: str, text: str,
             data = llm.chat_json([
                 {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
                 {"role": "user", "content": prompt},
-            ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=8000)
+            ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=12000)
             pack = _normalize_llm_units(data, title, subject)
             errors = validate_pack(pack)
             if errors:

@@ -103,11 +103,12 @@ Base URL：`http://127.0.0.1:7860`
 
 返回：
 
-- `goal`、`plan`（今日、策略、里程碑、前 14 天）
+- `goal`、`plan`（今日、策略、里程碑、大纲 `outline`、前 14 天）
 - `counts`（units/boiled/learning/new/rusting/due）
 - `mastery`（四维平均、最弱维度）
 - `statuses`（每个单元的状态与到期数）
 - `next_units`、`next_action`
+- `digest` / `study_plan_phases` / `generated_by`：编译时 AI 读完整份材料后生成的总览与阶段计划（存在 goal 的 meta 里），`generated_by` 为 `model` 或 `rules`
 - `activity`（事件流）
 - `map_preview`
 - `llm`（模式与错误）
@@ -170,10 +171,41 @@ Base URL：`http://127.0.0.1:7860`
 
 返回：
 
-- `unit`（含 steps/boundaries/misconceptions/faq/key_points/source_ref）
+- `unit`（含 steps/boundaries/misconceptions/faq/key_points/angle/source_ref）
 - `mastery`、`status`、`heat`、`heat_label`、`pn`、`records`
 - `notes`（速记/笔记）、`related`（语义相关单元）
 - `probes`、`cards`、`sessions`、`relations`、`attempts`
+
+### 灵感笔记（划词保存）
+
+前端在任意 `data-selectable` 区域划词或右键，把选中的文字连同想法存成一条跨页面的笔记。与 `unit_notes`（单元内的速记/笔记）是两套东西：`unit_notes` 每个单元每类只有一条，`notes` 可以无限累积并带引用原文。
+
+```
+GET  /api/notes?unit_id=…&q=…&limit=200   列表（默认 200，上限 500）
+POST /api/notes                           新建
+POST /api/notes/delete                    删除，body {"id": "…"}
+GET  /api/notes/export                    下载 boil-notes.md
+```
+
+> 本服务只实现 `do_GET` / `do_POST`，因此删除用 POST 动作端点，与 `/api/reset` 同一风格。
+
+新建请求：
+
+```json
+{
+  "quote": "提取一次，记忆痕迹就被强化一次",
+  "content": "可以用作每天早上第一个自测题。",
+  "unit_id": "u_…（可选，不属于任何单元时省略）",
+  "source": "unit"
+}
+```
+
+- `quote` 与 `content` 至少要有一个非空，否则 `bad_request`。
+- 长度上限：`quote` 2000 字、`content` 4000 字，超出会被截断而不是报错。
+- `unit_id` 不存在时置空；`source` 只接受白名单（`unit`/`socratic`/`feynman`/`review`/`insights`/`dashboard`/`map`/`library`/`notes`），其它值清空。
+- `goal_id` 省略时自动挂到当前目标。
+- 列表返回 `notes`（含 JOIN 出来的 `unit_title`）、`total`、`goal_id`。
+- 灵感笔记会随 `GET /api/export` 一起导出、被 `POST /api/import` 恢复，并会被 `POST /api/reset` 清除。
 
 ---
 
@@ -226,7 +258,13 @@ Base URL：`http://127.0.0.1:7860`
 
 ```json
 {
-  "pack": {"schema_version": "1.0", "id": "user.…", "units": []},
+  "pack": {
+    "schema_version": "1.0", "id": "user.…", "units": [],
+    "outline": [{"title": "第一部分", "summary": "为什么先学它", "unit_titles": ["…"]}],
+    "study_plan": [{"phase": "地基", "unit_titles": ["…"], "focus": "本阶段目标", "minutes": 180}],
+    "digest": {"overview": "150 字以内的材料总览", "advice": ["学习建议"]},
+    "generated_by": "model"
+  },
   "summary": {},
   "warnings": []
 }
@@ -236,6 +274,32 @@ Base URL：`http://127.0.0.1:7860`
 - 无模型 / `use_llm=false`：本地确定性编译器。
 - 使用 `documents` 时，Pack 的 `source.documents` 会记录文件名与字符数，`source.material_chars` 记录合并长度。
 - 编译会保存用户 Pack 到 `data/packs/`，可以直接用于 onboarding。
+- `outline` / `study_plan` / `digest` 两条路径都会生成，形状一致；`generated_by` 标明是 `model` 还是 `rules`，前端据此显示「AI 分析」或「本地规则」。大纲顺序会作为 `planner.build_plan(ai_outline=…)` 的排序依据，但**前置依赖仍由代码拓扑排序保证**，日期算术也始终由代码完成。
+- 每个单元带 `angle`：一句话说明这个单元该怎么学。
+
+### `POST /api/packs/suggest`
+
+导入材料后、编译前就能用的元信息生成（标题 / 学科 / 目标名 / 一句话描述）。
+
+```json
+{"text": "粘贴内容（可选）", "documents": [{"name": "讲义.md", "text": "……"}]}
+```
+
+返回：
+
+```json
+{
+  "title": "提取练习与复习策略",
+  "subject": "学习科学",
+  "goal_title": "掌握高效记忆与迁移",
+  "description": "一句话说明这份材料最值得学什么",
+  "source": "model"
+}
+```
+
+- 与编译共用合并规则（`documents` + `text`），少于 60 字符返回 `bad_request`。
+- 未配置模型或模型失败时回退本地规则：取第一个 Markdown 标题或首行，`source` 为 `rules`。
+- 只读操作：不落库、不创建 Pack，前端只回填空字段。
 
 ### `POST /api/packs/import`
 
@@ -501,6 +565,25 @@ data: {}
 - `gaps`（来自苏格拉底报告）
 - `next_action`
 - `recent_sessions`
+
+### `POST /api/insights/synthesize`
+
+把**材料总览 + 全部学习数据**一起交给模型，生成一段本周解读。请求体可选 `{"goal_id": "…"}`。
+
+```json
+{
+  "summary": "本周综合解读",
+  "suggestions": ["可执行建议"],
+  "risks": ["风险提醒"],
+  "based_on": {"digest": true, "units": 5},
+  "source": "model",
+  "warnings": []
+}
+```
+
+- 送进模型的统计只有数字摘要（单元数、已烧开/学习中/生锈、平均热度、计划完成度、30 天保留率、最近缺口）与最弱三个单元，控制在 2k 字内。
+- 未配置模型或模型失败：回退规则文案，`source` 为 `rules`，并把失败原因写进 `warnings`——不会静默冒充 AI。
+- 结果不落库；前端点击「生成解读」时才调用（模型路径可能需要十几秒）。
 
 ---
 

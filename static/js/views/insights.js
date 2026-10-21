@@ -57,7 +57,17 @@ export async function render(el, ctx, params) {
       <div class="stat"><span class="stat-icon violet">${icon("flame", 18)}</span><div><div class="stat-value">${stats.streak || 0} 天</div><div class="stat-label">连续学习</div></div></div>
     </div>
 
-    <div class="insight-grid mt-4">
+    <div class="card card-pad mt-4" id="insight-ai-card" data-selectable data-source="insights">
+      <div class="section-head">
+        <div><div class="section-title">本周解读</div><div class="section-sub">把全部证据与材料总览一起交给模型，再回给你一段判断</div></div>
+        <button class="btn btn-ghost btn-sm" id="insight-ai-btn" type="button">${icon("wand", 13)} 生成解读</button>
+      </div>
+      <div id="insight-ai-body" class="mt-2">
+        <p class="muted small">还没有生成。点击「生成解读」，AI 会读完掌握度、保留率、火候分布与材料总览后给出结论。</p>
+      </div>
+    </div>
+
+    <div class="insight-grid mt-4" data-selectable data-source="insights">
       <div class="card chart-card">
         <div class="section-head"><div><div class="section-title">掌握雷达</div><div class="section-sub">四维证据的平均值</div></div><a class="badge badge-muted" href="#/map">看地图 →</a></div>
         <div class="radar-wrap">${radarSVG(values, ["回忆", "解释", "应用", "迁移"], { size: 240 })}</div>
@@ -128,4 +138,29 @@ export async function render(el, ctx, params) {
         <div class="callout ember"><strong>${counts.rusting || 0}</strong> 个单元开始变凉；先复习，再学新的。</div>
       </div>
     </div>`;
+
+  const aiBtn = el.querySelector("#insight-ai-btn");
+  const aiBody = el.querySelector("#insight-ai-body");
+  aiBtn?.addEventListener("click", async () => {
+    aiBtn.disabled = true;
+    const label = aiBtn.innerHTML;
+    aiBtn.innerHTML = "分析中…";
+    aiBody.innerHTML = `<p class="muted small">AI 正在把全部证据与材料总览放在一起分析，可能需要十几秒…</p>`;
+    try {
+      const res = await ctx.api.post("/api/insights/synthesize", {}, { timeout: 120000 });
+      const badge = res.source === "model"
+        ? `<span class="badge badge-teal">AI 分析</span>`
+        : `<span class="badge badge-muted">本地规则</span>`;
+      aiBody.innerHTML = `
+        <div class="row wrap" style="gap:8px">${badge}${(res.warnings || []).map(w => `<span class="badge badge-ember">${escapeHTML(w)}</span>`).join("")}</div>
+        <p class="ai-summary mt-2">${escapeHTML(res.summary || "")}</p>
+        ${(res.suggestions || []).length ? `<div class="side-label mt-2">建议</div><ul class="digest-advice">${res.suggestions.map(s => `<li>${escapeHTML(s)}</li>`).join("")}</ul>` : ""}
+        ${(res.risks || []).length ? `<div class="callout ember mt-2"><div class="side-label">风险</div><ul class="digest-advice">${res.risks.map(r => `<li>${escapeHTML(r)}</li>`).join("")}</ul></div>` : ""}`;
+    } catch (e) {
+      aiBody.innerHTML = `<p class="muted small">生成失败：${escapeHTML(e.message || "未知错误")}</p>`;
+    } finally {
+      aiBtn.disabled = false;
+      aiBtn.innerHTML = label;
+    }
+  });
 }

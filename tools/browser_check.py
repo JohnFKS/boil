@@ -323,7 +323,72 @@ def main():
         wait_for(".insight-grid", "学习证据")
         wait_for(".heat-dist", "火候分布", 8)
         shot("insights.png")
+        if not evaluate("!!document.querySelector('#insight-ai-btn')"):
+            errors.append("insights AI 解读入口不存在")
         shot("insights-full.png", full=True)
+
+        # 划词菜单 + 灵感库
+        goto(f"#/unit/{unit_id}")
+        wait_for(".essence-text", "一句话本质")
+        evaluate(
+            "(()=>{const el=document.querySelector('.essence-text');"
+            "const r=document.createRange();r.selectNodeContents(el);"
+            "const s=getSelection();s.removeAllRanges();s.addRange(r);})()"
+        )
+        time.sleep(0.6)
+        menu = evaluate(
+            "(()=>{const m=document.querySelector('.selection-menu');"
+            "const c=getComputedStyle(m);"
+            "return {display:c.display, btns:[...m.querySelectorAll('.sel-btn')].length}})()"
+        )
+        if not menu or menu.get("display") != "flex" or menu.get("btns") != 2:
+            errors.append(f"划词菜单没有出现: {menu}")
+        shot("selection-menu.png")
+        evaluate("document.querySelector('[data-sel=\"note\"]')?.click()")
+        time.sleep(0.5)
+        pop = evaluate(
+            "(()=>{const p=document.querySelector('.note-popover');"
+            "return {display:getComputedStyle(p).display,"
+            "quote:(p.querySelector('.note-quote')?.textContent||'').length>0,"
+            "area:!!p.querySelector('#sel-note')}})()"
+        )
+        if not pop or pop.get("display") != "grid" or not pop.get("quote") or not pop.get("area"):
+            errors.append(f"灵感保存气泡不完整: {pop}")
+        evaluate(
+            "(()=>{const a=document.querySelector('#sel-note');"
+            "a.value='浏览器回归自动生成的灵感，用完即删。';"
+            "document.querySelector('[data-note-save]').click();})()"
+        )
+        time.sleep(1.4)
+        shot("note-popover.png")
+        created = evaluate(
+            "(async()=>{const r=await fetch('/api/notes');const j=await r.json();"
+            "const n=j.data.notes.find(x=>x.content&&x.content.includes('浏览器回归'));"
+            "return {total:j.data.total, id:n?n.id:'', src:n?n.source:'', unit:n?!!n.unit_id:false}})()"
+        )
+        if not created or not created.get("id") or created.get("src") != "unit" or not created.get("unit"):
+            errors.append(f"划词保存的笔记不完整: {created}")
+        goto("#/notes")
+        wait_for(".note-card", "灵感库")
+        notes_page = evaluate(
+            "(()=>({cards:document.querySelectorAll('.note-card').length,"
+            "quote:!!document.querySelector('.note-card .note-quote'),"
+            "nav:!!document.querySelector('[data-nav=\"notes\"]')}))()"
+        )
+        if not notes_page or notes_page.get("cards", 0) < 1 or not notes_page.get("quote") \
+                or not notes_page.get("nav"):
+            errors.append(f"灵感库渲染异常: {notes_page}")
+        shot("notes.png")
+        if created.get("id"):
+            id_literal = json.dumps(created["id"])
+            removed = evaluate(
+                "(async()=>{const r=await fetch('/api/notes/delete',"
+                "{method:'POST',headers:{'Content-Type':'application/json'},"
+                "body:JSON.stringify({id:" + id_literal + "})});"
+                "const j=await r.json();return {ok:r.ok,deleted:j.data?j.data.deleted:''}})()"
+            )
+            if not removed or not removed.get("ok"):
+                errors.append(f"回归笔记清理失败: {removed}")
 
         goto("#/settings")
         wait_for(".settings-grid", "模型连接")

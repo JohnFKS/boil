@@ -113,7 +113,7 @@ export async function render(el, ctx, params) {
       </div>
     </div>
     <div class="feynman-layout">
-      <div class="feynman-main" id="feynman-main">
+      <div class="feynman-main" id="feynman-main" data-selectable data-unit-id="${escapeAttr(unitId)}" data-source="feynman">
         <div class="card explain-card">
           <div class="mode-tabs" id="mode-tabs">
             ${Object.entries(MODES).map(([k, m]) => `<button class="mode-tab ${k === mode ? "active" : ""}" data-mode="${k}">${m.label}</button>`).join("")}

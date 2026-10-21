@@ -9,7 +9,7 @@ from typing import Any
 
 from . import config, embeddings, heat, llm, mastery, planner, socratic
 from .compiler import compile_material
-from .db import Database, json_dumps, json_loads
+from .db import Database, SCHEMA_VERSION, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
 from .packs import (PackError, all_available_packs, get_goal_relations,
                     get_goal_units, install_pack, normalize_pack, pack_progress,
@@ -134,6 +134,12 @@ def onboarding(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
                (now_iso(), user["id"]))
     goal_id = new_id("goal")
     ts = now_iso()
+    ai_meta = {
+        "ai_digest": pack.get("digest") or {},
+        "ai_outline": pack.get("outline") or [],
+        "ai_study_plan": pack.get("study_plan") or [],
+        "ai_generated_by": pack.get("generated_by") or "rules",
+    }
     db.insert("goals", {
         "id": goal_id,
         "user_id": user["id"],
@@ -147,7 +153,8 @@ def onboarding(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
         "pack_id": pack["id"],
         "meta_json": json_dumps({"warnings": warnings,
                                  "pack_name": pack.get("name"),
-                                 "material": bool(material)}),
+                                 "material": bool(material),
+                                 **ai_meta}),
         "created_at": ts,
         "updated_at": ts,
     })
@@ -156,7 +163,7 @@ def onboarding(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
     relations = get_goal_relations(db, goal_id)
     plan = planner.build_plan(units, relations, daily_minutes=daily_minutes,
                               start=_local_today(), deadline=deadline, goal_id=goal_id,
-                              version=1)
+                              version=1, ai_outline=ai_meta["ai_outline"])
     plan = save_plan(db, goal_id, plan)
     emit(db, "goal.created", {"goal_id": goal_id, "title": goal_title,
                               "pack_id": pack["id"], "units": len(units)}, user["id"])
@@ -240,6 +247,7 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
             "strategy": plan.get("strategy", {}),
             "today": today_day,
             "milestones": plan.get("milestones", []),
+            "outline": plan.get("outline", []),
             "progress": progress,
             "days": plan_days[:14],
         },
@@ -257,6 +265,9 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
         },
         "next_units": next_units,
         "next_action": next_action,
+        "digest": (goal.get("meta") or {}).get("ai_digest") or {},
+        "study_plan_phases": (goal.get("meta") or {}).get("ai_study_plan") or [],
+        "generated_by": (goal.get("meta") or {}).get("ai_generated_by") or "rules",
         "activity": recent(db, user_id, 12),
         "map_preview": {
             "units": [{"id": u["id"], "title": u["title"], "status": statuses[u["id"]]["status"]}
@@ -386,9 +397,11 @@ def update_goal_and_replan(db: Database, user_id: str, payload: dict[str, Any]) 
             deadline_date = date.fromisoformat(deadline)
         except ValueError:
             deadline_date = None
+    goal_meta = json_loads(goal.get("meta_json") or "{}")
     plan = planner.build_plan(remaining, relations, daily_minutes=daily,
                               start=_local_today(), deadline=deadline_date,
-                              goal_id=goal["id"], version=1)
+                              goal_id=goal["id"], version=1,
+                              ai_outline=goal_meta.get("ai_outline") or None)
     plan = save_plan(db, goal["id"], plan)
     emit(db, "goal.updated", {"goal_id": goal["id"], "daily_minutes": daily,
                               "deadline": deadline, "remaining": len(remaining)}, user_id)
@@ -451,6 +464,92 @@ def save_unit_note(db: Database, user_id: str, unit_id: str, kind: str,
         })
     emit(db, "note.saved", {"unit_id": unit_id, "kind": kind, "empty": not bool(content)}, user_id)
     return get_unit_notes(db, user_id, unit_id)
+
+
+# ---------------------------------------------------------------------------
+# 灵感笔记（划词保存，跨页面）
+# ---------------------------------------------------------------------------
+NOTE_SOURCES = ("unit", "socratic", "feynman", "review", "insights", "dashboard",
+                "map", "library", "notes")
+
+
+def list_notes(db: Database, user_id: str, unit_id: str | None = None,
+               q: str | None = None, limit: int = 200) -> dict[str, Any]:
+    limit = int(clamp(int(limit or 200), 1, 500))
+    sql = "SELECT n.*, u.title AS unit_title FROM notes n " \
+          "LEFT JOIN units u ON u.id = n.unit_id WHERE n.user_id=?"
+    params: list[Any] = [user_id]
+    if unit_id:
+        sql += " AND n.unit_id=?"
+        params.append(unit_id)
+    keyword = (q or "").strip()
+    if keyword:
+        sql += " AND (n.quote LIKE ? OR n.content LIKE ?)"
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    sql += " ORDER BY n.created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = db.query(sql, params)
+    for r in rows:
+        r["chars"] = len(r.get("content") or "") + len(r.get("quote") or "")
+    goal = active_goal(db, user_id)
+    return {"notes": rows, "total": db.scalar(
+        "SELECT COUNT(*) FROM notes WHERE user_id=?", (user_id,), 0) or 0,
+        "goal_id": goal["id"] if goal else None}
+
+
+def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    quote = re.sub(r"\r\n?", "\n", str(payload.get("quote") or "")).strip()[:2000]
+    content = re.sub(r"\r\n?", "\n", str(payload.get("content") or "")).strip()[:4000]
+    if not quote and not content:
+        raise ValueError("引用文字和灵感内容至少要有一个")
+    unit_id = str(payload.get("unit_id") or "").strip()[:80] or None
+    if unit_id and not db.one("SELECT id FROM units WHERE id=?", (unit_id,)):
+        unit_id = None
+    goal = active_goal(db, user_id)
+    source = str(payload.get("source") or "").strip()[:40]
+    if source not in NOTE_SOURCES:
+        source = ""
+    ts = now_iso()
+    note_id = new_id("no")
+    db.insert("notes", {
+        "id": note_id, "user_id": user_id,
+        "goal_id": str(payload.get("goal_id") or "").strip()[:80] or (goal["id"] if goal else None),
+        "unit_id": unit_id, "kind": "inspiration",
+        "quote": quote, "content": content, "source": source,
+        "created_at": ts, "updated_at": ts,
+    })
+    emit(db, "note.created", {"note_id": note_id, "unit_id": unit_id, "source": source,
+                              "chars": len(quote) + len(content)}, user_id)
+    row = db.one("SELECT n.*, u.title AS unit_title FROM notes n "
+                 "LEFT JOIN units u ON u.id = n.unit_id WHERE n.id=? AND n.user_id=?",
+                 (note_id, user_id))
+    return {"note": row, "id": note_id}
+
+
+def delete_note(db: Database, user_id: str, note_id: str) -> dict[str, Any]:
+    cur = db.execute("DELETE FROM notes WHERE id=? AND user_id=?", (note_id, user_id))
+    if cur.rowcount == 0:
+        raise ValueError("笔记不存在")
+    emit(db, "note.deleted", {"note_id": note_id}, user_id)
+    return {"deleted": note_id}
+
+
+def export_notes_markdown(db: Database, user_id: str) -> str:
+    rows = db.query(
+        "SELECT n.*, u.title AS unit_title FROM notes n "
+        "LEFT JOIN units u ON u.id = n.unit_id "
+        "WHERE n.user_id=? ORDER BY n.created_at DESC", (user_id,))
+    lines = ["# Boil 灵感库", ""]
+    for r in rows:
+        if r.get("quote"):
+            lines.append(f"> {r['quote']}")
+        if r.get("content"):
+            lines.append(f"\n{r['content']}")
+        meta = [x for x in (r.get("unit_title"), r.get("source"), (r.get("created_at") or "")[:10]) if x]
+        if meta:
+            lines.append(f"\n— {' · '.join(meta)}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
@@ -735,6 +834,79 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
     }
 
 
+def insights_synthesize(db: Database, user_id: str, goal_id: str | None = None) -> dict[str, Any]:
+    """把材料总览与全部学习数据一起交给模型，生成一段本周解读。"""
+    data = insights(db, user_id, goal_id)
+    goal = data.get("goal") or {}
+    digest = (goal.get("meta") or {}).get("ai_digest") or {}
+    statuses = data.get("statuses") or {}
+    units = {u["id"]: u for u in get_goal_units(db, goal["id"])} if goal else {}
+    ranked = sorted(statuses.items(), key=lambda kv: float(kv[1].get("average") or 0.0))
+    weak = [
+        f"{units.get(uid, {}).get('title') or uid}"
+        f"（掌握度 {float(st.get('average') or 0):.2f}，热度 {round4(float(st.get('heat') or 0))}）"
+        for uid, st in ranked[:3]
+    ]
+    counts = data.get("counts") or {}
+    stats_blob = {
+        "单元总数": counts.get("units", 0),
+        "已烧开": counts.get("boiled", 0),
+        "学习中": counts.get("learning", 0),
+        "正在生锈": counts.get("rusting", 0),
+        "平均热度": data.get("average_heat", 0),
+        "计划完成度百分比": (data.get("plan_progress") or {}).get("percent"),
+        "近30天保留率": (data.get("stats") or {}).get("retention_30d"),
+        "最近待补的缺口": [g.get("gap") for g in (data.get("gaps") or [])][:5],
+    }
+    warnings: list[str] = []
+    if llm.enabled():
+        try:
+            prompt = (llm.load_prompt("insights_synth.md")
+                      .replace("{overview}", digest.get("overview") or "（还没有材料总览）")
+                      .replace("{stats}", json_dumps(stats_blob))
+                      .replace("{weak_units}", "、".join(weak) or "（还没有学习记录）"))
+            res = llm.chat_json([
+                {"role": "system", "content": "你是严谨的学习教练。只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ], model=llm.model_name(deep=True), temperature=0.3, max_tokens=900)
+            if isinstance(res, dict) and str(res.get("summary") or "").strip():
+                return {
+                    "summary": _meta_field(res.get("summary"), 240),
+                    "suggestions": [_meta_field(s, 80) for s in (res.get("suggestions") or [])
+                                    if _meta_field(s, 80)][:5],
+                    "risks": [_meta_field(r, 80) for r in (res.get("risks") or [])
+                              if _meta_field(r, 80)][:4],
+                    "based_on": {"digest": bool(digest.get("overview")), "units": len(statuses)},
+                    "source": "model",
+                    "warnings": warnings,
+                }
+            warnings.append("模型没有给出可用解读，已切换到本地规则。")
+        except Exception as exc:
+            warnings.append(f"AI 解读失败，已切换到本地规则：{str(exc)[:160]}")
+    weakest = units.get(ranked[0][0], {}).get("title") if ranked else None
+    avg_heat = float(data.get("average_heat") or 0)
+    summary = (
+        f"共 {counts.get('units', 0)} 个单元，已烧开 {counts.get('boiled', 0)} 个，"
+        f"{counts.get('rusting', 0)} 个正在生锈，平均热度 {round4(avg_heat)}。"
+    )
+    if weakest:
+        summary += f" 当前最薄弱的是「{weakest}」。"
+    return {
+        "summary": summary,
+        "suggestions": [
+            "今天先清掉到期卡片，再学新单元",
+            f"给{weakest or'最弱单元'}做一次费曼讲解" if weakest else "挑一个单元做一次费曼讲解",
+            "答不出的探针第二天优先重测",
+        ][:3],
+        "risks": [
+            f"{counts.get('rusting', 0)} 个单元已生锈，拖越久重学成本越高",
+        ] if counts.get("rusting") else ["暂无明显风险，保持每日提取练习"],
+        "based_on": {"digest": bool(digest.get("overview")), "units": len(statuses)},
+        "source": "rules",
+        "warnings": warnings,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 内容包与编译器
 # ---------------------------------------------------------------------------
@@ -805,6 +977,45 @@ def merge_material_documents(documents: list[Any] | None, text: str) -> tuple[st
     return merged, docs
 
 
+def _meta_field(value: Any, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any]:
+    """材料元信息即时生成：优先真实模型，失败回退本地规则并如实标注来源。"""
+    merged, _docs = merge_material_documents(documents, text)
+    if len(merged) < 60:
+        raise ValueError("材料太短，至少提供 60 个字符。")
+    if llm.enabled():
+        try:
+            prompt = llm.load_prompt("meta_suggest.md").replace("{text}", merged[:6000])
+            data = llm.chat_json([
+                {"role": "system", "content": "你是严谨的学习材料元信息提取器。只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ], model=llm.model_name(), temperature=0.3, max_tokens=500)
+            title = _meta_field(data.get("title"), 40) if isinstance(data, dict) else ""
+            if title:
+                return {
+                    "title": title,
+                    "subject": _meta_field(data.get("subject"), 20),
+                    "goal_title": _meta_field(data.get("goal_title"), 40),
+                    "description": _meta_field(data.get("description"), 80),
+                    "source": "model",
+                }
+        except Exception:
+            pass
+    heading = re.search(r"^#{1,4}\s+(.+)$", merged, re.M)
+    first_line = heading.group(1) if heading else merged.splitlines()[0]
+    title = _meta_field(re.sub(r"^[\s>#*\-•]+", "", first_line), 28) or "我的学习材料"
+    return {
+        "title": title,
+        "subject": "",
+        "goal_title": f"掌握{title[:16]}" if len(title) <= 16 else title,
+        "description": "",
+        "source": "rules",
+    }
+
+
 def compile_preview(db: Database, title: str, subject: str, text: str,
                     use_llm: bool = True, use_embeddings: bool = True,
                     documents: list[Any] | None = None) -> dict[str, Any]:
@@ -869,7 +1080,7 @@ def export_data(db: Database, user_id: str) -> dict[str, Any]:
         "exported_at": now_iso(),
         "app": "Boil",
         "version": config.VERSION,
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
         "user": user,
         "goals": goals,
         "plans": db.query(f"SELECT * FROM plans WHERE goal_id IN ({placeholders})", tuple(goal_ids)) if goal_ids else [],
@@ -890,6 +1101,7 @@ def export_data(db: Database, user_id: str) -> dict[str, Any]:
         "attempts": db.query("SELECT * FROM attempts WHERE user_id=?", (user_id,)),
         "boil_records": db.query("SELECT * FROM boil_records WHERE user_id=?", (user_id,)),
         "unit_notes": db.query("SELECT * FROM unit_notes WHERE user_id=?", (user_id,)),
+        "notes": db.query("SELECT * FROM notes WHERE user_id=?", (user_id,)),
         "events": db.query("SELECT * FROM events WHERE user_id=?", (user_id,)),
         "study_days": db.query("SELECT * FROM study_days WHERE user_id=?", (user_id,)),
         "llm": {k: v for k, v in llm.get_config().items() if k != "api_key"},
@@ -949,7 +1161,7 @@ def reset_user(db: Database, user_id: str = config.DEFAULT_USER) -> None:
             db.execute(f"DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE user_id=?)", (user_id,))
             for table in ("sessions", "explanations", "attempts", "evidence", "mastery",
                           "review_logs", "cards", "probes", "relations", "units", "plans",
-                          "goal_packs", "boil_records", "unit_notes"):
+                          "goal_packs", "boil_records", "unit_notes", "notes"):
                 if table == "probes":
                     db.execute(f"DELETE FROM probes WHERE unit_id IN (SELECT id FROM units WHERE goal_id IN ({ph}))", tuple(goal_ids))
                 elif table in ("relations", "units", "plans", "goal_packs"):

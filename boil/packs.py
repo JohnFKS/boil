@@ -235,6 +235,7 @@ def normalize_pack(pack: dict[str, Any], source: str = "builtin") -> dict[str, A
         u.setdefault("importance", 3)
         u.setdefault("estimated_minutes", 45)
         u.setdefault("order_index", i)
+        u.setdefault("angle", "")
         u.setdefault("relations", [])
         u.setdefault("probes", [])
         u.setdefault("cards", [])
@@ -353,6 +354,7 @@ def install_pack(db: Database, user_id: str, goal_id: str, pack: dict[str, Any])
                 "importance": int(raw.get("importance") or 3),
                 "estimated_minutes": int(raw.get("estimated_minutes") or 45),
                 "order_index": int(raw.get("order_index") or 0),
+                "angle": str(raw.get("angle") or ""),
                 "source_ref_json": json.dumps(raw.get("source_ref") or {}, ensure_ascii=False),
                 "created_at": ts,
                 "updated_at": ts,
