@@ -259,9 +259,10 @@ def main():
             print("  shot", name)
 
         call("Page.navigate", {"url": APP + "/#/dashboard"})
-        if not wait_for(".hero", "今日闭环", 20):
+        if not wait_for(".hero", "学习闭环", 20):
             body = evaluate("document.body.innerText") or ""
             errors.append("dashboard did not render: " + body[:300])
+        wait_for("#advisor-body[data-advice-ready='1']", None, 12)
         shot("dashboard.png")
         # full page dashboard
         shot("dashboard-full.png", full=True)
@@ -272,7 +273,14 @@ def main():
 
         goto(f"#/unit/{unit_id}")
         wait_for(".essence-card", "一句话本质")
+        wait_for(".unit-heat-card", "本单元火候")
         shot("unit.png")
+        shot("unit-full.png", full=True)
+        evaluate("document.querySelector('[data-audio]')?.click()")
+        wait_for(".audio-script", "第 0 档", 6)
+        shot("audio.png")
+        evaluate("document.querySelector('.modal-head [data-close]')?.click()")
+        time.sleep(0.3)
 
         goto(f"#/socratic/{chat_sid}")
         wait_for(".chat-panel", "苏格拉底")
@@ -291,6 +299,9 @@ def main():
         wait_for("#feynman-result", "讲解分", 10)
         time.sleep(4.2)
         shot("feynman-result.png")
+        goto(f"#/feynman/{unit_id}?mode=examiner")
+        wait_for(".prompt-card", "极致对标", 10)
+        shot("benchmark.png")
 
         goto("#/review")
         wait_for(".flashcard", "先回忆")
@@ -310,11 +321,14 @@ def main():
 
         goto("#/insights")
         wait_for(".insight-grid", "学习证据")
+        wait_for(".heat-dist", "火候分布", 8)
         shot("insights.png")
+        shot("insights-full.png", full=True)
 
         goto("#/settings")
         wait_for(".settings-grid", "模型连接")
         shot("settings.png")
+        shot("settings-full.png", full=True)
 
         goto("#/onboarding")
         wait_for(".onboarding", "你想先烧开哪一壶水")
@@ -324,7 +338,7 @@ def main():
         call("Emulation.setDeviceMetricsOverride",
              {"width": 390, "height": 844, "deviceScaleFactor": 2, "mobile": True})
         goto("#/dashboard")
-        wait_for(".hero", "今日闭环")
+        wait_for(".hero", "学习闭环")
         shot("dashboard-mobile.png")
 
         print("\nerrors:")

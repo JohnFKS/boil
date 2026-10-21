@@ -10,7 +10,7 @@ import json
 import re
 from typing import Any
 
-from . import llm
+from . import heat, llm
 from .db import Database
 from .events import emit, touch_study_day
 from .mastery import add_evidence
@@ -206,7 +206,7 @@ def _normalize(data: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
 
 
 def evaluate(db: Database, user_id: str, unit: dict[str, Any], text: str,
-             mode: str = "peer") -> dict[str, Any]:
+             mode: str = "peer", advice_id: str | None = None) -> dict[str, Any]:
     text = (text or "").strip()
     if len(text) < 20:
         raise ValueError("讲解太短了，至少写 20 个字，或先说 60 秒。")
@@ -257,12 +257,20 @@ def evaluate(db: Database, user_id: str, unit: dict[str, Any], text: str,
     dims = result.get("dimensions") or {}
     explain_score = 0.5 * overall + 0.5 * float((dims.get("correctness") or {}).get("score", overall))
     transfer_score = 0.6 * float((dims.get("boundary") or {}).get("score", 0.0)) + 0.4 * overall
+    heat_before = heat.heat_for_unit(db, user_id, unit["id"])
     add_evidence(db, user_id, unit["id"], "explain", explain_score,
                  confidence=0.75 if result.get("engine") == "live" else 0.45,
                  weight=0.9, source="feynman", attempt_id=explanation_id)
     add_evidence(db, user_id, unit["id"], "transfer", transfer_score,
                  confidence=0.65 if result.get("engine") == "live" else 0.4,
                  weight=0.6, source="feynman", attempt_id=explanation_id)
+    heat_after = heat.heat_for_unit(db, user_id, unit["id"])
+    record_mode = "benchmark" if mode == "examiner" else "feynman"
+    heat.record_boil(db, user_id, unit["id"], record_mode, 4, {
+        "overall": overall, "dimensions": dims, "mode": mode,
+        "engine": result.get("engine"), "explanation_id": explanation_id,
+    }, heat_before, heat_after, result.get("gaps") or [],
+        advice_id=advice_id, accepted=1 if advice_id else 0)
     touch_study_day(db, user_id, minutes=10, sessions=1)
     emit(db, "feynman.evaluated", {
         "unit_id": unit["id"], "mode": mode, "overall": overall,

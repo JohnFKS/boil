@@ -97,9 +97,11 @@ async function refreshMe() {
   return state.me;
 }
 
-async function startSocratic(unitId) {
+async function startSocratic(unitId, adviceId = null) {
   try {
-    const res = await api.post("/api/socratic/start", { unit_id: unitId });
+    const payload = { unit_id: unitId };
+    if (adviceId) payload.advice_id = adviceId;
+    const res = await api.post("/api/socratic/start", payload);
     navigate(`#/socratic/${res.session.id}`);
   } catch (e) {
     toast(e.message || "无法开始对话", "error");

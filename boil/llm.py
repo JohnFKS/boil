@@ -23,11 +23,22 @@ from .utils import jwt_like_mask, now_iso, read_json, write_json_atomic
 
 DEFAULT_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_AUTH_HEADER = "Authorization"
+DEFAULT_AUTH_PREFIX = "Bearer "
 READ_IDLE = 120
 CONNECT_TIMEOUT = 20
 MAX_RETRIES = 2
+RESERVED_PAYLOAD_KEYS = {
+    "model", "messages", "stream", "max_tokens", "temperature",
+    "response_format", "tools", "tool_choice", "stop",
+}
 
 PROVIDERS = [
+    {"id": "dots", "name": "Dots（小红书）",
+     "base_url": "https://note3-prev-api.askdiandian.com/v1",
+     "model": "dots3-note-prev", "deep_model": "dots3-note-prev",
+     "auth_header": "api-key", "auth_prefix": "",
+     "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
     {"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1",
      "model": "gpt-4o-mini", "deep_model": "gpt-4o"},
     {"id": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
@@ -63,7 +74,19 @@ def _env_config() -> dict[str, Any]:
         "temperature": 0.5,
         "max_tokens": None,
         "timeout": READ_IDLE,
+        "auth_header": os.environ.get("BOIL_LLM_AUTH_HEADER", DEFAULT_AUTH_HEADER),
+        "auth_prefix": os.environ.get("BOIL_LLM_AUTH_PREFIX", DEFAULT_AUTH_PREFIX),
+        "extra_body": {},
     }
+
+
+def _normalize_auth_prefix(header: str, prefix: Any) -> str:
+    if prefix is None:
+        return DEFAULT_AUTH_PREFIX
+    value = str(prefix).replace("\r", "").replace("\n", "")
+    if header.lower() == "authorization" and value.strip().lower() == "bearer":
+        return "Bearer "
+    return value
 
 
 def get_config() -> dict[str, Any]:
@@ -77,6 +100,23 @@ def get_config() -> dict[str, Any]:
     cfg["temperature"] = float(cfg.get("temperature") or 0.5)
     cfg["timeout"] = int(cfg.get("timeout") or READ_IDLE)
     cfg["max_tokens"] = cfg.get("max_tokens") or None
+    header = str(cfg.get("auth_header") or DEFAULT_AUTH_HEADER).strip() or DEFAULT_AUTH_HEADER
+    if not re.fullmatch(r"[A-Za-z0-9-]+", header):
+        header = DEFAULT_AUTH_HEADER
+    cfg["auth_header"] = header
+    prefix = cfg.get("auth_prefix")
+    if prefix is None:
+        prefix = DEFAULT_AUTH_PREFIX
+    cfg["auth_prefix"] = _normalize_auth_prefix(header, prefix)
+    extra = cfg.get("extra_body")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    cfg["extra_body"] = extra
     return cfg
 
 
@@ -90,6 +130,31 @@ def set_config(payload: dict[str, Any]) -> dict[str, Any]:
         "max_tokens": payload.get("max_tokens", cur["max_tokens"]),
         "timeout": payload.get("timeout", cur["timeout"]),
     }
+    header = str(payload.get("auth_header", cur["auth_header"]) or DEFAULT_AUTH_HEADER).strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+", header):
+        raise ValueError("auth_header 必须是合法的 HTTP 头名称")
+    out["auth_header"] = header or DEFAULT_AUTH_HEADER
+    prefix = payload.get("auth_prefix", cur["auth_prefix"])
+    if prefix is None:
+        prefix = cur["auth_prefix"]
+    out["auth_prefix"] = str(prefix).replace("\r", "").replace("\n", "")
+    extra = cur.get("extra_body") or {}
+    if "extra_body" in payload:
+        raw = payload.get("extra_body")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            extra = {}
+        elif isinstance(raw, dict):
+            extra = raw
+        elif isinstance(raw, str):
+            try:
+                extra = json.loads(raw)
+            except ValueError as exc:
+                raise ValueError("extra_body 必须是合法 JSON 对象") from exc
+            if not isinstance(extra, dict):
+                raise ValueError("extra_body 必须是 JSON 对象")
+        else:
+            raise ValueError("extra_body 必须是 JSON 对象")
+    out["extra_body"] = extra
     # None = 不修改；空字符串 = 显式清空 Key（回到演示模式）
     if "api_key" in payload and payload["api_key"] is not None:
         key = str(payload["api_key"]).strip()
@@ -165,10 +230,30 @@ def public_config() -> dict[str, Any]:
         "temperature": cfg["temperature"],
         "max_tokens": cfg["max_tokens"],
         "timeout": cfg["timeout"],
+        "auth_header": cfg["auth_header"],
+        "auth_prefix": cfg["auth_prefix"],
+        "extra_body": cfg["extra_body"],
         "providers": PROVIDERS,
         "last_error": err,
         "forced_off": config.LLM_OFF,
     }
+
+
+def _request_headers(cfg: dict[str, Any], accept: str) -> dict[str, str]:
+    header = cfg.get("auth_header") or DEFAULT_AUTH_HEADER
+    prefix = _normalize_auth_prefix(header, cfg.get("auth_prefix"))
+    return {
+        "Content-Type": "application/json",
+        "Accept": accept,
+        header: f"{prefix}{cfg['api_key']}",
+        "User-Agent": "Boil/1.0 (local-first learning os)",
+    }
+
+
+def _apply_extra_body(payload: dict[str, Any], cfg: dict[str, Any]) -> None:
+    for key, value in (cfg.get("extra_body") or {}).items():
+        if key not in RESERVED_PAYLOAD_KEYS and key not in payload:
+            payload[key] = value
 
 
 def _extract_content(data: dict[str, Any]) -> str:
@@ -224,12 +309,8 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
         payload["max_tokens"] = int(tokens)
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": "Bearer " + cfg["api_key"],
-        "User-Agent": "Boil/1.0 (local-first learning os)",
-    }
+    _apply_extra_body(payload, cfg)
+    headers = _request_headers(cfg, "application/json")
     url = _base_url()
     timeout_s = int(timeout or cfg["timeout"])
     last_exc: LLMError | None = None
@@ -294,13 +375,9 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
     parts = urlsplit(_base_url())
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise LLMError("Base URL 不合法", _base_url(), "bad_config")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "Authorization": "Bearer " + cfg["api_key"],
-        "User-Agent": "Boil/1.0 (local-first learning os)",
-        "Connection": "close",
-    }
+    _apply_extra_body(payload, cfg)
+    headers = _request_headers(cfg, "text/event-stream")
+    headers["Connection"] = "close"
     timeout_s = int(timeout or cfg["timeout"])
     cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
     kwargs: dict[str, Any] = {"timeout": timeout_s}

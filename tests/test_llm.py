@@ -16,6 +16,7 @@ from boil import config, llm
 
 class FakeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    seen: dict = {}
 
     def do_GET(self):
         body = json.dumps({"data": [{"id": "fake-model"}]}).encode()
@@ -28,6 +29,7 @@ class FakeHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         payload = json.loads(self.rfile.read(length) or b"{}")
+        FakeHandler.seen = {"headers": {k.lower(): v for k, v in self.headers.items()}, "payload": payload}
         if payload.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -113,6 +115,29 @@ class LLMGatewayTest(unittest.TestCase):
         self.assertTrue(err.get("message"))
         pub = llm.public_config()
         self.assertTrue(pub["last_error"])
+
+    def test_custom_auth_header_and_extra_body(self):
+        llm.set_config({
+            "auth_header": "api-key",
+            "auth_prefix": "",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        })
+        text = llm.chat([{"role": "user", "content": "hello"}], max_tokens=20)
+        self.assertEqual(text, "OK from fake")
+        self.assertEqual(FakeHandler.seen["headers"].get("api-key"), "sk-test-1234567890abcdef")
+        self.assertEqual(FakeHandler.seen["payload"].get("chat_template_kwargs"),
+                         {"enable_thinking": False})
+        self.assertNotIn("Authorization", FakeHandler.seen["headers"])
+        pub = llm.public_config()
+        self.assertEqual(pub["auth_header"], "api-key")
+        self.assertEqual(pub["auth_prefix"], "")
+        self.assertEqual(pub["extra_body"]["chat_template_kwargs"]["enable_thinking"], False)
+
+    def test_bearer_prefix_without_trailing_space_is_normalized(self):
+        llm.set_config({"auth_header": "Authorization", "auth_prefix": "Bearer"})
+        self.assertEqual(llm.public_config()["auth_prefix"], "Bearer ")
+        llm.chat([{"role": "user", "content": "hello"}], max_tokens=8)
+        self.assertEqual(FakeHandler.seen["headers"].get("authorization"), "Bearer sk-test-1234567890abcdef")
 
     def test_models_endpoint(self):
         from urllib.request import urlopen

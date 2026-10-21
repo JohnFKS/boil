@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -247,7 +247,23 @@ CREATE TABLE IF NOT EXISTS study_days (
   PRIMARY KEY (user_id, day)
 );
 
+CREATE TABLE IF NOT EXISTS boil_records (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  level INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT NOT NULL DEFAULT '{}',
+  heat_before REAL NOT NULL DEFAULT 0,
+  heat_after REAL NOT NULL DEFAULT 0,
+  pn_diff_json TEXT NOT NULL DEFAULT '[]',
+  advice_id TEXT,
+  accepted INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_units_goal ON units(goal_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_boil_records_user ON boil_records(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_relations_goal ON relations(goal_id);
 CREATE INDEX IF NOT EXISTS idx_probes_unit ON probes(unit_id);
 CREATE INDEX IF NOT EXISTS idx_cards_user_due ON cards(user_id, due_at);

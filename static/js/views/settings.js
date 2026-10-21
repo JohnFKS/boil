@@ -47,9 +47,12 @@ export async function render(el, ctx, params) {
             <div class="field full"><label>API Key</label><input class="input" id="llm-key" type="password" autocomplete="off" placeholder="${cfg.api_key_set ? `已保存 ${escapeHTML(cfg.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">密钥写入 data/llm.json（0600），不会返回给浏览器，也不会进入导出包。</span></div>
             <div class="field"><label>模型</label><input class="input" id="llm-model" value="${escapeAttr(cfg.model || "")}" placeholder="gpt-4o-mini"></div>
             <div class="field"><label>深度模型（苏格拉底/费曼）</label><input class="input" id="llm-deep" value="${escapeAttr(cfg.deep_model || "")}" placeholder="留空则与模型相同"></div>
+            <div class="field"><label>认证头名称</label><input class="input" id="llm-auth-header" value="${escapeAttr(cfg.auth_header || "Authorization")}" placeholder="Authorization"><span class="hint">Dots 使用 <code>api-key</code>。</span></div>
+            <div class="field"><label>认证前缀</label><input class="input" id="llm-auth-prefix" value="${escapeAttr(cfg.auth_prefix ?? "Bearer ")}" placeholder="Bearer "><span class="hint">OpenAI 为 <code>Bearer </code>（含空格）；Dots 留空。</span></div>
             <div class="field"><label>温度 <span id="temp-label">${cfg.temperature}</span></label><input class="slider" id="llm-temp" type="range" min="0" max="1.5" step="0.1" value="${cfg.temperature}"></div>
             <div class="field"><label>最大输出 tokens（可选）</label><input class="input" id="llm-tokens" type="number" min="64" max="32000" value="${cfg.max_tokens || ""}" placeholder="留空由服务端决定"></div>
             <div class="field"><label>超时（秒）</label><input class="input" id="llm-timeout" type="number" min="10" max="600" value="${cfg.timeout || 120}"></div>
+            <div class="field full"><label>高级请求参数 JSON（可选）</label><textarea class="textarea" id="llm-extra" placeholder='{}'>${escapeHTML(JSON.stringify(cfg.extra_body || {}, null, 2))}</textarea><span class="hint">会合并进请求体。Dots 可设置 <code>{"chat_template_kwargs":{"enable_thinking":true}}</code> 开启深度思考；默认预设关闭以降低延迟。</span></div>
           </div>
           <div class="row mt-4" style="flex-wrap:wrap">
             <button class="btn btn-primary" id="save-llm">${icon("check", 15)} 保存连接</button>
@@ -130,15 +133,33 @@ export async function render(el, ctx, params) {
     if (p.base_url) el.querySelector("#llm-base").value = p.base_url;
     if (p.model) el.querySelector("#llm-model").value = p.model;
     el.querySelector("#llm-deep").value = p.deep_model || p.model || "";
+    el.querySelector("#llm-auth-header").value = p.auth_header || "Authorization";
+    el.querySelector("#llm-auth-prefix").value = p.auth_prefix !== undefined ? p.auth_prefix : "Bearer ";
+    el.querySelector("#llm-extra").value = JSON.stringify(p.extra_body || {}, null, 2);
     el.querySelectorAll("[data-provider]").forEach(x => x.classList.toggle("active", x === btn));
     toast(`已填入 ${p.name} 的默认端点，保存后生效。`, "info", 3000);
   }));
 
   function collectLLM() {
+    const extraText = el.querySelector("#llm-extra").value.trim();
+    let extraBody = {};
+    if (extraText) {
+      try {
+        extraBody = JSON.parse(extraText);
+      } catch {
+        throw new Error("高级请求参数必须是合法 JSON");
+      }
+      if (!extraBody || Array.isArray(extraBody) || typeof extraBody !== "object") {
+        throw new Error("高级请求参数必须是 JSON 对象");
+      }
+    }
     const payload = {
       base_url: el.querySelector("#llm-base").value.trim(),
       model: el.querySelector("#llm-model").value.trim(),
       deep_model: el.querySelector("#llm-deep").value.trim(),
+      auth_header: el.querySelector("#llm-auth-header").value.trim() || "Authorization",
+      auth_prefix: el.querySelector("#llm-auth-prefix").value,
+      extra_body: extraBody,
       temperature: Number(el.querySelector("#llm-temp").value),
       max_tokens: el.querySelector("#llm-tokens").value ? Number(el.querySelector("#llm-tokens").value) : null,
       timeout: Number(el.querySelector("#llm-timeout").value) || 120,

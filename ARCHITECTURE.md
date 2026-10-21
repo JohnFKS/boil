@@ -32,6 +32,8 @@ boil/
 │   ├── packs.py               # LearningPack 校验 / 安装 / 查询
 │   ├── compiler.py            # 材料 → Pack（LLM + 本地降级）
 │   ├── planner.py             # 前置 DAG + 时间预算 + 最少必要路径
+│   ├── heat.py               # T 温度 / PN 缺口 / BoilRecord
+│   ├── advisor.py            # 强度阶梯推荐器 v0（规则 + 理由 + 成本）
 │   ├── socratic.py            # 苏格拉底状态机 + 流式 + 报告
 │   ├── feynman.py             # 费曼六维评分 + 缺口
 │   ├── mastery.py             # 四维证据聚合
@@ -59,6 +61,8 @@ boil/
 - **Plan**：目标 + 前置 DAG + 时间预算 → 每天做什么。
 - **Card / ReviewLog**：FSRS 的卡片与复习历史。
 - **Session / Message**：对话与讲解的容器。
+- **T / PN / BoilRecord**：火候状态、必要步骤缺口、每次模式尝试的前后温度与结果。
+- **Advice**：一个带理由、成本、目标与档位的下一步建议；采纳/否决进入事件日志。
 - **Event**：所有上述行为的追加式记录。
 
 内核不包含任何具体学科词汇。它不知道“极限”“二重积分”或“考研”。
@@ -170,7 +174,48 @@ FSRS-5：
 - `preview` 与真实 `schedule` 共用逻辑，避免 UI 显示与实际到期漂移。
 - 目标保留率 0.9；最大间隔 100 年；保留率只用于显示与调度，不对外宣称“预测准确”。
 
-## 5. 掌握度
+## 5. 火候、PN 与 Advisor
+
+### 5.1 T（温度）
+
+`heat.compute_heat(mastery, due_count)`：
+
+- 基础值 = 四维平均分 × 100；
+- 四维都 ≥0.8 且 reps ≥4 → 基础值至少 96；
+- 超过 3 天没有新证据 → 每天衰减 2.2；
+- 每张到期卡 → 最多扣 20。
+
+T 是产品状态量，不是科学测量值。阈值 40/80/100 用于推荐与展示，必须用真实数据校准。
+
+### 5.2 PN（必要步骤）
+
+`heat.pn_state` 读取最近一次已完成的苏格拉底报告与费曼解释里的 `gaps`，把它们作为“还缺的步骤”；没有报告时返回未知，而不是假装完整。单元的 `steps` 是 PN 的默认映射。
+
+### 5.3 Advisor v0
+
+`advisor.build_advice`：
+
+1. 有到期卡 → 回测优先；时间不够就按时间预算还一部分。
+2. 无到期卡 → 找下一个未烧开单元；若前置未烧开，先补前置。
+3. 按 T 选档：T=0 预消化；T<40 苏格拉底；40–79 有 PN 缺口 → 费曼；≥65 无缺口 → 极致对标；≥80 → 极致对标。
+4. 时间 ≤8 分钟 → 音频；时间不够当前档 → 降一档。
+5. 输出一个建议：`mode × 档位 × 目标 × 理由 × 成本 × PN 缺口 × 训练阶梯`。
+6. 采纳/否决通过 `/api/advice/feedback` 进入事件日志，供未来策略学习。
+
+约束：每场只给一个建议；必须给理由；可否决且记账。
+
+### 5.4 BoilRecord
+
+`socratic` 报告、`feynman`/`benchmark` 评分、`recall` 评分都会写入 `boil_records`：
+
+- `mode` / `level` / `result_json`
+- `heat_before` / `heat_after`
+- `pn_diff_json`
+- `advice_id` / `accepted`
+
+它是“六个模式共享同一份状态”的落点，也是未来做“单位时间烧开数” benchmark 的原始数据。
+
+## 6. 掌握度
 
 `mastery.add_evidence` 使用带置信度的指数移动平均：
 
@@ -188,7 +233,7 @@ score = old * (1 - alpha) + evidence * alpha
 
 “已烧开”需要四维都 ≥ 0.8 且总重复 ≥ 4。这个阈值是产品假设，不是科学定论；未来用学习效果基准校准。
 
-## 6. 规划器
+## 7. 规划器
 
 输入：单元顺序、前置关系、重要度、估算分钟数、每日分钟数、截止日期。
 
@@ -198,19 +243,21 @@ score = old * (1 - alpha) + evidence * alpha
 - 时间不够时，按重要度选高权重单元，并自动补前置；其余进入 `parked`（暂存）。
 - 计划是版本化的；重排从今天开始，不累积历史欠账。
 
-## 7. LLM 网关
+## 8. LLM 网关
 
 `llm.py` 是唯一模型出口：
 
 - 配置：`data/llm.json`（0600）；API Key 不回传。
 - 支持：普通、流式 SSE、JSON 模式。
-- 兼容：OpenAI / DeepSeek / DashScope / Moonshot / Ollama / 自定义。
+- 兼容：OpenAI / DeepSeek / DashScope / Moonshot / Dots / Ollama / 自定义。
+- 认证：默认 `Authorization: Bearer`；支持自定义头名与前缀（Dots 使用 `api-key`）。
+- 高级请求体：`extra_body` 可合并 `chat_template_kwargs` 等供应商参数，不覆盖核心字段。
 - 失败：HTTP / 网络 / 空正文 / 非法 JSON 都有显式错误；`llm_state.json` 记录最近错误。
 - JSON 修复：去除代码围栏、截取首尾括号、去尾逗号。
 - 无 Key：业务层走本地演示引擎，不在网关里伪造模型回答。
 - 真实模型失败：苏格拉底会显示“已切换到本地演示引擎”，报告会带 demo 标记；不会静默冒充 live。
 
-## 8. 前端
+## 9. 前端
 
 - 自研 SPA，ES modules，无构建链；`static/js/app.js` 负责 shell/router/搜索。
 - 页面模块：`views/dashboard|map|unit|socratic|feynman|review|library|insights|settings|onboarding.js`。
@@ -220,7 +267,7 @@ score = old * (1 - alpha) + evidence * alpha
 - 图表：手写 SVG（雷达/折线/柱状/热力/环形），无图表库。
 - 所有用户内容转义；链接协议白名单；不渲染任意 HTML。
 
-## 9. 错误与安全纪律
+## 10. 错误与安全纪律
 
 沿用三个原项目的三条纪律：
 
@@ -236,7 +283,7 @@ score = old * (1 - alpha) + evidence * alpha
 - API Key 0600；导出包不含 Key。
 - 单用户产品，不是多租户；不要直接公网多用户使用。
 
-## 10. 可扩展点
+## 11. 可扩展点
 
 - 新增学科：写一个 Subject Pack + 内容包 + 评测器。
 - 新增评分方式：在 `feynman.py` 的维度/权重或独立 Evaluator Pack 中扩展。
@@ -246,7 +293,7 @@ score = old * (1 - alpha) + evidence * alpha
 - 新增前端页面：`static/js/views/` + 路由 + nav。
 - 新增集成：MCP 网关（路线图）、Anki 导入、Obsidian/SiYuan 捕获。
 
-## 11. 测试策略
+## 12. 测试策略
 
 - 单元：FSRS、规划器、编译器、Pack 校验、JSON 修复。
 - 服务：onboarding、dashboard、map、unit、review、socratic、feynman、insights、重排、导出。
@@ -254,8 +301,11 @@ score = old * (1 - alpha) + evidence * alpha
 - LLM：本地假端点的普通/流式/JSON/失败可见。
 - live 服务：假端点返回符合 schema 的报告/评分/内容包。
 - 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。
+- Advisor：新单元、苏格拉底、费曼、对标、回测优先、低时间音频、前置边界、否决记账。
+- 火候：T 衰减、到期惩罚、PN 缺口、BoilRecord 升温/降温。
+- Pack 质量：原子率、四类探针覆盖、DAG 无环。
 
-## 12. 未来：影子模式与学习效果基准
+## 13. 未来：影子模式与学习效果基准
 
 当前算法是“合理的 v1”，不是“被证明最优”。下一阶段：
 

@@ -120,12 +120,12 @@ export async function render(el, ctx, params) {
         <div class="stack">
           <div class="card card-pad">
             <div class="section-head">
-              <div><div class="section-title">今日闭环</div><div class="section-sub">不是五个功能，是一条完整的学习链。每天先走完复习。</div></div>
+              <div><div class="section-title">学习闭环</div><div class="section-sub">完整链路参考；今天具体从哪一档开始，看右侧「火候建议」。</div></div>
               <span class="badge badge-ember">${today?.total_minutes || 0} 分钟</span>
             </div>
             <div class="loop-steps">
               ${stepHTML(1, "复习到期卡", due > 0 ? `${due} 张卡在等你，先还掉` : "今天没有到期复习", due > 0 ? "current" : "done", "#/review")}
-              ${stepHTML(2, "预消化", currentUnitId ? "读一句话本质、类比与边界" : "暂无待学单元", due === 0 && unit ? "current" : "", currentUnitId ? `#/unit/${currentUnitId}` : "#/map")}
+              ${stepHTML(2, "预消化", currentUnitId ? "读一句话本质、类比与边界" : "暂无待学单元", "", currentUnitId ? `#/unit/${currentUnitId}` : "#/map")}
               ${stepHTML(3, "苏格拉底", "一次一个问题，把理解走通", "", currentUnitId ? `#/unit/${currentUnitId}` : "#/map")}
               ${stepHTML(4, "费曼挑战", "讲给一个外行听，暴露真实缺口", "", currentUnitId ? `#/feynman/${currentUnitId}` : "#/map")}
               ${stepHTML(5, "留下证据", "复习卡与掌握雷达会记住今天", "", "#/insights")}
@@ -165,13 +165,18 @@ export async function render(el, ctx, params) {
         </div>
 
         <div class="stack">
-          <div class="card card-pad">
-            <div class="side-label">下一步建议</div>
-            <div style="display:flex;align-items:center;gap:12px;margin-top:12px">
-              <span class="stat-icon ${next.kind === "review" ? "teal" : next.kind === "feynman" ? "gold" : ""}">${icon(next.kind === "review" ? "review" : next.kind === "feynman" ? "teach" : "play", 18)}</span>
-              <div style="min-width:0"><div style="font-size:14px;font-weight:650">${escapeHTML(next.title || "开始今天的学习")}</div><div class="muted" style="font-size:11px;margin-top:2px">${escapeHTML(next.subtitle || "")}</div></div>
+          <div class="card card-pad advisor-card" id="advisor-card">
+            <div class="between">
+              <div><div class="side-label">火候建议</div><div class="section-sub">沿强度阶梯，只推进一步</div></div>
+              <span class="badge badge-ember" id="advisor-level">计算中</span>
             </div>
-            ${next.href ? `<a class="btn btn-primary btn-block mt-3" href="${next.href}">${escapeHTML(next.cta || "开始")} ${icon("arrow", 14)}</a>` : ""}
+            <div id="advisor-body" data-advice-ready="0">
+              <div class="advisor-head mt-3">
+                <div class="skeleton" style="width:76px;height:76px;border-radius:50%"></div>
+                <div style="flex:1"><div class="skeleton" style="height:16px;width:70%"></div><div class="skeleton mt-2" style="height:12px;width:90%"></div></div>
+              </div>
+              <div class="skeleton mt-3" style="height:88px"></div>
+            </div>
             <div class="divider"></div>
             <div class="between"><span class="muted small">复习到期</span><span class="badge ${due ? "badge-ember" : "badge-muted"}">${due} 张</span></div>
             <div class="between mt-2"><span class="muted small">新卡</span><span class="badge badge-muted">${newCount} 张</span></div>
@@ -200,4 +205,98 @@ export async function render(el, ctx, params) {
   el.querySelectorAll("[data-unit]").forEach(node => {
     node.addEventListener("click", () => ctx.navigate(`#/unit/${node.dataset.unit}`));
   });
+  const advisorState = { advice: null, minutes: Math.min(60, Math.max(10, goal.daily_minutes || 30)) };
+  el.querySelector("#advisor-card")?.addEventListener("click", (e) => {
+    const minuteBtn = e.target.closest("[data-advice-minutes]");
+    if (minuteBtn) { loadAdvice(ctx, Number(minuteBtn.dataset.adviceMinutes), advisorState); return; }
+    const refresh = e.target.closest("[data-advice-refresh]");
+    if (refresh) { loadAdvice(ctx, advisorState.minutes, advisorState); return; }
+    const dismiss = e.target.closest("[data-advice-dismiss]");
+    if (dismiss) {
+      const a = advisorState.advice;
+      if (!a) return;
+      adviceRequestSeq += 1;
+      const body = document.getElementById("advisor-body");
+      if (body) { body.dataset.dismissed = "1"; body.dataset.adviceReady = "1"; }
+      ctx.api.post("/api/advice/feedback", { action: "dismissed", advice: a }).catch(() => {});
+      if (body) body.innerHTML = `<div class="callout mt-3">已记录：这次先不用建议。你可以自由选择，或重新获取一条。<div class="row mt-2"><button class="btn btn-ghost btn-sm" data-advice-refresh>重新获取建议</button><a class="btn btn-ghost btn-sm" href="#/map">去知识地图</a></div></div>`;
+      advisorState.advice = null;
+      return;
+    }
+    const accept = e.target.closest("[data-advice-accept]");
+    if (accept) {
+      const a = advisorState.advice;
+      if (!a || accept.disabled) return;
+      accept.disabled = true;
+      ctx.api.post("/api/advice/feedback", { action: "accepted", advice: a }).catch(() => {});
+      if (a.mode === "socratic" && a.target?.id) return ctx.startSocratic(a.target.id, a.id);
+      if (a.mode === "audio" && a.target?.id) return ctx.navigate(`#/unit/${a.target.id}?action=audio`);
+      if (a.mode === "digest" && a.target?.id) return ctx.navigate(`#/unit/${a.target.id}?action=digest`);
+      return ctx.navigate(a.href || "#/dashboard");
+    }
+  });
+  loadAdvice(ctx, advisorState.minutes, advisorState);
+}
+
+
+let adviceRequestSeq = 0;
+const HEAT_COLORS = (v) => v >= 80 ? "var(--teal)" : v >= 40 ? "var(--gold)" : v > 0 ? "var(--ember)" : "var(--faint)";
+
+function advisorHTML(a, currentMinutes) {
+  const target = a.target ? `<div class="advisor-target">${escapeHTML(a.target.title)}</div>` : "";
+  const levelLabel = a.level === null || a.level === undefined
+    ? (a.mode_label || "开始")
+    : (a.mode === "benchmark" ? "非档位" : `第 ${a.level} 档 · ${a.mode_label}`);
+  const pn = (a.pn?.missing || []).length
+    ? `<div class="mt-2"><span class="side-label">还缺这一步</span><div class="advisor-pn mt-2">${a.pn.missing.slice(0, 4).map(x => `<span class="gap-chip">${escapeHTML(x)}</span>`).join("")}</div></div>`
+    : "";
+  const ladder = (a.ladder || []).map(x => `<div class="ladder-pill ${x.active ? "active" : ""} ${x.done ? "done" : ""}" title="${escapeHTML(x.feature)}">
+    <span>${x.level === "gate" ? "★" : x.level}</span>${escapeHTML(x.label)}
+  </div>`).join("");
+  return `
+    <div class="advisor-head mt-3">
+      <div class="advisor-heat">
+        ${ringSVG(a.heat || 0, { size: 76, stroke: 6, color: HEAT_COLORS(a.heat || 0) })}
+        <div><strong>${Math.round(a.heat || 0)}</strong><small>°C</small></div>
+      </div>
+      <div style="min-width:0;flex:1">
+        <div class="row wrap" style="gap:6px">
+          <span class="badge ${a.mode === "benchmark" ? "badge-violet" : "badge-ember"}">${escapeHTML(levelLabel)}</span>
+          <span class="badge badge-muted">约 ${a.cost_minutes || 0} 分钟</span>
+        </div>
+        <div class="advisor-title">${escapeHTML(a.title || "下一档")}</div>
+        ${target}
+      </div>
+    </div>
+    <div class="advisor-reason">${escapeHTML(a.reason || "")}</div>
+    ${pn}
+    <div class="advisor-ladder">${ladder}</div>
+    <div class="time-chips mt-2">
+      ${[...new Set([10, 30, 60, Number(currentMinutes)])].sort((a, b) => a - b).map(m => `<button class="time-chip ${m === currentMinutes ? "active" : ""}" data-advice-minutes="${m}">${m === Number(currentMinutes) && ![10,30,60].includes(m) ? "按计划 " : "我有 "}${m} 分钟</button>`).join("")}
+    </div>
+    <div class="advisor-actions">
+      <button class="btn btn-primary" data-advice-accept>${icon(a.mode === "recall" ? "review" : a.mode === "audio" ? "volume" : a.mode === "benchmark" ? "trophy" : "arrow", 15)} ${escapeHTML(a.cta || "开始")}</button>
+      <button class="btn btn-ghost btn-sm" data-advice-dismiss>今天先不用</button>
+    </div>`;
+}
+
+async function loadAdvice(ctx, minutes, state = null) {
+  const body = document.getElementById("advisor-body");
+  if (!body) return;
+  body.dataset.dismissed = "0";
+  const seq = ++adviceRequestSeq;
+  if (state) state.minutes = Number(minutes);
+  try {
+    const a = await ctx.api.get(`/api/advice?minutes=${encodeURIComponent(minutes)}`);
+    if (seq !== adviceRequestSeq || body.dataset.dismissed === "1" || !document.body.contains(body)) return;
+    body.innerHTML = advisorHTML(a, minutes);
+    body.dataset.adviceReady = "1";
+    if (state) state.advice = a;
+    const level = document.getElementById("advisor-level");
+    if (level) level.textContent = a.mode === "benchmark" ? "非档位" : a.mode === "done" ? "完成" : a.mode === "onboarding" ? "开始" : "推荐";
+  } catch (e) {
+    if (state) state.advice = null;
+    body.dataset.adviceReady = "1";
+    body.innerHTML = `<div class="callout mt-3">暂时给不出建议：${escapeHTML(e.message || "未知错误")}</div>`;
+  }
 }

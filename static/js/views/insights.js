@@ -24,6 +24,15 @@ export async function render(el, ctx, params) {
   const forecast = (data.forecast || []).map(f => ({ label: f.weekday, value: f.due }));
   const forecastTotal = forecast.reduce((a, b) => a + (Number(b.value) || 0), 0);
   const maxHeat = Math.max(60, ...(data.heatmap || []).map(d => d.minutes || 0));
+  const heatStates = Object.values(data.statuses || {}).map(s => Number(s.heat) || 0);
+  const heatBuckets = [
+    { label: "未点火", n: heatStates.filter(x => x <= 0).length, cls: "muted" },
+    { label: "温热", n: heatStates.filter(x => x > 0 && x < 40).length, cls: "ember" },
+    { label: "升温中", n: heatStates.filter(x => x >= 40 && x < 80).length, cls: "gold" },
+    { label: "接近沸腾", n: heatStates.filter(x => x >= 80 && x < 99.5).length, cls: "violet" },
+    { label: "已烧开", n: heatStates.filter(x => x >= 99.5).length, cls: "teal" },
+  ];
+  const records = data.records || [];
   const next = data.next_action || {};
   const sessions = data.recent_sessions || [];
   const gaps = data.gaps || [];
@@ -44,7 +53,7 @@ export async function render(el, ctx, params) {
     <div class="stats-grid">
       <div class="stat"><span class="stat-icon">${icon("brain", 18)}</span><div><div class="stat-value">${pct(m.average || 0)}</div><div class="stat-label">平均掌握度</div></div></div>
       <div class="stat"><span class="stat-icon teal">${icon("review", 18)}</span><div><div class="stat-value">${pct(stats.retention_30d || 0)}</div><div class="stat-label">30 天保留率</div></div></div>
-      <div class="stat"><span class="stat-icon gold">${icon("clock", 18)}</span><div><div class="stat-value">${formatMinutes(stats.week_minutes || 0)}</div><div class="stat-label">本周投入</div></div></div>
+      <div class="stat"><span class="stat-icon gold">${icon("flame", 18)}</span><div><div class="stat-value">${Math.round(data.average_heat || 0)}°</div><div class="stat-label">平均火候</div></div></div>
       <div class="stat"><span class="stat-icon violet">${icon("flame", 18)}</span><div><div class="stat-value">${stats.streak || 0} 天</div><div class="stat-label">连续学习</div></div></div>
     </div>
 
@@ -66,6 +75,10 @@ export async function render(el, ctx, params) {
         ${heatmapHTML(data.heatmap || [], maxHeat)}
       </div>
       <div class="card chart-card">
+        <div class="section-head"><div><div class="section-title">火候分布</div><div class="section-sub">每壶水现在在哪一段</div></div><span class="badge badge-teal">平均 ${Math.round(data.average_heat || 0)}°</span></div>
+        <div class="heat-dist">${heatBuckets.map(b => `<div class="heat-bucket"><div class="heat-bucket-top"><strong>${b.n}</strong><span>${b.label}</span></div><div class="heat-bucket-bar ${b.cls}" style="width:${heatStates.length ? Math.max(4, b.n / heatStates.length * 100) : 0}%"></div></div>`).join("")}</div>
+      </div>
+      <div class="card chart-card">
         <div class="section-head"><div><div class="section-title">未来 7 天到期</div><div class="section-sub">提前知道哪一天会忙</div></div><a class="btn btn-ghost btn-sm" href="#/review">去复习</a></div>
         ${forecastTotal ? barChartSVG(forecast, { width: 440, height: 180, color: "var(--ember)" }) : `<div class="empty" style="padding:26px"><div class="empty-icon">${icon("trophy", 20)}</div><p>未来 7 天没有到期卡。</p></div>`}
       </div>
@@ -73,6 +86,16 @@ export async function render(el, ctx, params) {
         <div class="section-head"><div><div class="section-title">还模糊的地方</div><div class="section-sub">来自苏格拉底报告的真实缺口</div></div><span class="badge badge-ember">${gaps.length}</span></div>
         <div class="gaps-list">
           ${gaps.length ? gaps.map(g => `<a class="gap-item" href="#/unit/${escapeAttr(g.unit_id)}"><span class="g">!</span><span>${escapeHTML(g.gap)}</span><span class="faint" style="margin-left:auto;white-space:nowrap">${relativeTime(g.at)}</span></a>`).join("") : `<div class="empty" style="padding:22px"><p>还没有记录到缺口。完成一次苏格拉底对话或费曼挑战。</p></div>`}
+        </div>
+      </div>
+      <div class="card chart-card wide">
+        <div class="section-head"><div><div class="section-title">火候记录</div><div class="section-sub">同一份 BoilRecord 串起所有模式；温度变化就是学习证据</div></div><span class="badge badge-muted">${records.length} 条</span></div>
+        <div class="session-list">
+          ${records.length ? records.map(r => {
+            const modes = {socratic:"苏格拉底",feynman:"费曼",benchmark:"极致对标",recall:"回测",digest:"预消化",audio:"听讲"};
+            const summary = r.result?.summary || (r.result?.overall != null ? `讲解分 ${Math.round(r.result.overall * 100)}` : r.result?.rating ? `评分 ${r.result.rating}/4` : "");
+            return `<div class="session-row"><span class="row" style="gap:7px"><span class="badge badge-muted">${modes[r.mode] || r.mode}</span><span class="faint tiny">${escapeHTML(r.unit_title || "")}</span></span><span class="row" style="gap:8px"><span class="session-score">${Math.round(r.heat_before)}° → ${Math.round(r.heat_after)}°</span><span class="faint tiny">${formatDate(r.created_at)}</span></span></div>`;
+          }).join("") : `<div class="empty" style="padding:22px"><p>还没有火候记录。完成一次对话、费曼或回测。</p></div>`}
         </div>
       </div>
       <div class="card chart-card wide">
@@ -90,10 +113,13 @@ export async function render(el, ctx, params) {
     </div>
 
     <div class="card card-pad mt-4">
-      <div class="section-head"><div><div class="section-title">下一步建议</div><div class="section-sub">系统根据到期、掌握度和最弱维度给出</div></div>${icon("compass", 20)}</div>
       <div class="between" style="gap:16px;flex-wrap:wrap">
-        <div style="min-width:0"><strong style="font-size:15px">${escapeHTML(next.title || "保持节奏")}</strong><p class="muted small mt-2">${escapeHTML(next.subtitle || "完成一个闭环，留下证据。")}</p></div>
-        ${next.href ? `<a class="btn btn-primary" href="${next.href}">${escapeHTML(next.cta || "开始")} ${icon("arrow", 14)}</a>` : ""}
+        <div style="min-width:0">
+          <div class="section-title">下一步</div>
+          <div class="section-sub">洞察页只负责看证据；具体该用哪一档，回到今日看火候建议。</div>
+          <p class="muted small mt-2">每场只给一个下一步，理由、时间预算和 PN 缺口都会写在那里。</p>
+        </div>
+        <a class="btn btn-primary" href="#/dashboard">回到今日 ${icon("arrow", 14)}</a>
       </div>
       <div class="divider"></div>
       <div class="grid grid-3">

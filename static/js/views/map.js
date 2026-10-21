@@ -141,7 +141,7 @@ function nodeSide(n) {
   const facets = n.facets || {};
   const labels = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
   return `<div class="card map-side-card">
-    <div class="between"><span class="badge ${n.status === "boiled" ? "badge-teal" : n.status === "rusting" ? "badge-ember" : n.status === "learning" ? "badge-gold" : "badge-muted"}">${st.label}</span><span class="faint tiny">${n.due_count ? `${n.due_count} 张待复习` : `${n.estimated_minutes || 45} 分钟`}</span></div>
+    <div class="between"><span class="badge ${n.status === "boiled" ? "badge-teal" : n.status === "rusting" ? "badge-ember" : n.status === "learning" ? "badge-gold" : "badge-muted"}">${st.label}</span><span class="faint tiny">T ${Math.round(n.heat || 0)}° · ${n.due_count ? `${n.due_count} 张待复习` : `${n.estimated_minutes || 45} 分钟`}</span></div>
     <div class="map-side-title mt-3">${escapeHTML(n.title)}</div>
     <div class="map-side-essence">${escapeHTML(n.essence || "")}</div>
     ${n.tags?.length ? `<div class="chip-row mt-3">${n.tags.slice(0, 4).map(t => `<span class="tag">${escapeHTML(t)}</span>`).join("")}</div>` : ""}

@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-29%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-38%20passing-38d6bd?style=flat-square)](#测试)
 
 ![Boil Dashboard](screenshots/dashboard.png)
 
@@ -62,6 +62,7 @@ python3 run.py
 
 打开 **设置 → 模型连接**，填入任意 OpenAI 兼容端点：
 
+- **Dots（小红书）**：`https://note3-prev-api.askdiandian.com/v1`，模型 `dots3-note-prev`，使用 `api-key` 请求头
 - OpenAI
 - DeepSeek
 - 通义千问（DashScope 兼容模式）
@@ -80,6 +81,22 @@ python3 run.py
 
 密钥只写入 `data/llm.json`（0600），不会返回给浏览器，也不会进入导出包。
 失败会在设置页与 `/api/health` 中显式显示，不会静默降级成“假模型回答”。
+
+#### Dots 接入
+
+在设置中选择 **Dots（小红书）** 预设，或在自定义端点中填写：
+
+```text
+Base URL:   https://note3-prev-api.askdiandian.com/v1
+Model:      dots3-note-prev
+认证头:     api-key
+认证前缀:   （留空）
+高级参数:   {"chat_template_kwargs":{"enable_thinking":false}}
+```
+
+Dots 默认开启深度思考；预设为了让苏格拉底对话保持低延迟，关闭了 thinking。
+需要更强的推理时，把高级参数改为 `{"chat_template_kwargs":{"enable_thinking":true}}` 并保存。
+Key 只保存在本机 `data/llm.json`，不会进入 Git、导出包或前端代码。
 
 ### Docker
 
@@ -103,6 +120,39 @@ python3 run.py
 
 ---
 
+## 火候：不只给工具，给“下一档”
+
+Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学习金字塔从听讲、阅读、讨论、演练到教别人，强度逐级上升；火候只负责告诉你：现在在哪一档、下一档该做什么、为什么。
+
+| 档位 | 模式 | 对应功能 | 负责什么 |
+|---|---|---|---|
+| 0 | 听讲 | 音频浸泡 | 建立熟悉感，不指望记住 |
+| 1 | 阅读/视听 | 预消化 | 粉末化、知识地图、类比、FAQ |
+| 2 | 讨论 | 苏格拉底对话 | AI 问、你答，把石头打散 |
+| 3 | 实际演练 | 高频回测 + FSRS | 同一档重复的时刻表 |
+| 4 | 教别人 | 费曼对话 | 你讲、AI 装不懂 |
+| — | 非档位 | 极致对标 | 完整复现标准步骤，过了才算烧开 |
+
+### T（火候）与 PN（必要步骤）
+
+- **T**：由四维掌握度、距上次证据的天数、到期卡数量压缩成 0–100 的温度。它不是科学测量值，是产品状态量；阈值用于推荐，而不是宣称“精确预测”。
+- **PN**：每个单元的标准步骤就是必要步骤；最近一次苏格拉底/费曼报告里的缺口会显示为“还缺这一步”。T 升高但 PN 仍有缺口时，推荐费曼；T 很高且缺口补齐时，推荐极致对标。
+- **BoilRecord**：每次苏格拉底、费曼、回测都记录 `heat_before → heat_after`、模式、档位、结果与 PN 差异；这些记录是未来策略学习和效果评估的原料。
+
+### Advisor v0
+
+输入：当前 T、降温/到期列表、PN 缺口、能力边界、本次可用时间。
+输出：**一个**下一步建议 + 人话理由 + 预计成本，并支持“今天先不用”（否决会记账）。
+
+规则示例：
+
+- 有到期卡 → 先回测；时间不足就只还一部分，不硬塞新内容。
+- 新单元 T=0 → 预消化；时间 ≤8 分钟 → 音频建立熟悉感。
+- T<40 → 苏格拉底；T 40–79 且 PN 有缺口 → 费曼；T≥65 且无缺口 → 极致对标。
+- 前置未烧开 → 先补前置，不硬上目标单元。
+
+推荐理由、时间预算、PN 缺口和“今天先不用”都在 [今日仪表盘](screenshots/dashboard.png) 的火候建议卡里。
+
 ## 页面
 
 | 今日 | 知识地图 |
@@ -121,6 +171,10 @@ python3 run.py
 |---|---|
 | ![Library](screenshots/library.png) | ![Onboarding](screenshots/onboarding.png) |
 
+| 第 0 档音频 | 极致对标 |
+|---|---|
+| ![Audio](screenshots/audio.png) | ![Benchmark](screenshots/benchmark.png) |
+
 ---
 
 ## 功能
@@ -132,6 +186,10 @@ python3 run.py
 - **费曼挑战**：三种讲解对象；计时；六维评分；缺口、术语、参考讲解、追问。
 - **间隔重复**：FSRS-5；四档评分；每个评分显示下次间隔；复习队列；未来 7 天预测。
 - **学习证据**：回忆/解释/应用/迁移四维雷达；30 天保留率；热力图；苏格拉底缺口聚合。
+- **火候状态**：每个单元的 T 温度、PN 缺口、BoilRecord 历史；降温与到期会自动影响推荐。
+- **Advisor v0**：沿强度阶梯只推进一步；理由可解释；支持时间预算、接受与否决记账。
+- **强度模式**：第 0 档音频浸泡、第 1 档预消化、第 2 档苏格拉底、第 3 档回测、第 4 档费曼、非档位极致对标。
+- **Pack 质量门禁**：原子率、四类探针覆盖率、DAG 无环，在内容库直接可见。
 - **内容包（Learning Pack）**：安装/版本/幂等；更新内容不重置学习进度；JSON 导入/导出。
 - **本地优先**：SQLite；数据导出；API Key 本地存储；无强制账号。
 - **模型无关**：OpenAI 兼容端点；普通 + 流式 + JSON 模式；失败可见。
@@ -267,7 +325,7 @@ curl -X POST http://127.0.0.1:7860/api/onboarding \
 ## 测试
 
 ```bash
-# 29 项单元 / 集成 / HTTP / SSE / LLM 网关测试（stdlib unittest）
+# 38 项单元 / 集成 / HTTP / SSE / LLM 网关测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -279,8 +337,11 @@ python3 -m unittest discover -s tests -v
 - Pack 重复安装不重置 SRS
 - 苏格拉底流式对话、六轮收束、证据报告
 - 费曼评分、复习、洞察、重排、导出
+- 火候 T 衰减、到期惩罚、PN 缺口
+- Advisor v0：新单元/苏格拉底/费曼/对标/回测优先/低时间音频/前置边界
+- BoilRecord 与 Pack 质量门禁
 - HTTP REST + SSE + 静态资源 + 错误码
-- 真实模型网关（假端点）：普通、流式、JSON 模式、失败可见
+- 真实模型网关（假端点）：普通、流式、JSON 模式、自定义认证头、失败可见
 - live 服务路径：苏格拉底、费曼、编译器
 
 浏览器验收（需要 Chromium，且服务已在 7861 运行）：
@@ -304,6 +365,10 @@ python3 tools/browser_check.py
 - 费曼（六维 + 缺口）
 - FSRS-5 复习
 - 四维掌握度与洞察
+- 火候 T / PN 缺口 / BoilRecord
+- Advisor v0（规则版 + 时间预算 + 否决记账）
+- 第 0 档音频、第 4 档费曼、非档位极致对标
+- Pack 质量门禁（原子率/探针覆盖/DAG）
 - Pack 编译/导入/幂等
 - 模型网关（普通/流式/JSON/失败可见）
 - 本地优先 + 导出 + 演示模式
@@ -328,6 +393,8 @@ python3 tools/browser_check.py
 - 演示模式的评分是**关键词/结构启发式**，不是语义理解；重要内容请配置真实模型并核对材料。
 - 内置数学包只演示了 examgen 章节 5 的 6 条通法，不是完整课程或题库。
 - 苏格拉底/费曼的提示词与评分器是 v1，仍需要更大规模的效果验证。
+- T 与 Advisor 是规则版产品启发式，不是学习科学定论；需要在真实数据上校准阈值与成本模型。
+- BoilRecord 已落库，但尚未做策略学习；“建议采纳/否决”数据需要积累后再训练。
 - 没有内置学习效果随机对照实验；路线图中有“学习效果基准”。
 - 音频浸泡、移动原生 App、Pack 市场尚未实现。
 - 内容版权：数学包来自作者生成的模板结构；原始教辅 OCR（`date1/`）未包含。再分发前请自行确认来源权利。

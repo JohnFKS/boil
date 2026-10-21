@@ -163,6 +163,7 @@ const ICONS = {
   eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.6"/>',
   eyeOff: '<path d="M3 3l18 18"/><path d="M10.6 6.2A10.8 10.8 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-3 3.5M6.2 6.8A17.6 17.6 0 0 0 2 12s3.5 6 10 6c1.2 0 2.3-.2 3.3-.6"/>',
   dot: '<circle cx="12" cy="12" r="3"/>',
+  volume: '<path d="M4 9v6h4l5 4V5L8 9H4Z"/><path d="M16 8a5 5 0 0 1 0 8M19 5a9 9 0 0 1 0 14"/>',
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   trash: '<path d="M4 7h16M10 3h4M7 7l1 14h8l1-14"/><path d="M10 11v6M14 11v6"/>',
   edit: '<path d="M4 20h4L20 8l-4-4L4 16v4Z"/><path d="M14 6l4 4"/>',

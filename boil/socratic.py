@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any, Generator
 
-from . import llm
+from . import heat, llm
 from .db import Database, json_dumps, json_loads
 from .events import emit, touch_study_day
 from .mastery import FACETS, add_evidence
@@ -124,14 +124,15 @@ def _first_question(unit: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def start_session(db: Database, user_id: str, goal_id: str, unit_id: str) -> dict[str, Any]:
+def start_session(db: Database, user_id: str, goal_id: str, unit_id: str,
+                  advice_id: str | None = None) -> dict[str, Any]:
     unit = _get_unit(db, unit_id)
     if not unit or unit.get("goal_id") != goal_id:
         raise ValueError("单元不存在或不属于当前目标")
     session_id = new_id("ss")
     first, source = _first_question(unit)
     meta = {"stage": "diagnose", "hints": 0, "report": None, "evidence_added": False,
-            "engine": source, "unit_title": unit["title"]}
+            "engine": source, "unit_title": unit["title"], "advice_id": advice_id}
     db.insert("sessions", {
         "id": session_id,
         "user_id": user_id,
@@ -374,11 +375,18 @@ def generate_report(db: Database, user_id: str, session_id: str) -> dict[str, An
         (now_iso(), json_dumps(meta), session_id),
     )
     if not meta.get("evidence_added"):
+        heat_before = heat.heat_for_unit(db, user_id, unit["id"])
         conf = float(report.get("confidence") or 0.5)
         for facet in FACETS:
             score = float((report.get("facets") or {}).get(facet) or 0.0)
             add_evidence(db, user_id, unit["id"], facet, score, confidence=conf,
                          weight=0.75, source="socratic", session_id=session_id)
+        heat_after = heat.heat_for_unit(db, user_id, unit["id"])
+        heat.record_boil(db, user_id, unit["id"], "socratic", 2, {
+            "session_id": session_id, "summary": report.get("summary"),
+            "facets": report.get("facets"), "engine": report.get("engine"),
+        }, heat_before, heat_after, report.get("gaps") or [],
+            advice_id=meta.get("advice_id"), accepted=1 if meta.get("advice_id") else 0)
         meta["evidence_added"] = True
         db.execute("UPDATE sessions SET meta_json=? WHERE id=?", (json_dumps(meta), session_id))
         emit(db, "socratic.completed", {

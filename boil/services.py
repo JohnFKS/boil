@@ -5,13 +5,14 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import config, llm, mastery, planner, socratic
+from . import config, heat, llm, mastery, planner, socratic
 from .compiler import compile_material
 from .db import Database, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
 from .packs import (PackError, all_available_packs, get_goal_relations,
                     get_goal_units, install_pack, normalize_pack, pack_progress,
-                    pack_summary, save_user_pack, unit_from_row, validate_pack)
+                    pack_quality, pack_summary, save_user_pack, unit_from_row,
+                    validate_pack)
 from .srs.fsrs import card_from_row, interval_label, scheduler
 from .utils import (clamp, coverage, days_between, new_id, now, now_iso,
                     parse_iso, round4, safe_div, slugify, today_str, truncate)
@@ -200,8 +201,10 @@ def _unit_status_map(db: Database, user_id: str, units: list[dict[str, Any]]) ->
     for u in units:
         m = bulk.get(u["id"], {})
         status = mastery.status_for(m, due.get(u["id"], 0), mastery.days_since((m.get("facets") or {}).get("recall", {}).get("last_evidence_at")))
+        h = heat.compute_heat(m, due.get(u["id"], 0))
         out[u["id"]] = {**m, "status": status, "due_count": due.get(u["id"], 0),
-                        "status_label": STATUS_LABELS.get(status, status)}
+                        "status_label": STATUS_LABELS.get(status, status),
+                        "heat": h, "heat_label": heat.heat_label(h)}
     return out
 
 
@@ -248,6 +251,7 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
             "new": sum(1 for s in statuses.values() if s["status"] == "new"),
             "rusting": sum(1 for s in statuses.values() if s["status"] == "rusting"),
             "due": due_total,
+            "average_heat": round4(sum(s["heat"] for s in statuses.values()) / len(statuses)) if statuses else 0.0,
         },
         "next_units": next_units,
         "next_action": next_action,
@@ -322,6 +326,7 @@ def _unit_card(u: dict[str, Any], st: dict[str, Any] | None = None) -> dict[str,
         "status": st.get("status", "new"),
         "status_label": st.get("status_label", STATUS_LABELS.get(st.get("status", "new"), "未开始")),
         "mastery": st.get("average", 0.0), "due_count": st.get("due_count", 0),
+        "heat": st.get("heat", 0.0), "heat_label": st.get("heat_label", "未点火"),
     }
 
 
@@ -449,7 +454,12 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
         "SELECT * FROM attempts WHERE unit_id=? AND user_id=? ORDER BY created_at DESC LIMIT 8",
         (unit_id, user_id),
     )
+    h = heat.heat_for_unit(db, user_id, unit_id)
+    pn = heat.pn_state(db, user_id, unit)
+    records = heat.history(db, user_id, unit_id=unit_id, limit=6)
     return {"unit": unit, "mastery": m, "status": st[unit_id],
+            "heat": h, "heat_label": heat.heat_label(h), "pn": pn,
+            "records": records,
             "probes": probes, "cards": cards, "sessions": sessions,
             "relations": relations, "attempts": attempts,
             "source": unit.get("source_ref") or {}}
@@ -518,6 +528,7 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     if not card:
         raise ValueError("卡片不存在")
     rating = int(clamp(int(rating), 1, 4))
+    before_heat = heat.heat_for_unit(db, user_id, card["unit_id"])
     before = dict(card)
     result = scheduler.schedule(card_from_row(card), rating)
     ts = now_iso()
@@ -547,6 +558,10 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     score = {1: 0.1, 2: 0.45, 3: 0.8, 4: 0.95}[rating]
     add = mastery.add_evidence(db, user_id, card["unit_id"], "recall", score,
                                confidence=0.8, weight=0.9, source="review")
+    after_heat = heat.heat_for_unit(db, user_id, card["unit_id"])
+    heat.record_boil(db, user_id, card["unit_id"], "recall", 3,
+                     {"rating": rating, "interval_days": round4(result.interval_days)},
+                     before_heat, after_heat, [])
     touch_study_day(db, user_id, minutes=max(1, int(elapsed_ms / 60000)) if elapsed_ms else 1,
                     sessions=0, reviews=1)
     emit(db, "review.rated", {"card_id": card_id, "unit_id": card["unit_id"],
@@ -609,9 +624,9 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
         forecast.append({"date": d.isoformat(), "weekday": "一二三四五六日"[d.weekday()], "due": int(n)})
 
     # 56 天热力图
-    heat = db.query("SELECT day, minutes, sessions, reviews FROM study_days "
-                    "WHERE user_id=? ORDER BY day DESC LIMIT 56", (user_id,))
-    heat_by_day = {r["day"]: r for r in heat}
+    heat_rows = db.query("SELECT day, minutes, sessions, reviews FROM study_days "
+                         "WHERE user_id=? ORDER BY day DESC LIMIT 56", (user_id,))
+    heat_by_day = {r["day"]: r for r in heat_rows}
     heatmap = []
     for i in range(55, -1, -1):
         d = today - timedelta(days=i)
@@ -654,6 +669,8 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
             "rusting": sum(1 for s in statuses.values() if s["status"] == "rusting"),
         },
         "plan_progress": progress,
+        "average_heat": round4(sum(s["heat"] for s in statuses.values()) / len(statuses)) if statuses else 0.0,
+        "records": heat.history(db, user_id, limit=10),
         "retention": retention,
         "forecast": forecast,
         "heatmap": heatmap,
@@ -686,7 +703,9 @@ def pack_detail(pack_id: str) -> dict[str, Any]:
     pack = next((p for p in all_available_packs() if p.get("id") == pack_id), None)
     if not pack:
         raise ValueError("找不到内容包")
-    return normalize_pack(pack)
+    normalized = normalize_pack(pack)
+    normalized["quality"] = pack_quality(normalized)
+    return normalized
 
 
 def import_pack(payload: dict[str, Any]) -> dict[str, Any]:

@@ -32,6 +32,7 @@ function promptHTML(mode) {
     <div class="prompt-label">FEYNMAN MODE · ${escapeHTML(m.label)}</div>
     <div class="prompt-text">${escapeHTML(m.prompt)}</div>
     <div class="prompt-hint">${escapeHTML(m.hint)}</div>
+    ${mode === "examiner" ? `<div class="callout violet mt-3" style="border-color:rgba(167,139,250,.22);background:var(--violet-soft)"><strong>极致对标：</strong>完整复现标准步骤，不能跳步。AI 会像阅卷人一样按 rubric 找缺口；过了才算烧开。</div>` : ""}
   </div>`;
 }
 
@@ -91,7 +92,8 @@ export async function render(el, ctx, params) {
   const unit = data.unit;
   const status = data.status;
   ctx.setPageTitle("FEYNMAN CHALLENGE", "费曼挑战");
-  let mode = "child";
+  const requestedMode = params.query?.get("mode");
+  let mode = MODES[requestedMode] ? requestedMode : "child";
   let result = null;
   let started = null;
   let elapsed = 0;

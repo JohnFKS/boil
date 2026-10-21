@@ -180,7 +180,18 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 - 不要重用已被删除的 unit ID；否则历史证据会错位。
 - `schema_version` 变化时需要迁移器；当前只有 v1。
 
-## 6. 内容质量门禁（建议）
+## 6. 自动质量指标（`pack_quality`）
+
+内容库会为每个 Pack 计算并在 UI 展示：
+
+- **原子率**：有本质、≥2 个探针、≥3 个关键点，并且有步骤或边界的单元比例。
+- **探针覆盖率**：recall / explain / apply / boundary 四类齐全的单元比例。
+- **DAG 无环**：prerequisite 关系无环。
+- **综合分**：0.5 × 原子率 + 0.4 × 探针覆盖 + 0.1 × DAG。
+
+这是一个工程门禁，不是学习效果证明；高 stakes 内容仍需人工复核与来源核对。
+
+## 7. 内容质量门禁（建议）
 
 对高 stakes 内容，发布前至少：
 
@@ -194,7 +205,7 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 examgen 的三道质检（数学等价 / 考点覆盖 / 边界一致）是 v1 数学包的来源；
 未来的 Evaluator Pack 应把这类质检变成可执行门禁。
 
-## 7. 从 examgen 导入
+## 8. 从 examgen 导入
 
 ```bash
 python3 tools/import_examgen.py \
@@ -214,7 +225,7 @@ python3 tools/import_examgen.py \
 
 原始 OCR 教辅 `date1/` **不会**被导入或分发。
 
-## 8. 自定义 Skill Pack（路线图）
+## 9. 自定义 Skill Pack（路线图）
 
 当前 v1 的提示词在 `prompts/`。未来 Skill Pack 将包含：
 

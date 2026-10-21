@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import config, feynman, llm, mastery, services, socratic
+from . import advisor, config, feynman, llm, mastery, services, socratic
 from .compiler import compile_material
 from .db import Database, json_loads
 from .events import recent
@@ -50,6 +50,8 @@ class App:
             ("GET", re.compile(r"^/api/goals$"), self.goals),
             ("POST", re.compile(r"^/api/onboarding$"), self.onboarding),
             ("GET", re.compile(r"^/api/dashboard$"), self.dashboard),
+            ("GET", re.compile(r"^/api/advice$"), self.advice),
+            ("POST", re.compile(r"^/api/advice/feedback$"), self.advice_feedback),
             ("POST", re.compile(r"^/api/plan/rebuild$"), self.plan_rebuild),
             ("GET", re.compile(r"^/api/map$"), self.map),
             ("GET", re.compile(r"^/api/units/([^/]+)$"), self.unit),
@@ -106,6 +108,22 @@ class App:
         return services.dashboard(self.db, config.DEFAULT_USER,
                                   _q(query, "goal_id") or None)
 
+    def advice(self, req, match, query, body):
+        minutes_raw = _q(query, "minutes")
+        minutes = None
+        if minutes_raw:
+            try:
+                minutes = int(minutes_raw)
+            except ValueError:
+                minutes = None
+        return advisor.build_advice(self.db, config.DEFAULT_USER,
+                                    _q(query, "goal_id") or None, minutes)
+
+    def advice_feedback(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return advisor.feedback(self.db, config.DEFAULT_USER, body)
+
     def plan_rebuild(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
@@ -150,7 +168,8 @@ class App:
             if not row:
                 raise ApiError(404, "单元不存在", "not_found")
             goal_id = row["goal_id"]
-        return socratic.start_session(self.db, config.DEFAULT_USER, goal_id, unit_id)
+        return socratic.start_session(self.db, config.DEFAULT_USER, goal_id, unit_id,
+                                      advice_id=body.get("advice_id"))
 
     def socratic_stream(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -200,7 +219,8 @@ class App:
             raise ApiError(404, "单元不存在", "not_found")
         unit = unit_from_row(row)
         try:
-            result = feynman.evaluate(self.db, config.DEFAULT_USER, unit, text, mode)
+            result = feynman.evaluate(self.db, config.DEFAULT_USER, unit, text, mode,
+                                      advice_id=body.get("advice_id"))
         except ValueError as exc:
             raise ApiError(400, str(exc), "bad_request") from exc
         return result

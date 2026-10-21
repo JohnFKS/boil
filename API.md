@@ -162,7 +162,8 @@ Base URL：`http://127.0.0.1:7860`
 返回：
 
 - `unit`（含 steps/boundaries/misconceptions/faq/key_points/source_ref）
-- `mastery`、`status`、`probes`、`cards`、`sessions`、`relations`、`attempts`
+- `mastery`、`status`、`heat`、`heat_label`、`pn`、`records`
+- `probes`、`cards`、`sessions`、`relations`、`attempts`
 
 ---
 
@@ -425,7 +426,47 @@ data: {}
 
 ---
 
-## 8. 洞察
+## 8. 火候建议
+
+### `GET /api/advice?minutes=30&goal_id=...`
+
+返回**一个**建议：
+
+```json
+{
+  "id": "adv_...",
+  "mode": "socratic",
+  "level": 2,
+  "mode_label": "讨论",
+  "feature": "苏格拉底对话",
+  "cta": "开始对话",
+  "title": "第 2 档 · 苏格拉底对话",
+  "reason": "「学习的本质是记忆」现在 T=28°。上次报告还缺「输出比输入更强」。……",
+  "cost_minutes": 12,
+  "minutes": 30,
+  "target": {"id": "u_...", "title": "学习的本质是记忆", "heat": 28, "heat_label": "温热"},
+  "heat": 28,
+  "pn": {"total": 4, "missing": ["输出比输入更强"], "source": "socratic", "complete": false},
+  "ladder": [
+    {"level": 2, "mode": "socratic", "label": "讨论", "feature": "苏格拉底对话", "active": true},
+    {"level": "gate", "mode": "benchmark", "label": "非档位", "feature": "极致对标", "active": false}
+  ],
+  "href": "#/unit/u_..."
+}
+```
+
+`mode` 可为 `audio` / `digest` / `socratic` / `recall` / `feynman` / `benchmark` / `done` / `onboarding`。
+`pn.missing` 是最近一次苏格拉底/费曼报告里明确说缺失的步骤。
+
+### `POST /api/advice/feedback`
+
+```json
+{"action": "accepted", "advice": {...}}
+```
+
+`action`：`accepted` 或 `dismissed`。会写 `advice.accepted` / `advice.dismissed` 事件，供未来策略学习。
+
+## 9. 洞察
 
 ### `GET /api/insights?goal_id=...`
 
@@ -434,6 +475,8 @@ data: {}
 - `mastery`（四维）
 - `counts`
 - `plan_progress`
+- `average_heat`（平均火候）
+- `records`（最近 BoilRecord）
 - `retention`（近 30 天，按天聚合）
 - `forecast`（未来 7 天到期，不含新卡）
 - `heatmap`（56 天）
@@ -444,7 +487,7 @@ data: {}
 
 ---
 
-## 9. 设置与模型
+## 10. 设置与模型
 
 ### `GET /api/settings/llm`
 
@@ -471,6 +514,9 @@ data: {}
   "api_key": "sk-...",
   "model": "deepseek-chat",
   "deep_model": "deepseek-reasoner",
+  "auth_header": "Authorization",
+  "auth_prefix": "Bearer ",
+  "extra_body": {},
   "temperature": 0.5,
   "max_tokens": null,
   "timeout": 120
@@ -479,6 +525,10 @@ data: {}
 
 - `api_key` 省略：保持现有 Key。
 - `api_key: ""`：清除 Key，回到演示模式。
+- `auth_header` 默认 `Authorization`；`auth_prefix` 默认 `Bearer `。
+  Dots 使用 `auth_header: "api-key"`、`auth_prefix: ""`。
+- `extra_body` 会合并进请求体（不会覆盖 `model/messages/stream/max_tokens/temperature/response_format` 等核心字段）。
+  Dots 可用 `{"chat_template_kwargs":{"enable_thinking":false}}` 控制深度思考。
 - 响应为新的 public config；Key 永远不会回传。
 
 ### `POST /api/settings/llm/test`
@@ -493,7 +543,7 @@ data: {}
 
 ---
 
-## 10. 搜索、事件、导出
+## 11. 搜索、事件、导出
 
 ### `GET /api/search?q=学习`
 
@@ -520,7 +570,7 @@ data: {}
 
 ---
 
-## 11. 错误码
+## 12. 错误码
 
 | HTTP | code | 说明 |
 |---|---|---|
@@ -534,7 +584,7 @@ data: {}
 
 ---
 
-## 12. curl 示例
+## 13. curl 示例
 
 ```bash
 # 健康

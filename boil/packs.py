@@ -59,6 +59,63 @@ def all_available_packs() -> list[dict[str, Any]]:
     return out
 
 
+def pack_quality(pack: dict[str, Any]) -> dict[str, Any]:
+    units = [u for u in (pack.get("units") or []) if isinstance(u, dict)]
+    total = len(units)
+    if not total:
+        return {"atomic_rate": 0.0, "probe_coverage": 0.0, "dag_ok": False,
+                "score": 0.0, "atomic_units": 0, "total_units": 0,
+                "issues": ["没有单元"]}
+    atomic = 0
+    covered = 0
+    issues = []
+    required = {"recall", "explain", "apply", "boundary"}
+    for u in units:
+        probes = u.get("probes") or []
+        kinds = {p.get("kind") for p in probes if isinstance(p, dict)}
+        key_points = u.get("key_points") or derive_key_points(u)
+        is_atomic = bool(u.get("essence")) and len(probes) >= 2 and len(key_points) >= 3 \
+            and (len(u.get("steps") or []) >= 2 or len(u.get("boundaries") or []) >= 1)
+        if is_atomic:
+            atomic += 1
+        else:
+            issues.append(f"{u.get('title', u.get('id', '?'))}: 缺少本质/探针/关键点")
+        if required.issubset(kinds):
+            covered += 1
+    # DAG 无环
+    ids = {u.get("id") for u in units}
+    edges = {u.get("id"): [] for u in units}
+    indeg = {u.get("id"): 0 for u in units}
+    for u in units:
+        for rel in u.get("relations") or []:
+            target = rel.get("to") if isinstance(rel, dict) else None
+            if target in ids and u.get("id") != target:
+                edges[u.get("id")].append(target)
+                indeg[target] += 1
+    ready = [uid for uid, n in indeg.items() if n == 0]
+    seen = 0
+    while ready:
+        uid = ready.pop()
+        seen += 1
+        for t in edges.get(uid, []):
+            indeg[t] -= 1
+            if indeg[t] == 0:
+                ready.append(t)
+    dag_ok = seen == len(ids)
+    atomic_rate = atomic / total
+    coverage = covered / total
+    score = round((atomic_rate * 0.5 + coverage * 0.4 + (1.0 if dag_ok else 0.0) * 0.1), 4)
+    return {
+        "atomic_rate": round(atomic_rate, 4),
+        "probe_coverage": round(coverage, 4),
+        "dag_ok": dag_ok,
+        "score": score,
+        "atomic_units": atomic,
+        "total_units": total,
+        "issues": issues[:6],
+    }
+
+
 def pack_summary(pack: dict[str, Any], installed: bool = False,
                  goal_id: str | None = None) -> dict[str, Any]:
     units = pack.get("units") or []
@@ -78,6 +135,7 @@ def pack_summary(pack: dict[str, Any], installed: bool = False,
         "installed": installed,
         "goal_id": goal_id,
         "cover": pack.get("cover", "ember"),
+        "quality": pack_quality(pack),
     }
 
 

@@ -98,6 +98,8 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(len(m["nodes"]), 8)
         u = self.call("GET", f"/api/units/{type(self).unit_id}")["data"]
         self.assertTrue(u["unit"]["essence"])
+        self.assertIn("heat", u)
+        self.assertIn("pn", u)
         self.assertEqual(self.call("GET", "/api/me")["data"]["user"]["name"], "API 测试者")
         ins = self.call("GET", "/api/insights")["data"]
         self.assertEqual(len(ins["forecast"]), 7)
@@ -182,6 +184,23 @@ class ApiTest(unittest.TestCase):
             payload = json.loads(exc.read())
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["error"]["code"], "not_configured")
+
+    def test_08_advice_heat_quality(self):
+        adv = self.call("GET", "/api/advice?minutes=30")["data"]
+        self.assertIn(adv["mode"], ("audio", "digest", "socratic", "recall", "feynman", "benchmark", "done"))
+        self.assertIn("reason", adv)
+        self.assertTrue(adv["ladder"])
+        fb = self.call("POST", "/api/advice/feedback", {"action": "dismissed", "advice": adv})
+        self.assertTrue(fb["ok"])
+        ins = self.call("GET", "/api/insights")["data"]
+        self.assertIn("average_heat", ins)
+        self.assertIn("records", ins)
+        packs = self.call("GET", "/api/packs")["data"]["packs"]
+        self.assertTrue(all("quality" in p for p in packs))
+        self.assertGreaterEqual(packs[0]["quality"]["atomic_rate"], 0.99)
+        unit = self.call("GET", f"/api/units/{type(self).unit_id}")["data"]
+        self.assertIn("heat_label", unit)
+        self.assertIn("missing", unit["pn"])
 
     def test_07_unknown_route(self):
         try:
