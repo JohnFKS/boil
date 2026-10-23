@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -293,6 +294,28 @@ class CacheTest(unittest.TestCase):
         msgs = [{"role": "user", "content": "同一个模型名"}]
         self.assertNotEqual(llm.cache_key("fake-model", msgs, 0.2, None, "http://a/v1"),
                             llm.cache_key("fake-model", msgs, 0.2, None, "http://b/v1"))
+
+    def test_cache_is_capped_and_keeps_the_newest(self):
+        """缓存只增不减会一直吃盘：超过上限要淘汰最旧的，但不许把刚写的也扔了。"""
+        old = llm.CACHE_MAX_ENTRIES
+        llm.CACHE_MAX_ENTRIES = 3
+        msgs_last = [{"role": "user", "content": "材料 5"}]
+        try:
+            for i in range(6):
+                self._serve_one('{"n": %d}' % i)
+                llm.chat_json([{"role": "user", "content": f"材料 {i}"}], temperature=0.2)
+                time.sleep(0.02)
+        finally:
+            llm.CACHE_MAX_ENTRIES = old
+        self.assertLessEqual(llm.cache_size(), 3, "上限没生效")
+        self.assertGreaterEqual(llm.cache_stats()["writes"], 6)
+        key = llm.cache_key("fake-model", msgs_last, 0.2, None,
+                            str(llm.get_config().get("base_url") or ""))
+        self.assertTrue((llm.cache_dir() / f"{key}.json").exists(), "刚写的条目被淘汰了")
+        before = len(FakeHandler.requests)
+        self.assertEqual(llm.chat_json(msgs_last, temperature=0.2), {"n": 5},
+                         "最近一次的结果应当还能命中")
+        self.assertEqual(len(FakeHandler.requests), before)
 
     def test_cache_key_separates_prompt_model_params(self):
         self._serve_one('{"n": 1}')

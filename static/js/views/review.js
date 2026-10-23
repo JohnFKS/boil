@@ -264,7 +264,10 @@ export async function render(el, ctx, params) {
         <div class="flashcard-divider"></div>
         <div class="recall-block mt-2">
           <textarea class="textarea" id="recall-input" rows="3" placeholder="先不看答案，用自己的话回忆一下——写不出来正好说明这里还没懂。"></textarea>
-          <button class="skip-recall" type="button" id="skip-recall">想跳过，直接看答案</button>
+          <div class="row between mt-1" style="gap:8px">
+            <span class="faint tiny">评分后这份回忆会存进单元页的「回忆记录」，方便对照前后的说法</span>
+            <button class="skip-recall" type="button" id="skip-recall">想跳过，直接看答案</button>
+          </div>
         </div>
         <button class="btn btn-primary btn-lg mt-3" id="reveal-btn">${icon("eye", 16)} 显示答案</button>
         <div class="faint tiny mt-2">空格键也可以</div>

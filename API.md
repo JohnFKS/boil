@@ -206,7 +206,7 @@ Base URL：`http://127.0.0.1:7860`
 - `unit`（含 steps/boundaries/misconceptions/faq/key_points/angle/source_ref）
 - `mastery`、`status`、`heat`、`heat_label`、`pn`、`records`
 - `notes`（速记/笔记）、`related`（语义相关单元）
-- `probes`、`cards`、`sessions`、`relations`、`attempts`
+- `probes`、`cards`、`sessions`、`relations`、`attempts`、`recalls`（复习回忆原文）
 
 ### 灵感笔记（划词保存）
 
@@ -315,11 +315,12 @@ GET /api/search?q=   单元 + 内容包
 ```
 GET  /api/units/duplicates?goal_id=   当前目标里疑似重复的存活单元对
 POST /api/units/{unit_id}/merge        {"into": "另一单元id", "reason": "可选", "override": false, "confirmed": false}
+POST /api/units/{unit_id}/unmerge      撤销这个单元被吸收的那一次合并
 ```
 
 候选由**两路信号**提出：字面近乎逐字（`lexical ≥ 0.82`），或云端语义进入候选带（`semantic ≥ 0.74`）。语义分只看**标题 + 一句话本质**（`quality.dup_text`）：把步骤/边界也算进去时（`embeddings.unit_text`），同一主题的单元全部挤在 0.76–0.81，真重复反而排在假候选后面，分数就废了。每对都带 `lexical` / `semantic` / `engine` / `auto` / `same` / `allowed` / `basis` / `decision_reason` / `pending_judgement`，响应还有 `checked`、`judged`、`thresholds`（含 `judge_limit`）。**没有配置嵌入服务时 `semantic` 为 `null`**，`engine` 回 `rules`——绝不拿本地哈希向量冒充语义分。
 
-裁决阶梯（`quality.merge_decision`。实测标题+本质口径：真重复 0.870，而「提取练习 / 测试即学习」这种相关但不同的能到 0.797——只差 0.07，一条线分不开，而合并会重写关系边且当前不可撤销）：
+裁决阶梯（`quality.merge_decision`。实测标题+本质口径：真重复 0.870，而「提取练习 / 测试即学习」这种相关但不同的能到 0.797——只差 0.07，一条线分不开，而合并会按记录重写关系边）：
 
 1. `lexical ≥ 0.62` → 代码直接放行（`basis: "lexical"`）；
 2. 其余一律要模型签字：`same: true` 才放行（`basis: "model"`），并且**服务端要求 `confirmed: true`**——模型对同一对两次能给出相反答案，缓存关掉时更是如此。没带 `confirmed` 就报「需要你先确认」且一个字都不改库；
@@ -328,8 +329,17 @@ POST /api/units/{unit_id}/merge        {"into": "另一单元id", "reason": "可
 一次 `GET /api/units/duplicates` 最多请模型判 `judge_limit`（默认 3）对，按分数从高到低；没判到的带 `pending_judgement: true`，用户点合并时才判（同一问法，命中缓存）。这样打开地图不会变成烧钱。
 
 判定问法按单元 id 定序，所以候选列表渲染过的判定会被内容寻址缓存复用——**页面上说的依据和端点实际用的依据一定是同一个答案**（实测 `calls: 1, hits: 3`）。
-- 合并后：被吸收的单元从地图节点与「下一步推荐」中消失，但 `unit_detail` 仍可访问并返回 `merged_into`（归宿）与 `absorbed`（吸收了谁，带 reason）；前置关系自动重连到归宿，自环与重复边被清掉；复习卡保留在原处继续到期。
+- 合并后：被吸收的单元从地图节点与「下一步推荐」中消失，但 `unit_detail` 仍可访问并返回 `merged_into`（归宿）、`absorbed`（吸收了谁，带 reason）、`can_unmerge` 与 `unmerge_blocked_reason`；前置关系自动重连到归宿，自环与重复边被清掉；复习卡保留在原处继续到期。
 - 链式合并会自动指向最终归宿；会形成环或互相合并的请求被拒绝。
+
+**撤销合并**（`POST /api/units/{id}/unmerge`，body 可为空）：把指向恢复为空，并按合并时写进 `units.merged_op` 指向的事件记录**回滚关系边**——被改指到归宿的边回到原指向，因自环/去重被删的边重新插入（若等价边已存在或端点已不存在则跳过，响应里的 `relations_restored` / `relations_skipped` 会如实给出数量）。
+
+三条闸（不满足就 400 并说明原因，不猜着改）：
+1. 归宿本身还活着（没被并进别人）；
+2. 这个单元在被吸收之后没有又收过别的单元；
+3. 合并记录还在。旧版本或导入来的合并可能没有记录：这时仍然撤销指向，`degraded: true` 且 `note` 明说「关系边保持现状」——不会假装恢复了。
+
+`unit_detail` 的 `recalls` 是最近 6 条 `attempts(kind="review_recall")`（复习时写的回忆原文 + 分数 + 时间），单元页据此渲染「我的回忆记录」。
 
 ### 学习风格测试
 
@@ -785,7 +795,7 @@ data: {}
 
 清空内容寻址缓存，返回 `{"removed": 12, "cache": {"calls":12,"hits":5,"writes":12}, "entries": 0}`。
 
-缓存只作用于 `chat_json`（编译、大纲、元信息、速记、洞察解读）：键为 `sha256(模型 + messages + 温度 + max_tokens)`，命中直接复用原始文本再解析，因此同样材料重跑**零 token、零漂移**（实测 1.15s → 0ms）。流式对话带会话状态，不缓存。缓存键含 `base_url`：同名模型换网关不会复用另一家的输出。**只有解析成功的结果才写缓存**；命中到坏条目（截断、占位串）会删掉该条目并回落到真实调用，一次失败不会被固化成永久失败。
+缓存只作用于 `chat_json`（编译、大纲、元信息、速记、洞察解读）：键为 `sha256(模型 + messages + 温度 + max_tokens)`，命中直接复用原始文本再解析，因此同样材料重跑**零 token、零漂移**（实测 1.15s → 0ms）。流式对话带会话状态，不缓存。缓存键含 `base_url`：同名模型换网关不会复用另一家的输出。**只有解析成功的结果才写缓存**；命中到坏条目（截断、占位串）会删掉该条目并回落到真实调用，一次失败不会被固化成永久失败。缓存有上限（`CACHE_MAX_ENTRIES = 800`）：写入后超过上限就按文件 mtime 淘汰到九成，不会无限吃盘。
 
 开关随 `POST /api/settings/llm` 一起保存（`cache_enabled`，默认开）；`GET /api/settings/llm` 与 `/api/health` 会回 `cache`（calls/hits/writes）与 `cache_entries`。缓存落在 `data/llm_cache/`（gitignore 内），API Key 永不进入缓存内容。
 

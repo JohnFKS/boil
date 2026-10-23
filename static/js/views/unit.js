@@ -1,7 +1,7 @@
 /* Unit detail: the pre-digested learning surface. */
 import {
   escapeHTML, escapeAttr, icon, pct, radarSVG, ringSVG, statusMeta, kindMeta,
-  renderMarkdown, truncate, relativeTime, formatDateTime,
+  renderMarkdown, truncate, relativeTime, formatDateTime, confirmDialog, toast,
 } from "../utils.js";
 import { highlightQuotes } from "../quoteHighlight.js";
 import { aiEnabled, aiFailure, aiSuccess } from "../utils.js";
@@ -93,6 +93,9 @@ export async function render(el, ctx, params) {
             <span>这个单元已被吸收进
               <a href="#/unit/${escapeAttr(data.merged_into.id)}">${escapeHTML(data.merged_into.title)}</a>
               ——内容没有删除，只是不再单独出现在地图上。</span>
+            ${data.can_unmerge
+              ? `<button class="link-btn" type="button" data-unmerge>撤销这次合并</button>`
+              : `<span class="faint tiny">暂时不能撤销：${escapeHTML(data.unmerge_blocked_reason || "")}</span>`}
           </div>` : ""}
         ${(data.absorbed || []).length ? `
           <div class="merge-banner muted-banner">
@@ -193,6 +196,17 @@ export async function render(el, ctx, params) {
           <a class="btn btn-ghost btn-block mt-3" href="#/review">去复习 ${icon("arrow", 13)}</a>
         </div>
 
+        ${(data.recalls || []).length ? `<div class="card side-card">
+          <div class="between"><span class="side-label">我的回忆记录</span><span class="badge badge-muted">最近 ${data.recalls.length} 次</span></div>
+          <div class="mt-2">
+            ${data.recalls.map(r => `<div class="recall-log">
+              <div class="recall-log-head"><span>${Math.round((Number(r.score) || 0) * 100)}%</span><span class="faint tiny">${escapeHTML(relativeTime(r.created_at))}</span></div>
+              <p class="recall-log-text">${escapeHTML(truncate(r.response || "", 140))}</p>
+            </div>`).join("")}
+          </div>
+          <p class="faint tiny mt-2">复习时写的回忆会原样存进这里，方便对照自己前后的说法。</p>
+        </div>` : ""}
+
         <div class="card side-card">
           <div class="side-label">速记与我的笔记</div>
           <div class="field mt-2"><label>速记（复习线索）</label><textarea class="textarea" id="note-mnemonic" style="min-height:64px" placeholder="口诀、谐音、类比、画面感…">${escapeHTML(notes.mnemonic?.content || "")}</textarea></div>
@@ -252,6 +266,25 @@ export async function render(el, ctx, params) {
   el.querySelectorAll("[data-probe] .probe-head").forEach(head => {
     head.addEventListener("click", () => head.parentElement.classList.toggle("open"));
   });
+  el.querySelector("[data-unmerge]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const sure = await confirmDialog({
+      title: "撤销这次合并？",
+      message: "这个单元会重新出现在地图与「下一步」里；合并时重连的前置关系会按当时的记录恢复。",
+      confirmLabel: "撤销合并",
+    });
+    if (!sure) return;
+    btn.disabled = true;
+    try {
+      const res = await ctx.api.post(`/api/units/${encodeURIComponent(u.id)}/unmerge`, {});
+      toast(`已撤销合并；${res.note || "单元已回到地图"}`, res.degraded ? "warn" : "success", 5600);
+      await ctx.refreshView();
+    } catch (err) {
+      toast(err.message || "撤销失败", "error", 5200);
+      btn.disabled = false;
+    }
+  });
+
   el.querySelectorAll("[data-mnemonic-ai]").forEach(btn => btn.addEventListener("click", async () => {
     const box = el.querySelector("#mnemonic-ai");
     const ta = el.querySelector("#note-mnemonic");

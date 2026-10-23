@@ -63,6 +63,7 @@ class App:
             ("POST", re.compile(r"^/api/units/([^/]+)/notes$"), self.unit_note),
             ("POST", re.compile(r"^/api/units/([^/]+)/mnemonic$"), self.unit_mnemonic),
             ("POST", re.compile(r"^/api/units/([^/]+)/merge$"), self.unit_merge),
+            ("POST", re.compile(r"^/api/units/([^/]+)/unmerge$"), self.unit_unmerge),
             ("GET", re.compile(r"^/api/notes$"), self.notes_list),
             ("POST", re.compile(r"^/api/notes$"), self.notes_create),
             ("POST", re.compile(r"^/api/notes/delete$"), self.notes_delete),
@@ -234,6 +235,13 @@ class App:
                                         str(body.get("reason") or ""),
                                         override=bool(body.get("override")),
                                         confirmed=bool(body.get("confirmed")))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def unit_unmerge(self, req, match, query, body):
+        try:
+            return services.unmerge_unit(self.db, config.DEFAULT_USER,
+                                         unquote(match.group(1)))
         except ValueError as exc:
             raise ApiError(400, str(exc), "bad_request") from exc
 

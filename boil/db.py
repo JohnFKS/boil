@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS units (
   angle TEXT NOT NULL DEFAULT '',
   merged_into TEXT,
   merged_reason TEXT NOT NULL DEFAULT '',
+  merged_op TEXT,
   source_ref_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -310,7 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_notes_unit ON notes(user_id, unit_id);
 # 旧库升级用：新库由 SCHEMA 直接带上，旧库启动时幂等补列。
 EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "units": [("angle", "TEXT NOT NULL DEFAULT ''"),
-              ("merged_into", "TEXT"), ("merged_reason", "TEXT NOT NULL DEFAULT ''")],
+              ("merged_into", "TEXT"), ("merged_reason", "TEXT NOT NULL DEFAULT ''"),
+              ("merged_op", "TEXT")],
     "cards": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'")],
     "review_logs": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'"),
                     ("missed_points", "INTEGER NOT NULL DEFAULT 0")],

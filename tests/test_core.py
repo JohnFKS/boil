@@ -698,6 +698,70 @@ class AiPathTest(TempCase):
         self.assertIn("学习者确认", stored)
         self.assertIn("同一个概念", stored, "用户写的理由要能被后来的人看见")
 
+    def _merge_units(self, goal_id, specs):
+        for uid, title, order in specs:
+            self.db.upsert("units", {"id": uid, "goal_id": goal_id, "pack_id": "p",
+                                     "pack_unit_id": uid, "title": title,
+                                     "essence": "同一件事的两种说法",
+                                     "order_index": order, "created_at": now_iso(),
+                                     "updated_at": now_iso()}, "id")
+
+    def test_merge_can_be_undone_and_restores_edges(self):
+        """合并会重写关系边，所以撤销必须按记录把边也还回去，不能只把指针抹掉。"""
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        self._merge_units(goal_id, [("u-a", "间隔复习", 60), ("u-b", "间隔复习法", 61),
+                                    ("u-c", "睡眠巩固", 62)])
+        self.db.upsert("relations", {"id": "rel-1", "goal_id": goal_id, "from_unit": "u-b",
+                                     "to_unit": "u-c", "kind": "prerequisite"}, "id")
+        res = services.merge_units(self.db, "local", "u-b", "u-a")
+        self.assertEqual(res["basis"], "lexical")
+        rel = self.db.one("SELECT from_unit, to_unit FROM relations WHERE id='rel-1'")
+        self.assertEqual((rel["from_unit"], rel["to_unit"]), ("u-a", "u-c"), "合并应把边改指归宿")
+        detail = services.unit_detail(self.db, "local", "u-b")
+        self.assertTrue(detail["can_unmerge"], detail["unmerge_blocked_reason"])
+
+        undone = services.unmerge_unit(self.db, "local", "u-b")
+        self.assertFalse(undone["degraded"])
+        self.assertGreaterEqual(undone["relations_restored"], 1)
+        row = self.db.one("SELECT merged_into, merged_reason, merged_op FROM units WHERE id='u-b'")
+        self.assertIsNone(row["merged_into"])
+        self.assertEqual(row["merged_reason"], "")
+        self.assertIsNone(row["merged_op"])
+        rel = self.db.one("SELECT from_unit, to_unit FROM relations WHERE id='rel-1'")
+        self.assertEqual((rel["from_unit"], rel["to_unit"]), ("u-b", "u-c"), "边要回到原来指向")
+        self.assertIn("u-b", [n["id"] for n in services.map_data(self.db, "local", goal_id)["nodes"]],
+                      "撤销后应该重新出现在地图上")
+        with self.assertRaises(ValueError):
+            services.unmerge_unit(self.db, "local", "u-b")
+
+    def test_unmerge_refuses_when_the_target_moved(self):
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        self._merge_units(goal_id, [("u-a2", "间距复习", 63), ("u-b2", "间距复习法", 64),
+                                    ("u-c2", "间距复习", 65)])
+        services.merge_units(self.db, "local", "u-b2", "u-a2")
+        services.merge_units(self.db, "local", "u-a2", "u-c2")
+        with self.assertRaises(ValueError) as cm:
+            services.unmerge_unit(self.db, "local", "u-b2")
+        self.assertIn("归宿", str(cm.exception))
+        self.assertIsNotNone(self.db.one(
+            "SELECT merged_into FROM units WHERE id='u-b2'")["merged_into"])
+
+    def test_unmerge_refuses_when_it_absorbed_others(self):
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        self._merge_units(goal_id, [("u-a3", "复述练习", 66), ("u-b3", "复述练习法", 67),
+                                    ("u-c3", "复述练习", 68)])
+        services.merge_units(self.db, "local", "u-c3", "u-b3")
+        services.merge_units(self.db, "local", "u-b3", "u-a3")
+        detail = services.unit_detail(self.db, "local", "u-b3")
+        self.assertFalse(detail["can_unmerge"])
+        self.assertIn("收了", detail["unmerge_blocked_reason"])
+        with self.assertRaises(ValueError) as cm:
+            services.unmerge_unit(self.db, "local", "u-b3")
+        self.assertIn("先撤销那几次", str(cm.exception))
+
     def test_compile_heuristic_covers_all_sections(self):
         text = "\n\n".join(f"## 第 {i} 节\n这是第 {i} 节的正文说明。" for i in range(1, 11))
         pack = compile_heuristic("十节材料", "学科", text, use_embeddings=False)
@@ -871,6 +935,9 @@ class ServiceTest(TempCase):
                          "来源探测题要留在 feedback 里，不能计进作答次数")
         probe = [p for p in detail["probes"] if p["id"] == probe_id]
         self.assertEqual(probe[0]["attempts"], 0, "探测题「N 次作答」被复习污染了")
+        self.assertEqual(len(detail["recalls"]), 1, "单元页要能看到这条回忆")
+        self.assertEqual(detail["recalls"][0]["response"], "提取练习就是合上书用自己的话讲出来。")
+        self.assertAlmostEqual(detail["recalls"][0]["score"], 0.8, places=3)
 
         second = services.review_queue(self.db, "local")
         other = [c for c in second["cards"] if c["id"] != card["id"]][0]

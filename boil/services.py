@@ -786,6 +786,9 @@ def persona_for_goal(db: Database, user_id: str, goal_id: str | None) -> dict[st
     return (json_loads(row["meta_json"], {}) or {}).get("persona") or {}
 
 
+MAX_UNDO_RELATIONS = 200
+
+
 def _chain_target(db: Database, unit_id: str, limit: int = 12) -> str | None:
     """沿 merged_into 走到最终归宿；链太长或成环就停下，绝不静默丢内容。"""
     seen = {unit_id}
@@ -893,30 +896,43 @@ def merge_units(db: Database, user_id: str, from_id: str, into_id: str,
     note = reason or decision["reason"]
     stored_reason = _meta_field(
         f"学习者确认：{note}" if decision["basis"] == "user" else note, 200)
+    changes: list[dict[str, Any]] = []
     with db.transaction():
         db.execute("UPDATE units SET merged_into=?, merged_reason=?, updated_at=? WHERE id=?",
                    (into_id, stored_reason, ts, from_id))
-        # 前置关系重连：指向被合并单元的边改指归宿，自己指向自己的边删掉
+        # 前置关系重连：指向被合并单元的边改指归宿，自己指向自己的边删掉。
+        # 每一条的实际改动都记下来，撤销合并时按记录回滚（否则图就再也回不去了）。
         for rel in db.query("SELECT * FROM relations WHERE from_unit=? OR to_unit=?",
                             (from_id, from_id)):
             new_from = into_id if rel["from_unit"] == from_id else rel["from_unit"]
             new_to = into_id if rel["to_unit"] == from_id else rel["to_unit"]
+            record = {"id": rel["id"], "goal_id": rel["goal_id"], "kind": rel["kind"],
+                      "old_from": rel["from_unit"], "old_to": rel["to_unit"]}
             if new_from == new_to:
                 db.execute("DELETE FROM relations WHERE id=?", (rel["id"],))
+                changes.append({**record, "action": "delete"})
                 continue
             exists = db.one("SELECT id FROM relations WHERE goal_id=? AND from_unit=? "
                             "AND to_unit=? AND kind=?",
                             (rel["goal_id"], new_from, new_to, rel["kind"]))
             if exists:
                 db.execute("DELETE FROM relations WHERE id=?", (rel["id"],))
+                changes.append({**record, "action": "delete"})
             else:
                 db.execute("UPDATE relations SET from_unit=?, to_unit=? WHERE id=?",
                            (new_from, new_to, rel["id"]))
+                changes.append({**record, "action": "update",
+                                "new_from": new_from, "new_to": new_to})
         # 卡片不动：它们仍指向被合并的单元，复习照常发生，只是地图上不再单独出现
-    emit(db, "unit.merged", {"from": from_id, "into": into_id,
-                             "similarity": round4(similarity),
-                             "basis": decision["basis"],
-                             "signals": decision["signals"]}, user_id)
+        event = emit(db, "unit.merged", {
+            "from": from_id, "into": into_id,
+            "similarity": round4(similarity),
+            "basis": decision["basis"],
+            "signals": decision["signals"],
+            "undo": {"relations": changes[:MAX_UNDO_RELATIONS],
+                     "truncated": len(changes) > MAX_UNDO_RELATIONS},
+        }, user_id)
+        db.execute("UPDATE units SET merged_op=? WHERE id=?", (event["id"], from_id))
     return {
         "from": from_id, "into": into_id,
         "from_title": source["title"], "into_title": target["title"],
@@ -925,6 +941,96 @@ def merge_units(db: Database, user_id: str, from_id: str, into_id: str,
         "decision_reason": decision["reason"],
         "cards_kept": db.scalar("SELECT COUNT(*) FROM cards WHERE unit_id=?", (from_id,), 0) or 0,
     }
+
+
+def _unmerge_blockers(db: Database, unit: dict[str, Any]) -> str:
+    """撤销合并前的检查：归宿还活着、自己没吸收过别人、记录还在。
+
+    合并不删内容，但关系边是按记录重写的；只要有一环被别人动过，
+    与其猜一个「大概对」的图，不如说清楚为什么现在不能撤。
+    """
+    into_id = unit.get("merged_into")
+    if not into_id:
+        return "这个单元没有被合并"
+    target = db.one("SELECT id, merged_into FROM units WHERE id=?", (into_id,))
+    if not target:
+        return "归宿单元已经不存在了"
+    if target.get("merged_into"):
+        return "归宿本身也被并进了别的单元，先撤销那一次"
+    absorbed = db.scalar("SELECT COUNT(*) FROM units WHERE merged_into=?", (unit["id"],), 0) or 0
+    if absorbed:
+        return f"这个单元在被吸收后又收了 {absorbed} 个单元，先撤销那几次"
+    return ""
+
+
+def unmerge_unit(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
+    """撤销一次合并：指针复原，关系边按合并时记下的改动回滚。"""
+    row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
+    if not row:
+        raise ValueError("单元不存在")
+    unit = unit_from_row(row)
+    blocked = _unmerge_blockers(db, unit)
+    if blocked:
+        raise ValueError(blocked)
+    into_id = unit["merged_into"]
+    op_id = unit.get("merged_op")
+    undo: dict[str, Any] = {}
+    record_found = False
+    if op_id:
+        ev = db.one("SELECT payload_json FROM events WHERE id=? AND type='unit.merged'", (op_id,))
+        if ev:
+            payload = json_loads(ev["payload_json"], {}) or {}
+            undo = payload.get("undo") or {}
+            record_found = isinstance(payload.get("undo"), dict)
+    changes = undo.get("relations") or []
+    restored = skipped = 0
+    ts = now_iso()
+    with db.transaction():
+        db.execute("UPDATE units SET merged_into=NULL, merged_reason='', merged_op=NULL, "
+                   "updated_at=? WHERE id=?", (ts, unit_id))
+        for ch in changes[:MAX_UNDO_RELATIONS]:
+            rid = str(ch.get("id") or "")
+            old_from, old_to = ch.get("old_from"), ch.get("old_to")
+            if not rid or not old_from or not old_to:
+                skipped += 1
+                continue
+            if not db.one("SELECT id FROM units WHERE id=?", (old_from,)) or \
+                    not db.one("SELECT id FROM units WHERE id=?", (old_to,)):
+                skipped += 1          # 端点已经不在了，不复活一条悬空边
+                continue
+            if ch.get("action") == "update":
+                cur = db.one("SELECT * FROM relations WHERE id=?", (rid,))
+                if (cur and cur["from_unit"] == ch.get("new_from")
+                        and cur["to_unit"] == ch.get("new_to")):
+                    db.execute("UPDATE relations SET from_unit=?, to_unit=? WHERE id=?",
+                               (old_from, old_to, rid))
+                    restored += 1
+                else:
+                    skipped += 1      # 合并没有那样改过，或者之后又被改过
+            else:
+                dup = db.one("SELECT id FROM relations WHERE goal_id=? AND from_unit=? "
+                             "AND to_unit=? AND kind=?",
+                             (ch.get("goal_id"), old_from, old_to, ch.get("kind")))
+                if dup:
+                    skipped += 1
+                    continue
+                db.insert("relations", {"id": rid, "goal_id": ch.get("goal_id"),
+                                        "from_unit": old_from, "to_unit": old_to,
+                                        "kind": ch.get("kind") or "prerequisite"})
+                restored += 1
+        emit(db, "unit.unmerged", {"from": unit_id, "into": into_id, "op": op_id,
+                                   "restored": restored, "skipped": skipped}, user_id)
+    target = db.one("SELECT title FROM units WHERE id=?", (into_id,)) or {}
+    if not record_found:
+        note = "这次合并没有留下可回滚的记录（多半来自旧版本或导入），只撤销了指向，关系边保持现状"
+    elif changes:
+        note = f"已恢复 {restored} 条关系边" + (f"，跳过 {skipped} 条" if skipped else "")
+    else:
+        note = "这次合并没有改动任何前置关系，已直接撤销指向"
+    return {"from": unit_id, "into": into_id,
+            "from_title": unit["title"], "into_title": target.get("title", ""),
+            "relations_restored": restored, "relations_skipped": skipped,
+            "degraded": not record_found, "note": note}
 
 
 def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
@@ -968,6 +1074,13 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
         "SELECT * FROM attempts WHERE unit_id=? AND user_id=? ORDER BY created_at DESC LIMIT 8",
         (unit_id, user_id),
     )
+    # 复习时写下的回忆单独取一份：它和探测题作答不是一回事，混在一个列表里两头都看不清
+    recalls = db.query(
+        "SELECT id, response, score, created_at FROM attempts "
+        "WHERE unit_id=? AND user_id=? AND kind='review_recall' "
+        "ORDER BY created_at DESC LIMIT 6",
+        (unit_id, user_id),
+    )
     h = heat.heat_for_unit(db, user_id, unit_id)
     pn = heat.pn_state(db, user_id, unit)
     records = heat.history(db, user_id, unit_id=unit_id, limit=6)
@@ -980,13 +1093,16 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     absorbed = db.query("SELECT id, title, merged_reason FROM units "
                         "WHERE goal_id=? AND merged_into=? ORDER BY title",
                         (unit["goal_id"], unit_id))
+    unmerge_blocked = _unmerge_blockers(db, unit)
     return {"unit": unit, "mastery": m, "status": st[unit_id],
             "heat": h, "heat_label": heat.heat_label(h), "pn": pn,
             "merged_into": merged_into, "absorbed": absorbed,
+            "can_unmerge": not unmerge_blocked,
+            "unmerge_blocked_reason": unmerge_blocked,
             "records": records, "notes": get_unit_notes(db, user_id, unit_id),
             "related": related,
             "probes": probes, "cards": cards, "sessions": sessions,
-            "relations": relations, "attempts": attempts,
+            "relations": relations, "attempts": attempts, "recalls": recalls,
             "source": unit.get("source_ref") or {}}
 
 

@@ -136,7 +136,7 @@ function defaultSide(data) {
   </div>
   ${(data.duplicates || []).length ? `<div class="card map-side-card dup-card">
     <div class="side-label">疑似重复 ${data.duplicates.length} 对${data.dupEngine === "semantic" ? " · 语义 + 字面" : " · 只看字面"}</div>
-    <p class="faint tiny">合并不是删除：被吸收的单元不再单独出现，内容与复习卡仍在原处可访问。分数只提候选，字面以外都要模型签字、你再点一次确认。</p>
+    <p class="faint tiny">合并不是删除：被吸收的单元不再单独出现，内容与复习卡仍在原处可访问；合错了可在被吸收单元的页面上撤销（关系边会按记录回滚）。分数只提候选，字面以外都要模型签字、你再点一次确认。</p>
     ${data.duplicates.slice(0, 5).map((d, i) => dupRow(d, i)).join("")}
     ${data.judged ? `<p class="faint tiny mt-2">其中 ${data.judged} 对分数落在中间带，已请模型判过。</p>` : ""}
   </div>` : ""}`;

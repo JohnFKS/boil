@@ -713,6 +713,7 @@ def _reject_junk(value: Any) -> Any:
 
 
 _cache_stats = {"calls": 0, "hits": 0, "writes": 0}
+CACHE_MAX_ENTRIES = 800
 
 
 def cache_dir():
@@ -767,6 +768,27 @@ def _cache_write(key: str, text: str, model: str) -> None:
     write_json_atomic(directory / f"{key}.json",
                       {"key": key, "model": model, "created_at": now_iso(), "text": text})
     _cache_stats["writes"] += 1
+    prune_cache()
+
+
+def prune_cache() -> int:
+    """缓存只增不减会一直吃盘：超过上限就按 mtime 淘汰到九成，避免每次写都搬家。"""
+    directory = cache_dir()
+    if not directory.exists():
+        return 0
+    files = list(directory.glob("*.json"))
+    if len(files) <= CACHE_MAX_ENTRIES:
+        return 0
+    files.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    keep = int(CACHE_MAX_ENTRIES * 0.9)
+    removed = 0
+    for path in files[:len(files) - keep]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _cache_drop(key: str) -> None:

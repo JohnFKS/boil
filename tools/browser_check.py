@@ -349,6 +349,30 @@ def main():
                         errors.append(f"合并后 toast 没说清依据: {done}")
                     else:
                         print(f"  merged: {done[:60]}")
+                        # G1：撤销合并要走真鼠标 + 确认框，撤销后单元必须回到地图
+                        evaluate(f"location.hash = '#/unit/' + encodeURIComponent({seed_id!r})")
+                        time.sleep(1.6)
+                        if not wait_for("[data-unmerge]", timeout=8):
+                            errors.append("被合并单元的页面上没有撤销入口")
+                        elif not real_click("[data-unmerge]"):
+                            errors.append("撤销按钮真鼠标点不到")
+                        else:
+                            time.sleep(0.6)
+                            if not real_click(".modal-foot .btn-primary"):
+                                errors.append("撤销确认框点不到")
+                            else:
+                                time.sleep(2.0)
+                                note = evaluate("(document.querySelector('.toast')||{}).textContent||''")
+                                alive = evaluate(
+                                    "(async()=>{const r=await fetch('/api/units/'+encodeURIComponent(%r));"
+                                    "const j=await r.json();return {merged:!!j.data.merged_into,"
+                                    " can:j.data.can_unmerge}})()" % seed_id)
+                                if "撤销" not in note:
+                                    errors.append(f"撤销后 toast 不对: {note}")
+                                elif not alive or alive.get("merged"):
+                                    errors.append(f"撤销后单元没有回到存活状态: {alive}")
+                                else:
+                                    print(f"  unmerged: {note[:60]}")
         except Exception as exc:
             errors.append(f"重复候选回归没跑成: {type(exc).__name__}: {exc}")
         finally:
@@ -445,6 +469,35 @@ def main():
         if not echo or echo.get("shown") == "none" or "回归" not in echo.get("text", ""):
             errors.append(f"翻面后没有回显回忆内容: {echo}")
         shot("review-revealed.png")
+
+        # G2：单元页要能看到自己写过的回忆（种一条临时记录，跑完删掉，不动真实排程）
+        db_path = Path(os.environ.get("BOIL_DATA_DIR", str(ROOT / "data"))) / "boil.db"
+        import sqlite3 as _sq
+        with _sq.connect(str(db_path), timeout=15) as conn:
+            rec_unit = conn.execute(
+                "SELECT id FROM units WHERE merged_into IS NULL ORDER BY order_index LIMIT 1").fetchone()[0]
+            conn.execute(
+                "INSERT OR REPLACE INTO attempts (id, user_id, unit_id, probe_id, kind, response,"
+                " score, confidence, hints_used, feedback_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("at-browser-recall", "local", rec_unit, None, "review_recall",
+                 "浏览器回归写入的回忆记录：提取练习=合书复述后对照原文找差距。", 0.8, 0.0, 0,
+                 "{}", datetime.now(timezone.utc).isoformat(timespec="seconds")))
+            conn.commit()
+        try:
+            goto(f"#/unit/{rec_unit}")
+            wait_for(".recall-log", "我的回忆记录", 10)
+            rec = evaluate(
+                "(()=>{const t=document.querySelector('.recall-log-text');"
+                "return {text:t?t.textContent.trim():'', logs:document.querySelectorAll('.recall-log').length}})()")
+            if not rec or "回归写入" not in rec.get("text", ""):
+                errors.append(f"单元页没有显示回忆记录: {rec}")
+            else:
+                print(f"  recalls: {rec['logs']} 条，首条={rec['text'][:20]}")
+        finally:
+            with _sq.connect(str(db_path), timeout=15) as conn:
+                conn.execute("DELETE FROM attempts WHERE id='at-browser-recall'")
+                conn.commit()
 
         goto("#/library")
         wait_for(".library-grid", "内容库")

@@ -631,6 +631,39 @@ class ApiTest(unittest.TestCase):
         self.assertIsNone(self.db.one("SELECT id FROM cards WHERE id='cd-poison'"),
                           "坏行不能已经进去了才报错")
 
+    def test_23_merge_undo_over_http(self):
+        from boil.utils import now_iso
+        db = self.db
+        goal = db.one("SELECT id FROM goals WHERE status='active' ORDER BY created_at DESC LIMIT 1")
+        for uid, order in (("unit-undo-a", 95), ("unit-undo-b", 96)):
+            db.upsert("units", {"id": uid, "goal_id": goal["id"], "pack_id": "p",
+                                "pack_unit_id": uid, "title": "合意困难",
+                                "essence": "把难度控制在跳一跳够得着的范围",
+                                "order_index": order, "created_at": now_iso(),
+                                "updated_at": now_iso()}, "id")
+        db.upsert("relations", {"id": "rel-undo", "goal_id": goal["id"],
+                                "from_unit": "unit-undo-b", "to_unit": "unit-undo-a",
+                                "kind": "prerequisite"}, "id")
+        merged = self.call("POST", "/api/units/unit-undo-b/merge",
+                           {"into": "unit-undo-a"})["data"]
+        self.assertIn("basis", merged)
+        detail = self.call("GET", "/api/units/unit-undo-b")["data"]
+        self.assertTrue(detail["can_unmerge"], detail.get("unmerge_blocked_reason"))
+        self.assertIsNone(db.one("SELECT id FROM relations WHERE id='rel-undo'"),
+                          "合并时 b→a 会变成 a→a 自环，应当被删掉")
+        undo = self.call("POST", "/api/units/unit-undo-b/unmerge", {})["data"]
+        self.assertFalse(undo["degraded"])
+        self.assertGreaterEqual(undo["relations_restored"], 1)
+        self.assertIsNotNone(db.one(
+            "SELECT id FROM units WHERE id='unit-undo-b' AND merged_into IS NULL"))
+        rel = db.one("SELECT from_unit, to_unit FROM relations WHERE id='rel-undo'")
+        self.assertEqual((rel["from_unit"], rel["to_unit"]), ("unit-undo-b", "unit-undo-a"))
+        try:
+            self.call("POST", "/api/units/unit-undo-b/unmerge", {})
+            self.fail("没被合并的单元不能撤销")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")
