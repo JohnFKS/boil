@@ -16,6 +16,7 @@ import * as insightsView from "./views/insights.js";
 import * as notesView from "./views/notes.js";
 import * as settingsView from "./views/settings.js";
 import { initSelectionMenu } from "./selectionMenu.js";
+import { initFocus } from "./focus.js";
 
 const THEME_KEY = "boil_theme";
 const state = {
@@ -200,6 +201,7 @@ function shellHTML() {
             </div>
           </div>
           <div class="topbar-right">
+            <button class="btn btn-ghost btn-sm focus-btn" id="focus-btn" title="番茄钟：点击开始一次专注">${icon("clock", 14)}<span id="focus-label">专注</span></button>
             <button class="search-btn" id="search-btn" aria-label="搜索">${icon("search", 16)}<span>搜索单元或内容包</span><span class="kbd">⌘K</span></button>
             <button class="icon-btn" id="theme-btn" aria-label="切换主题">${icon(state.theme === "light" ? "moon" : "sun", 17)}</button>
             <a class="btn btn-primary btn-sm" href="#/onboarding" data-new-goal>${icon("plus", 14)} 新目标</a>
@@ -459,6 +461,7 @@ async function boot() {
   }
   clearTimeout(watchdog);
   initSelectionMenu(ctx);
+  initFocus(ctx);
   try {
     await renderRoute();
     window.__boilBootReady?.();

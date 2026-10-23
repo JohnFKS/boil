@@ -287,6 +287,45 @@ def main():
         # full page dashboard
         shot("dashboard-full.png", full=True)
 
+        # P3-10：番茄钟 —— 开始 / 倒计时 / 提前结束不计入时长
+        if not real_click("#focus-btn"):
+            errors.append("顶栏的专注按钮点不到")
+        else:
+            time.sleep(0.5)
+            pick = evaluate(
+                "(()=>{const m=document.querySelector('.modal');if(!m)return {open:false};"
+                "return {open:true, btns:[...m.querySelectorAll('.modal-foot button')].map(b=>b.textContent.trim())}})()")
+            if not pick or not pick.get("open") or not any("25 分钟" in b for b in pick.get("btns") or []):
+                errors.append(f"专注时长选择框不对: {pick}")
+            else:
+                if not real_click(".modal-foot .btn-primary"):      # 25 分钟是主按钮
+                    errors.append("25 分钟按钮点不到")
+                else:
+                    time.sleep(1.4)
+                    running = evaluate(
+                        "(()=>{const l=document.querySelector('#focus-label');"
+                        "return {text:l?l.textContent.trim():'',"
+                        "running:!!document.querySelector('#focus-btn.running')}})()")
+                    if not running or not running.get("running") or ":" not in running.get("text", ""):
+                        errors.append(f"专注没有进入倒计时: {running}")
+                    else:
+                        print(f"  focus running: {running['text']}")
+                        if real_click("#focus-btn"):
+                            time.sleep(0.5)
+                            real_click(".modal-foot .btn-ghost")
+                            time.sleep(1.6)
+                            done = evaluate(
+                                "(()=>{const l=document.querySelector('#focus-label');"
+                                "const ts=[...document.querySelectorAll('.toast')];"
+                                "return {text:l?l.textContent.trim():'',"
+                                "toast:ts.length?ts[ts.length-1].textContent:''}})()")
+                            if done.get("text") != "专注":
+                                errors.append(f"结束专注后按钮没有复原: {done}")
+                            elif "不计入" not in done.get("toast", ""):
+                                errors.append(f"放弃的专注提示不对: {done.get('toast')}")
+                            else:
+                                print(f"  focus abandoned: {done['toast'][:40]}")
+
         goto("#/map")
         wait_for(".map-svg", "知识地图")
         # F15/F16：地图不崩、重复卡片按数据有无正确显隐
@@ -469,6 +508,39 @@ def main():
         if not echo or echo.get("shown") == "none" or "回归" not in echo.get("text", ""):
             errors.append(f"翻面后没有回显回忆内容: {echo}")
         shot("review-revealed.png")
+
+        # P3-11：评分 →「刚才这次」→ 撤销 → 卡片回到队列（净效果为零，不动排程）
+        first_card = evaluate(
+            "(()=>{const t=document.querySelector('.queue-item.current .queue-title');"
+            "return t?t.textContent.trim():''})()")
+        evaluate("document.querySelector('.rating-btn[data-rate=\"3\"]').click()")
+        time.sleep(1.6)
+        strip = evaluate(
+            "(()=>{const b=document.querySelector('#last-review');"
+            "if(!b) return {shown:false};"
+            "return {shown:getComputedStyle(b).display!=='none',"
+            " text:b.textContent.replace(/\\s+/g,' ').trim(),"
+            " btn:!!b.querySelector('[data-undo-review]')}})()")
+        if not strip or not strip.get("shown") or not strip.get("btn"):
+            errors.append(f"评分后没有撤销入口: {strip}")
+        else:
+            print(f"  review undo: {strip['text'][:56]}")
+            if not real_click("#last-review [data-undo-review]"):
+                errors.append("撤销评分按钮真鼠标点不到")
+            else:
+                time.sleep(2.0)
+                note = evaluate(
+                    "(()=>{const ts=[...document.querySelectorAll('.toast')];"
+                    "return ts.length?ts[ts.length-1].textContent:''})()")
+                back = evaluate(
+                    "(()=>{const t=document.querySelector('.queue-item.current .queue-title');"
+                    "return t?t.textContent.trim():''})()")
+                if "撤销" not in note:
+                    errors.append(f"撤销评分后的提示不对: {note}")
+                elif first_card and back != first_card:
+                    errors.append(f"撤销后没有回到原来那张卡: {first_card} → {back}")
+                else:
+                    print(f"  review undone: {note[:48]}")
 
         # G2：单元页要能看到自己写过的回忆（种一条临时记录，跑完删掉，不动真实排程）
         db_path = Path(os.environ.get("BOIL_DATA_DIR", str(ROOT / "data"))) / "boil.db"
@@ -661,6 +733,43 @@ def main():
         if not hl or hl.get("marks", 0) < 1 or not hl.get("tip"):
             errors.append(f"灵感引文没有高亮: {hl}")
         shot("unit-note-highlight.png")
+
+        # P3-12：触摸端 —— 手指拖选结束后浮条要自己出来，且不能超出屏幕
+        call("Emulation.setDeviceMetricsOverride",
+             {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True})
+        call("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
+        time.sleep(0.6)
+        evaluate(
+            "(()=>{const el=document.querySelector('.essence-text');"
+            "const r=document.createRange();r.selectNodeContents(el);"
+            "const s=getSelection();s.removeAllRanges();s.addRange(r);})()")
+        time.sleep(0.4)
+        evaluate("document.querySelector('.selection-menu').style.display='none'")
+        box = evaluate(
+            "(()=>{const el=document.querySelector('.essence-text');"
+            "const r=el.getBoundingClientRect();"
+            "return JSON.stringify([r.x+r.width/2, r.y+Math.min(r.height/2, 40)])})()")
+        tx, ty = json.loads(box)
+        call("Input.dispatchTouchEvent",
+             {"type": "touchStart", "touchPoints": [{"x": tx, "y": ty}]})
+        call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        time.sleep(1.0)
+        touch_menu = evaluate(
+            "(()=>{const m=document.querySelector('.selection-menu');"
+            "if(!m) return {display:'missing'};const r=m.getBoundingClientRect();"
+            "return {display:getComputedStyle(m).display, btns:m.querySelectorAll('.sel-btn').length,"
+            "left:Math.round(r.left), right:Math.round(r.right), vw:innerWidth}})()")
+        if not touch_menu or touch_menu.get("display") != "flex":
+            errors.append(f"触摸端浮条没有出现: {touch_menu}")
+        elif touch_menu.get("right", 0) > touch_menu.get("vw", 0) + 1:
+            errors.append(f"触摸端浮条超出屏幕: {touch_menu}")
+        else:
+            print(f"  touch menu: {touch_menu['btns']} 个动作，边界 {touch_menu['left']}–{touch_menu['right']}/{touch_menu['vw']}")
+        evaluate("getSelection().removeAllRanges()")
+        call("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        call("Emulation.setDeviceMetricsOverride",
+             {"width": 1440, "height": 1100, "deviceScaleFactor": 1, "mobile": False})
+        time.sleep(0.5)
         goto("#/notes")
         wait_for(".note-card", "灵感库")
         notes_page = evaluate(

@@ -1241,6 +1241,78 @@ class ServiceTest(TempCase):
         self.assertTrue(all("lexical" not in u["matched_by"] for u in found["units"][1:]),
                         "只有一个字面命中才对，多一个说明样例选得不干净")
 
+    def test_rating_can_be_undone_exactly(self):
+        """掌握度是状态量（EMA），撤销只能整行还原：卡片、掌握度、日志、回忆、火候记录一起回。"""
+        self.onboard()
+        card = services.review_queue(self.db, "local")["cards"][0]
+        unit_id = card["unit_id"]
+        m_before = self.db.one(
+            "SELECT * FROM mastery WHERE user_id='local' AND unit_id=? AND facet='recall'",
+            (unit_id,))
+        logs_before = self.db.scalar("SELECT COUNT(*) FROM review_logs", (), 0) or 0
+
+        res = services.rate_card(self.db, "local", card["id"], 2, 5000,
+                                 recall="只记得一半", mistake_tags=["blank"])
+        undo = res["undo"]
+        self.assertTrue(undo.get("op"))
+        self.assertEqual(undo["rating"], 2)
+        self.assertNotEqual(self.db.one("SELECT state FROM cards WHERE id=?", (card["id"],))["state"],
+                            card["state"], "评分应该改变卡片状态")
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM review_logs", (), 0), logs_before + 1)
+
+        services.undo_review(self.db, "local", undo["op"])
+        restored = self.db.one("SELECT * FROM cards WHERE id=?", (card["id"],))
+        for key in ("state", "step", "stability", "difficulty", "due_at", "reps", "lapses"):
+            self.assertEqual(restored[key], card[key], f"{key} 没有回到评分前")
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM review_logs", (), 0), logs_before,
+                         "评分日志要删掉")
+        self.assertIsNone(self.db.one(
+            "SELECT id FROM attempts WHERE kind='review_recall' AND unit_id=?", (unit_id,)),
+            "回忆记录要一起删掉")
+        m_after = self.db.one(
+            "SELECT * FROM mastery WHERE user_id='local' AND unit_id=? AND facet='recall'",
+            (unit_id,))
+        if m_before:
+            self.assertEqual(m_after["score"], m_before["score"])
+            self.assertEqual(m_after["reps"], m_before["reps"])
+        else:
+            self.assertIsNone(m_after, "首评前没有掌握度行，撤销后也不该留下")
+        self.assertIsNone(self.db.one("SELECT id FROM boil_records WHERE unit_id=?", (unit_id,)))
+        self.assertTrue(self.db.one("SELECT id FROM events WHERE type='review.undone'"))
+
+    def test_undo_refuses_when_unit_reviewed_since(self):
+        self.onboard()
+        cards = services.review_queue(self.db, "local", limit=20)["cards"]
+        first = cards[0]
+        same_unit = [c for c in cards[1:] if c["unit_id"] == first["unit_id"]]
+        if not same_unit:
+            self.skipTest("演示内容里同一单元只有一张卡，构不成场景")
+        res = services.rate_card(self.db, "local", first["id"], 3, 1000)
+        services.rate_card(self.db, "local", same_unit[0]["id"], 3, 1000)
+        with self.assertRaises(ValueError) as cm:
+            services.undo_review(self.db, "local", res["undo"]["op"])
+        self.assertIn("又复习", str(cm.exception))
+
+    def test_focus_sessions_count_only_completed(self):
+        """番茄钟只有「完成」才计入学习时长；重复提交不能把 25 分钟记两遍。"""
+        self.onboard()
+        start = services.focus_start(25)
+        self.assertEqual(start["minutes"], 25)
+        before = self.db.scalar("SELECT COALESCE(SUM(minutes),0) FROM study_days", (), 0) or 0
+        done = services.focus_finish(self.db, "local", start["session"], 25, outcome="completed")
+        self.assertFalse(done["duplicate"])
+        self.assertEqual((done["sessions"], done["minutes"]), (1, 25))
+        after = self.db.scalar("SELECT COALESCE(SUM(minutes),0) FROM study_days", (), 0) or 0
+        self.assertEqual(after, before + 25, "完成的专注要进 study_days")
+        dup = services.focus_finish(self.db, "local", start["session"], 25, outcome="completed")
+        self.assertTrue(dup["duplicate"])
+        self.assertEqual(services.focus_today(self.db, "local")["sessions"], 1, "重复提交不能记两次")
+        abandoned = services.focus_start(45)
+        services.focus_finish(self.db, "local", abandoned["session"], 45, outcome="abandoned")
+        self.assertEqual(services.focus_today(self.db, "local")["sessions"], 1, "放弃的不计入")
+        with self.assertRaises(ValueError):
+            services.focus_finish(self.db, "local", "", 25)
+
     def test_notes_backup_and_semantic_search(self):
         out = self.onboard()
         unit_id = out["next_units"][0]["id"]

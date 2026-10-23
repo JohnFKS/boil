@@ -1240,6 +1240,9 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     rating = int(clamp(int(rating), 1, 4))
     before_heat = heat.heat_for_unit(db, user_id, card["unit_id"])
     before = dict(card)
+    mastery_before = db.one(
+        "SELECT * FROM mastery WHERE user_id=? AND unit_id=? AND facet='recall'",
+        (user_id, card["unit_id"]))
     result = scheduler.schedule(card_from_row(card), rating)
     ts = now_iso()
     tags = normalize_mistake_tags(mistake_tags)
@@ -1252,8 +1255,9 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
         (result.state, result.step, result.stability, result.difficulty,
          result.due_iso(), ts, result.reps, result.lapses, json_dumps(card_tags), ts, card_id),
     )
+    log_id = new_id("rv")
     db.insert("review_logs", {
-        "id": new_id("rv"),
+        "id": log_id,
         "card_id": card_id,
         "user_id": user_id,
         "rating": rating,
@@ -1273,11 +1277,13 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     })
     score = {1: 0.1, 2: 0.45, 3: 0.8, 4: 0.95}[rating]
     said = re.sub(r"\r\n?", "\n", str(recall or "")).strip()[:4000]
+    attempt_id = None
     if said:
         # kind=review_recall、probe_id=None：探测题的「N 次作答」按 probe_id 统计，
         # 复习时写的回忆不是作答那道题，混进去计数就成谎话了。
+        attempt_id = new_id("at")
         db.insert("attempts", {
-            "id": new_id("at"),
+            "id": attempt_id,
             "user_id": user_id,
             "unit_id": card["unit_id"],
             "probe_id": None,
@@ -1293,14 +1299,21 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     add = mastery.add_evidence(db, user_id, card["unit_id"], "recall", score,
                                confidence=0.8, weight=0.9, source="review")
     after_heat = heat.heat_for_unit(db, user_id, card["unit_id"])
-    heat.record_boil(db, user_id, card["unit_id"], "recall", 3,
-                     {"rating": rating, "interval_days": round4(result.interval_days)},
-                     before_heat, after_heat, [])
+    boil_id = heat.record_boil(db, user_id, card["unit_id"], "recall", 3,
+                               {"rating": rating, "interval_days": round4(result.interval_days)},
+                               before_heat, after_heat, [])
     touch_study_day(db, user_id, minutes=max(1, int(elapsed_ms / 60000)) if elapsed_ms else 1,
                     sessions=0, reviews=1)
-    emit(db, "review.rated", {"card_id": card_id, "unit_id": card["unit_id"],
-                              "rating": rating, "interval_days": round4(result.interval_days)},
-         user_id)
+    snapshot = {k: before.get(k) for k in CARD_STATE_FIELDS}
+    event = emit(db, "review.rated", {
+        "card_id": card_id, "unit_id": card["unit_id"],
+        "rating": rating, "interval_days": round4(result.interval_days),
+        "undo": {"card": snapshot,
+                 "mastery": dict(mastery_before) if mastery_before else None,
+                 "log_id": log_id, "attempt_id": attempt_id,
+                 "evidence_id": add.get("evidence_id"), "boil_id": boil_id,
+                 "day": today_str()},
+    }, user_id)
     updated = db.one("SELECT * FROM cards WHERE id=?", (card_id,))
     return {
         "card": {**_public_card(updated), "preview": scheduler.preview_labels(card_from_row(updated))},
@@ -1314,7 +1327,87 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
         "mastery": add,
         "mistake_tags": logged_tags,
         "remaining": review_queue(db, user_id, limit=1)["due_total"],
+        "undo": {
+            "op": event["id"],
+            "rating": rating,
+            "interval_label": interval_label(result.interval_seconds),
+            "due_before": before.get("due_at"),
+            "state_before": before.get("state") or "new",
+            "mastery_before": (round4(float(mastery_before.get("score") or 0))
+                               if mastery_before else None),
+            "mastery_after": add.get("score"),
+        },
     }
+
+
+CARD_STATE_FIELDS = ("state", "step", "stability", "difficulty", "due_at",
+                     "last_review", "reps", "lapses", "mistake_tags_json")
+
+
+def undo_review(db: Database, user_id: str, op_id: str) -> dict[str, Any]:
+    """撤销最近一次评分：卡片状态、掌握度、日志、回忆、火候记录一起回到评分前。
+
+    掌握度是状态量（EMA），不能「减掉一条证据」——所以评分时就把快照存进事件，
+    撤销时整行还原。只允许撤最近一次：同一单元之后若又复习过，快照已经作废。
+    """
+    op_id = str(op_id or "").strip()
+    if not op_id:
+        raise ValueError("缺少撤销凭据")
+    ev = db.one("SELECT * FROM events WHERE id=? AND type='review.rated' AND user_id=?",
+                (op_id, user_id))
+    if not ev:
+        raise ValueError("找不到这次评分的记录")
+    payload = json_loads(ev["payload_json"], {}) or {}
+    undo = payload.get("undo") or {}
+    if not undo.get("log_id") or not undo.get("card"):
+        raise ValueError("这次评分来自旧版本，没有留下可回滚的快照")
+    log = db.one("SELECT * FROM review_logs WHERE id=?", (undo["log_id"],))
+    card = db.one("SELECT * FROM cards WHERE id=? AND user_id=?",
+                  (payload.get("card_id"), user_id))
+    if not log or not card:
+        raise ValueError("这次评分或卡片已经不在了")
+    # 用 rowid 而不是 reviewed_at：时间戳只到秒，同一秒里的两次复习会分不出先后
+    later = db.scalar(
+        "SELECT COUNT(*) FROM review_logs l JOIN cards c ON c.id=l.card_id "
+        "WHERE c.unit_id=? AND c.user_id=? AND l.rowid > "
+        "(SELECT rowid FROM review_logs WHERE id=?)",
+        (payload.get("unit_id"), user_id, log["id"]), 0) or 0
+    if later:
+        raise ValueError(f"这个单元在那之后又复习了 {later} 次；"
+                         "撤掉这一条会把后面的掌握度一起抹掉，所以不允许")
+    snap = undo["card"]
+    ts = now_iso()
+    with db.transaction():
+        db.execute(
+            "UPDATE cards SET state=?, step=?, stability=?, difficulty=?, due_at=?, "
+            "last_review=?, reps=?, lapses=?, mistake_tags_json=?, updated_at=? WHERE id=?",
+            (snap.get("state") or "new", int(snap.get("step") or 0),
+             float(snap.get("stability") or 0), float(snap.get("difficulty") or 0),
+             snap.get("due_at"), snap.get("last_review"),
+             int(snap.get("reps") or 0), int(snap.get("lapses") or 0),
+             snap.get("mistake_tags_json") or "[]", ts, card["id"]),
+        )
+        db.execute("DELETE FROM review_logs WHERE id=?", (log["id"],))
+        for key, table in (("attempt_id", "attempts"), ("evidence_id", "evidence"),
+                           ("boil_id", "boil_records")):
+            if undo.get(key):
+                db.execute(f"DELETE FROM {table} WHERE id=?", (undo[key],))
+        m = undo.get("mastery")
+        if m:
+            db.upsert("mastery", {k: m.get(k) for k in (
+                "user_id", "unit_id", "facet", "score", "confidence", "reps",
+                "lapses", "last_evidence_at", "updated_at")}, "user_id,unit_id,facet")
+        else:
+            db.execute("DELETE FROM mastery WHERE user_id=? AND unit_id=? AND facet='recall'",
+                       (user_id, payload.get("unit_id")))
+        if undo.get("day") == today_str():
+            db.execute("UPDATE study_days SET reviews=MAX(0, reviews-1) "
+                       "WHERE user_id=? AND day=?", (user_id, undo["day"]))
+        emit(db, "review.undone", {"op": op_id, "card_id": card["id"],
+                                   "rating": payload.get("rating")}, user_id)
+    restored = db.one("SELECT * FROM cards WHERE id=?", (card["id"],))
+    return {"card": _public_card(restored), "rating": payload.get("rating"),
+            "note": "已撤销这次评分；卡片与掌握度都回到了评分前"}
 
 
 def _public_card(card: dict[str, Any]) -> dict[str, Any]:
@@ -1664,6 +1757,59 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
 # ---------------------------------------------------------------------------
 # 搜索 / 导出 / 重置
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 专注（番茄钟）：开始不落库，结束才记；完成才计入学习时长
+# ---------------------------------------------------------------------------
+FOCUS_MINUTES = (15, 25, 45)
+
+
+def focus_start(minutes: int = 25, unit_id: str | None = None) -> dict[str, Any]:
+    minutes = int(clamp(int(minutes or 25), 5, 120))
+    return {"session": new_id("fs"), "minutes": minutes,
+            "unit_id": unit_id or None, "started_at": now_iso()}
+
+
+def focus_finish(db: Database, user_id: str, session: str, minutes: int,
+                 unit_id: str | None = None, outcome: str = "completed") -> dict[str, Any]:
+    """结束一次专注。会话 id 同时是事件 id，重复提交不会把时长记两遍。
+
+    只有 completed 才计入 study_days：把 15 分钟的半截算成 25 分钟，热力图就成假的了。
+    """
+    session = str(session or "").strip()[:64]
+    if not session:
+        raise ValueError("缺少专注会话标识")
+    outcome = "completed" if outcome == "completed" else "abandoned"
+    minutes = int(clamp(int(minutes or 0), 1, 240))
+    eid = f"fo_{session}"
+    if db.one("SELECT id FROM events WHERE id=?", (eid,)):
+        return {"duplicate": True, **focus_today(db, user_id)}
+    with db.transaction():
+        if outcome == "completed":
+            touch_study_day(db, user_id, minutes=minutes, sessions=1)
+        db.insert("events", {
+            "id": eid, "user_id": user_id, "type": "focus.session",
+            "payload_json": json_dumps({"session": session, "minutes": minutes,
+                                        "outcome": outcome, "unit_id": unit_id or None}),
+            "created_at": now_iso(),
+        })
+    return {"duplicate": False, "outcome": outcome, "minutes": minutes,
+            **focus_today(db, user_id)}
+
+
+def focus_today(db: Database, user_id: str) -> dict[str, Any]:
+    start = _day_start_iso(_local_today())
+    rows = db.query("SELECT payload_json FROM events WHERE user_id=? AND type='focus.session' "
+                    "AND created_at>=?", (user_id, start))
+    done = []
+    for r in rows:
+        p = json_loads(r["payload_json"], {}) or {}
+        if p.get("outcome") == "completed":
+            done.append({"minutes": int(p.get("minutes") or 0),
+                         "unit_id": p.get("unit_id")})
+    return {"sessions": len(done), "minutes": sum(d["minutes"] for d in done),
+            "recent": done[-5:]}
+
+
 def search(db: Database, user_id: str, q: str) -> dict[str, Any]:
     q = (q or "").strip()
     if not q:

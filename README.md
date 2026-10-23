@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-177%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-182%20passing-38d6bd?style=flat-square)](#测试)
 [![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
@@ -159,6 +159,9 @@ python3 run.py
 - **记忆健康度**：洞察页新增一项——所有已学卡片此刻平均还能提取多少（按 FSRS 遗忘曲线计算）。它和「30 天保留率」不同：后者是历史答对率，前者是当下状态。
 - **结构化调用缓存**：编译、大纲、速记、洞察解读这类结构化调用按「模型 + 提示词 + 参数」做内容寻址缓存，同样材料重跑零 token 且结果不漂移（实测 1.15s → 0ms）；流式对话不缓存，可在设置页关闭或一键清空。
 - **错因标签**：答「忘了/模糊」时要求标一下错在哪（概念、边界、步骤、记混、粗心、没印象 6 类），只拦一次、可以跳过；标签写进 `review_logs` 与卡片，洞察页的「错因分布」卡片按标签出条形，并把「多少复习标了错因 / 样本多大」写在下面，不把没标的算进来。复习时写的回忆文字另记为 `attempts(kind=review_recall)`，不占探测题的作答计数。
+- **撤销评分**：评完分的卡片旁边会出现「刚才这次」——几分钟后再见、掌握度从多少到多少——点一下就能整条撤销：卡片状态、掌握度、复习日志、回忆、火候记录一起回到评分前。只允许撤该单元最近一次（后来的复习会让快照失效），同一次不能撤两遍。
+- **专注（番茄钟）**：顶栏「专注」可选 15 / 25 / 45 分钟，倒计时刷新后也不会丢；走完自动记账，提前结束明确「不计入学习时长」——完成才进热力图。
+- **触摸端划词**：手指拖选结束后浮条自己出现在选区上方（不再跟着拖选柄乱跳），窄屏会换行而不是溢出屏幕；用 `-webkit-touch-callout` 让系统长按菜单让位给自己的工具条。
 - **回忆记录**：复习时写的回忆会存成 `attempts(kind=review_recall)`，单元页的「我的回忆记录」按时间倒序列出最近几条原文与得分，方便对照自己前后的说法；它和探测题作答分开计数。
 - **复习队列侧栏**：本轮队列可视、点一行就跳到那张卡、勾选后「只练选中」、还能「提前加卡」把未到期的卡加进来练；已完成的划线变灰。
 - **键盘优先**：空格翻面、1–4 评分、`/` 或 ⌘K 搜索；输入框里打字与浮层打开时不抢键。
@@ -444,7 +447,7 @@ python3 -m boil.mcp_server
 ## 测试
 
 ```bash
-# 177 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格测试（stdlib unittest）
+# 182 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 

@@ -341,6 +341,18 @@ POST /api/units/{unit_id}/unmerge      撤销这个单元被吸收的那一次�
 
 `unit_detail` 的 `recalls` 是最近 6 条 `attempts(kind="review_recall")`（复习时写的回忆原文 + 分数 + 时间），单元页据此渲染「我的回忆记录」。
 
+### 专注（番茄钟）
+
+```
+POST /api/focus/start    {"minutes": 25, "unit_id": "可选"}   → {session, minutes, started_at}
+POST /api/focus/finish   {"session": "...", "minutes": 25, "unit_id": "...", "outcome": "completed|abandoned"}
+GET  /api/focus          今天的完成情况 {sessions, minutes, recent}
+```
+
+- 开始不落库，结束才记；**只有 `completed` 计入 `study_days` 的学习时长与次数**。提前结束记为 `abandoned`，只留下一条审计事件，不冒充完成。
+- `session` 同时是事件 id（`fo_<session>`）：重复提交（比如刷新后补记）返回 `duplicate: true`，不会把 25 分钟记两遍。
+- 前端顶栏的「专注」按钮启动倒计时，时长可选 15 / 25 / 45 分钟；刷新页面会从 `localStorage` 恢复，走完自动提交完成。
+
 ### 学习风格测试
 
 ```
@@ -609,6 +621,18 @@ data: {}
 ```
 
 `rating`：1 忘了 / 2 模糊 / 3 记得 / 4 很简单。
+
+响应里带 `undo`：`{op, rating, interval_label, state_before, mastery_before, mastery_after}`，`op` 就是撤销凭据。
+
+### `POST /api/reviews/undo`
+
+```json
+{"op": "ev_xxx"}
+```
+
+撤销最近一次评分：卡片状态（state/step/stability/difficulty/due_at/last_review/reps/lapses/标签）整行还原，删掉那条 `review_logs`、对应的 `review_recall`、火候记录与 mastery 证据，并把 `study_days.reviews` 减一（同一天才减）；掌握度是 EMA 状态量，所以评分时就把快照存进 `review.rated` 事件，撤销时整行还原而不是「减掉一条证据」。
+
+只允许撤**该单元最近一次**复习：同一单元之后若又复习过，快照已经作废，直接 400 并说明原因（用 `review_logs` 的 rowid 判先后，避免同秒时间戳分不出来）。同一个 `op` 不能撤两次。
 
 - `recall` 可选：翻面前写的回忆草稿，非空时以 `kind="review_recall"` 写入 `attempts`（空白不写）。它不带 `probe_id`，所以不会被探测题的「N 次作答」计数吸收；来源探测题记在 `feedback_json.probe_id`。
 - `mistake_tags` 可选：错因标签，取值固定为 `concept`（概念没吃透）/ `boundary`（条件边界）/ `step`（步骤缺一环）/ `confusion`（记混）/ `carelessness`（粗心笔误）/ `blank`（完全没印象）；未知标签丢弃、去重、最多 4 个。**只有 1/2 会被记录**——答对后卡片上的旧标签会清空，避免挂着过期错因。

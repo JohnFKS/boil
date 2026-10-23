@@ -1387,6 +1387,9 @@ ul, ol { margin: 0; padding: 0; }
 .heat-bucket-top strong { font-size: 14px; font-weight: 700; }
 .heat-bucket-top span { font-size: 9px; color: var(--faint); }
 .heat-bucket-bar { height: 8px; min-width: 4px; border-radius: 99px; background: var(--faint); }
+.focus-btn { gap: 6px; font-variant-numeric: tabular-nums; }
+.focus-btn.running { color: var(--ember); border-color: color-mix(in srgb, var(--ember) 45%, transparent); }
+@media (max-width: 720px) { .focus-btn span { display: none; } }
 .recall-log { padding: 8px 0; border-top: 1px dashed var(--line); }
 .recall-log:first-child { border-top: none; padding-top: 0; }
 .recall-log-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; font-weight: 700; }
@@ -1477,8 +1480,10 @@ ul, ol { margin: 0; padding: 0; }
 [data-theme="light"] .selection-menu { background: rgba(255,253,248,0.95); }
 [data-theme="light"] .note-popover { background: #fffdf8; }
 [data-theme="light"] .note-card { background: rgba(255,255,255,0.6); }
+/* 移动端用我们自己的浮条替代系统长按菜单；选区本身仍然可选 */
+[data-selectable] { -webkit-touch-callout: none; }
 @media (max-width: 620px) {
-  .selection-menu { transform: scale(0.96); }
+  .selection-menu { transform: scale(0.96); max-width: calc(100vw - 16px); flex-wrap: wrap; white-space: normal; justify-content: center; }
   .notes-toolbar .select { flex: 1 1 100%; }
 }
 

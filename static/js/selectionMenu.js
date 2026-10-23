@@ -72,6 +72,7 @@ function pointInRange(range, x, y) {
 
 export function initSelectionMenu(ctx) {
   if (mounted) return mounted.rebind(ctx);
+  let touching = false;
   const menu = document.createElement("div");
   menu.className = "selection-menu";
   menu.setAttribute("role", "menu");
@@ -337,6 +338,7 @@ export function initSelectionMenu(ctx) {
 
   const onSelectionChange = () => {
     if (Date.now() < ignoreUntil) return;
+    if (touching) return;          // 手指还在拖选柄：别让菜单跟着乱跳
     if (popover.style.display !== "none") return;
     if ([...document.querySelectorAll(".sel-panel")].some(p => p.style.display !== "none")) return;
     const found = activeContainer();
@@ -363,6 +365,29 @@ export function initSelectionMenu(ctx) {
     showMenu(e.clientX, e.clientY + 20);
   };
 
+  const onTouchStart = (e) => {
+    touching = true;
+    ignoreUntil = Date.now() + 600;
+    const t = e.target;
+    if (menu.contains(t) || popover.contains(t)) return;
+    if (t.closest && t.closest(".sel-panel")) return;
+    hideAll();
+  };
+  const onTouchEnd = () => {
+    touching = false;
+    // 原生菜单会比 touchend 晚出现：等它落定，再把自己的浮条放到选区上方
+    setTimeout(() => {
+      if (touching) return;
+      if (popover.style.display !== "none") return;
+      if ([...document.querySelectorAll(".sel-panel")].some(p => p.style.display !== "none")) return;
+      const found = activeContainer();
+      if (!found) return;
+      current = found;
+      showMenu(found.rect.left + found.rect.width / 2,
+               Math.max(TOP_BAR + 8, found.rect.top - 6));
+    }, 280);
+  };
+
   const onMouseDown = (e) => {
     if (menu.contains(e.target) || popover.contains(e.target)) return;
     // 面板里的按下不是「点外部」：否则 hideAll 先拆掉 DOM，按钮永远收不到 click
@@ -383,6 +408,8 @@ export function initSelectionMenu(ctx) {
   document.addEventListener("selectionchange", onSelectionChange);
   document.addEventListener("contextmenu", onContextMenu);
   document.addEventListener("mousedown", onMouseDown);
+  document.addEventListener("touchstart", onTouchStart, { passive: true });
+  document.addEventListener("touchend", onTouchEnd, { passive: true });
   window.addEventListener("scroll", onScroll, { passive: true });
   document.addEventListener("keydown", onKeyDown);
 
@@ -393,6 +420,8 @@ export function initSelectionMenu(ctx) {
       document.removeEventListener("selectionchange", onSelectionChange);
       document.removeEventListener("contextmenu", onContextMenu);
       document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("touchstart", onTouchStart);
+      document.removeEventListener("touchend", onTouchEnd);
       document.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("scroll", onScroll);
       menu.remove();

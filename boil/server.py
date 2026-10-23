@@ -85,6 +85,10 @@ class App:
             ("GET", re.compile(r"^/api/review$"), self.review),
             ("GET", re.compile(r"^/api/cards$"), self.cards),
             ("POST", re.compile(r"^/api/review/([^/]+)$"), self.review_rate),
+            ("POST", re.compile(r"^/api/reviews/undo$"), self.review_undo),
+            ("GET", re.compile(r"^/api/focus$"), self.focus_today),
+            ("POST", re.compile(r"^/api/focus/start$"), self.focus_start),
+            ("POST", re.compile(r"^/api/focus/finish$"), self.focus_finish),
             ("GET", re.compile(r"^/api/insights$"), self.insights),
             ("POST", re.compile(r"^/api/insights/synthesize$"), self.insights_synthesize),
             ("GET", re.compile(r"^/api/settings/llm$"), self.llm_get),
@@ -419,6 +423,35 @@ class App:
                                       mistake_tags=body.get("mistake_tags"))
         except ValueError as exc:
             raise ApiError(404, str(exc), "not_found") from exc
+
+    def review_undo(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.undo_review(self.db, config.DEFAULT_USER,
+                                        str(body.get("op") or ""))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def focus_today(self, req, match, query, body):
+        return services.focus_today(self.db, config.DEFAULT_USER)
+
+    def focus_start(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return services.focus_start(int(body.get("minutes") or 25),
+                                    str(body.get("unit_id") or "") or None)
+
+    def focus_finish(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.focus_finish(
+                self.db, config.DEFAULT_USER, str(body.get("session") or ""),
+                int(body.get("minutes") or 0), str(body.get("unit_id") or "") or None,
+                str(body.get("outcome") or "completed"))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
 
     def insights(self, req, match, query, body):
         return services.insights(self.db, config.DEFAULT_USER, _q(query, "goal_id") or None)

@@ -70,8 +70,9 @@ def add_evidence(db: Database, user_id: str, unit_id: str, facet: str,
         "updated_at": ts,
     }, "user_id,unit_id,facet")
 
+    evidence_id = new_id("evd")
     db.insert("evidence", {
-        "id": new_id("evd"),
+        "id": evidence_id,
         "user_id": user_id,
         "unit_id": unit_id,
         "facet": facet,
@@ -84,7 +85,7 @@ def add_evidence(db: Database, user_id: str, unit_id: str, facet: str,
         "created_at": ts,
     })
     return {"facet": facet, "score": round4(new_score), "confidence": round4(new_conf),
-            "reps": reps, "lapses": lapses}
+            "reps": reps, "lapses": lapses, "evidence_id": evidence_id}
 
 
 def get_mastery(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:

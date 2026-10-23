@@ -224,6 +224,12 @@ AI 只给候选，落库由人决定；未配置模型时入口不渲染，服�
 - 翻面前写「回忆」草稿 → 翻面后草稿排在标准答案上方做对照 → 随评分写入 `attempts(kind="review_recall")`（与探测题作答分开计数）。
 - 评分 1/2 时要求标错因（6 类固定 taxonomy），只拦一次、可跳过；标签写进 `review_logs.mistake_tags_json` 与卡片，答对则清空卡片上的旧标签。洞察页 `mistakes` 给分布与样本量。
 - 队列侧栏：跳转任意一张卡、勾选后「只练选中」（重排不改已做部分）、「提前加卡」用 `GET /api/cards` 从全量卡片里挑未到期的加进本轮。
+- **撤销评分**：掌握度是 EMA 状态量，「减掉一条证据」不成立，所以评分时把卡片状态行与 mastery 行快照写进 `review.rated` 事件的 `undo` 字段；`POST /api/reviews/undo` 用 `op`（事件 id）在一个事务里还原卡片、恢复 mastery、删除 review_log / recall attempt / evidence / boil_record，并把当天的 `reviews` 减一。只允许撤该单元最近一次复习（用 `review_logs.rowid` 判先后，时间戳只到秒）；同一次不能撤两遍。页面侧栏的「刚才这次」显示这条 diff 与撤销入口。
+- 单元页的「我的回忆记录」列出最近 6 条回忆原文与得分：数据写进去就要能被看见。
+
+### 4.6.1 专注（番茄钟）
+
+开始不落库，结束才记：`POST /api/focus/finish` 以 `session` 作为事件 id（`fo_<session>`），重复提交返回 `duplicate` 而不是把时长记两遍；**只有 `completed` 写 `study_days`**，`abandoned` 只留审计事件。顶栏按钮负责倒计时（15/25/45 分钟），刷新后从 `localStorage` 恢复并在到点时补交；提前结束必须先点「结束这次专注」，界面明说「不计入学习时长」。
 
 ### 4.7 质检与合并（借鉴 examgen）
 
@@ -430,7 +436,7 @@ score = old * (1 - alpha) + evidence * alpha
 - HTTP：REST、SSE、静态资源、错误码、包导入/编译。
 - LLM：本地假端点的普通/流式/JSON/失败可见。
 - live 服务：假端点返回符合 schema 的报告/评分/内容包。
-- 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。浮层必须用 CDP 真实鼠标事件走一遍（`real_click`）：`element.click()` 不派发 mousedown，「点外部关闭」这类 document 级逻辑用合成点击永远测不到——划词面板曾被自己的 hideAll 抢关，29 张截图全绿也发现不了。
+- 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。触摸端的划词浮条用 `Input.dispatchTouchEvent` + 移动视口验证（浮条必须出现在屏幕内，且拖选过程中不许抢跑）。浮层必须用 CDP 真实鼠标事件走一遍（`real_click`）：`element.click()` 不派发 mousedown，「点外部关闭」这类 document 级逻辑用合成点击永远测不到——划词面板曾被自己的 hideAll 抢关，29 张截图全绿也发现不了。
 - 备份：导出 → 合并导入 → 目标/单元/卡片/火候记录/速记一致；替换导入中途插入失败要整体回滚，不许留下被清空的库。
 - 合并/撤销：`merge` 改边 → `unmerge` 后边回到原指向、单元回到地图；链被移动过时撤销必须被拒绝而不是猜。
 - Notes：速记保存 → 复习队列带出 mnemonic。

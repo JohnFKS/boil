@@ -664,6 +664,38 @@ class ApiTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             self.assertEqual(exc.code, 400)
 
+    def test_24_review_undo_over_http(self):
+        queue = self.call("GET", "/api/review?limit=5")["data"]
+        card = queue["cards"][0]
+        res = self.call("POST", "/api/review/" + urllib.parse.quote(card["id"]),
+                        {"rating": 3, "elapsed_ms": 3000, "recall": "HTTP 撤销测试"})["data"]
+        op = (res.get("undo") or {}).get("op")
+        self.assertTrue(op, "评分响应要带撤销凭据")
+        undone = self.call("POST", "/api/reviews/undo", {"op": op})["data"]
+        self.assertEqual(undone["card"]["state"], card["state"])
+        self.assertIn("撤销", undone["note"])
+        again = self.call("GET", "/api/review?limit=20")["data"]
+        self.assertIn(card["id"], [c["id"] for c in again["cards"]], "撤销后卡片应回到队列")
+        try:
+            self.call("POST", "/api/reviews/undo", {"op": op})
+            self.fail("同一条评分不能撤销两次")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
+    def test_25_focus_endpoints(self):
+        start = self.call("POST", "/api/focus/start", {"minutes": 25})["data"]
+        self.assertTrue(start["session"])
+        done = self.call("POST", "/api/focus/finish",
+                         {"session": start["session"], "minutes": 25})["data"]
+        self.assertEqual((done["sessions"], done["minutes"]), (1, 25))
+        self.assertEqual(self.call("GET", "/api/focus")["data"]["minutes"], 25)
+        again = self.call("POST", "/api/focus/finish",
+                          {"session": start["session"], "minutes": 25})["data"]
+        self.assertTrue(again["duplicate"])
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.call("POST", "/api/focus/finish", {"minutes": 25})
+        self.assertEqual(ctx.exception.code, 400)
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")

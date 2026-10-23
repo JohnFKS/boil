@@ -74,6 +74,7 @@ export async function render(el, ctx, params) {
         <div id="review-card-slot"></div>
       </div>
       <aside class="review-side">
+        <div class="card" id="last-review" style="display:none"></div>
         <div class="card queue-card">
           <div class="between">
             <span class="side-label">本轮队列</span>
@@ -394,12 +395,41 @@ export async function render(el, ctx, params) {
       rated += 1;
       index += 1;
       toast(`下一次：${res.result?.interval_label || "已安排"}`, "success", 2600);
+      showUndo(res.undo);
       busy = false;
       renderCard();
     } catch (e) {
       busy = false;
       toast(e.message || "评分失败", "error");
     }
+  }
+
+  function showUndo(undo) {
+    const box = el.querySelector("#last-review");
+    if (!box || !undo) return;
+    const label = (RATINGS.find(r => r.value === Number(undo.rating)) || {}).label || undo.rating;
+    const before = undo.mastery_before === null || undo.mastery_before === undefined
+      ? "首评" : pct(undo.mastery_before);
+    box.style.display = "block";
+    box.innerHTML = `
+      <div class="between"><span class="side-label">刚才这次</span>
+        <span class="faint tiny">${escapeHTML(undo.interval_label || "")}</span></div>
+      <p class="small mt-1">${escapeHTML(label)} · 掌握度 ${before} → ${pct(undo.mastery_after || 0)}</p>
+      <button class="link-btn" type="button" data-undo-review>撤销这次评分</button>`;
+    box.querySelector("[data-undo-review]").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "撤销中…";
+      try {
+        const res = await ctx.api.post("/api/reviews/undo", { op: undo.op });
+        toast(res.note || "已撤销这次评分", "success", 4200);
+        await ctx.refreshView();
+      } catch (err) {
+        toast(err.message || "撤销失败", "error", 5200);
+        btn.disabled = false;
+        btn.textContent = "撤销这次评分";
+      }
+    });
   }
 
   el.querySelector("[data-queue-select]")?.addEventListener("click", applyOnlySelected);
