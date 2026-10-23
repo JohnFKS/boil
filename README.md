@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-182%20passing-38d6bd?style=flat-square)](#测试)
+[![Tests](https://img.shields.io/badge/tests-184%20passing-38d6bd?style=flat-square)](#测试)
 [![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
@@ -162,6 +162,7 @@ python3 run.py
 - **撤销评分**：评完分的卡片旁边会出现「刚才这次」——几分钟后再见、掌握度从多少到多少——点一下就能整条撤销：卡片状态、掌握度、复习日志、回忆、火候记录一起回到评分前。只允许撤该单元最近一次（后来的复习会让快照失效），同一次不能撤两遍。
 - **专注（番茄钟）**：顶栏「专注」可选 15 / 25 / 45 分钟，倒计时刷新后也不会丢；走完自动记账，提前结束明确「不计入学习时长」——完成才进热力图。
 - **触摸端划词**：手指拖选结束后浮条自己出现在选区上方（不再跟着拖选柄乱跳），窄屏会换行而不是溢出屏幕；用 `-webkit-touch-callout` 让系统长按菜单让位给自己的工具条。
+- **跨公式的引文**：划选里带公式时，引文会存成可读的 `$TeX$`（不是 KaTeX 的 MathML 乱码），并额外记一个「去公式可见文本」锚点；重新打开单元页，公式两侧的文字照样点亮（公式本身不动），追问的上下文也换成同一套可读文本。
 - **回忆记录**：复习时写的回忆会存成 `attempts(kind=review_recall)`，单元页的「我的回忆记录」按时间倒序列出最近几条原文与得分，方便对照自己前后的说法；它和探测题作答分开计数。
 - **复习队列侧栏**：本轮队列可视、点一行就跳到那张卡、勾选后「只练选中」、还能「提前加卡」把未到期的卡加进来练；已完成的划线变灰。
 - **键盘优先**：空格翻面、1–4 评分、`/` 或 ⌘K 搜索；输入框里打字与浮层打开时不抢键。
@@ -447,7 +448,7 @@ python3 -m boil.mcp_server
 ## 测试
 
 ```bash
-# 182 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格测试（stdlib unittest）
+# 184 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 

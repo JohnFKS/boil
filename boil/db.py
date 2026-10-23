@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS notes (
   kind TEXT NOT NULL DEFAULT 'inspiration',
   quote TEXT NOT NULL DEFAULT '',
   content TEXT NOT NULL DEFAULT '',
+  anchor_json TEXT NOT NULL DEFAULT '{}',
   source TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -316,6 +317,7 @@ EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "cards": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'")],
     "review_logs": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'"),
                     ("missed_points", "INTEGER NOT NULL DEFAULT 0")],
+    "notes": [("anchor_json", "TEXT NOT NULL DEFAULT '{}'")],
 }
 
 

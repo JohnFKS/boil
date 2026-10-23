@@ -1,5 +1,6 @@
 /* 划词菜单：在可复制的内容上选中文字或右键，把灵感存进笔记。 */
 import { escapeHTML, icon, toast, aiEnabled, aiFailure, aiSuccess } from "./utils.js";
+import { anchorForRange, cleanRangeText, readableText } from "./quoteHighlight.js";
 
 const MIN_CHARS = 4;
 const MAX_CHARS = 2000;
@@ -28,9 +29,13 @@ function activeContainer() {
   if (!container) return null;
   const rect = range.getBoundingClientRect();
   if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+  // 跨公式的选区：selection.toString() 是 MathML + 字形混杂的乱码，换成可读的 $TeX$
+  const clean = cleanRangeText(range);
+  if (!clean.text || clean.text.trim().length < MIN_CHARS || clean.text.length > MAX_CHARS) return null;
   const unitHost = element.closest("[data-unit-id]");
   return {
-    text,
+    text: clean.text,
+    anchor: clean.hasMath ? anchorForRange(range, container) : null,
     rect,
     container,
     unitId: (unitHost && unitHost.dataset.unitId) || container.dataset.unitId || "",
@@ -108,8 +113,9 @@ export function initSelectionMenu(ctx) {
   }
 
   function anchorContext(state) {
-    // 只给模型选中位置前后各约 800 字，不整篇塞进去
-    const full = (state.container?.innerText || state.text).replace(/[ \t]+\n/g, "\n");
+    // 只给模型选中位置前后各约 800 字，不整篇塞进去。
+    // 用 readableText（公式是 $TeX$）而不是 innerText：后者混着 MathML，indexOf 对不上。
+    const full = (readableText(state.container) || state.text).replace(/[ \t]+\n/g, "\n");
     const at = full.indexOf(state.text);
     if (at < 0) return full.slice(0, 1600);
     return full.slice(Math.max(0, at - 800), Math.min(full.length, at + state.text.length + 800));
@@ -292,6 +298,7 @@ export function initSelectionMenu(ctx) {
         content,
         unit_id: current.unitId || undefined,
         source: current.source || undefined,
+        anchor: current.anchor || undefined,
       });
       hideAll();
       const sel = window.getSelection();

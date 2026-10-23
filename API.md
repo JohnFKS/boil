@@ -228,9 +228,12 @@ GET  /api/notes/export                    下载 boil-notes.md
   "quote": "提取一次，记忆痕迹就被强化一次",
   "content": "可以用作每天早上第一个自测题。",
   "unit_id": "u_…（可选，不属于任何单元时省略）",
-  "source": "unit"
+  "source": "unit",
+  "anchor": {"search": "去公式可见文本", "occurrence": 0}
 }
 ```
+
+`anchor` 可选，只在选区跨过 KaTeX 公式时才有：KaTeX 渲染出来的 DOM 文本与 `selection.toString()` 对不上（后者混着 MathML、annotation 与两遍字形），所以前端把选区里的公式换成 `$TeX$` 存进 `quote`，另外存一段「去掉公式后的可见文本」和它在本页出现的序号。列表里只回 `{search, occurrence}`，内部的 `anchor_json` 不外泄；`search` 少于 4 字不存（没有消歧价值），`occurrence` 夹在 0–40。
 
 - `quote` 与 `content` 至少要有一个非空，否则 `bad_request`。
 - 长度上限：`quote` 2000 字、`content` 4000 字，超出会被截断而不是报错。

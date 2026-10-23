@@ -1313,6 +1313,34 @@ class ServiceTest(TempCase):
         with self.assertRaises(ValueError):
             services.focus_finish(self.db, "local", "", 25)
 
+    def test_note_anchor_roundtrip_and_sanitizing(self):
+        """跨公式的引文要存一个「去公式可见文本」锚点，对外不暴露内部列。"""
+        self.onboard()
+        created = services.create_note(self.db, "local", {
+            "quote": "当 $x \\to 0$ 时，$\\sin x \\sim x$，这是等价无穷小替换",
+            "content": "跨公式选中",
+            "anchor": {"search": "时，这是等价无穷小替换", "occurrence": 3},
+        })
+        self.assertEqual(created["note"]["anchor"],
+                         {"search": "时，这是等价无穷小替换", "occurrence": 3})
+        self.assertNotIn("anchor_json", created["note"], "内部列不该外泄")
+        listed = services.list_notes(self.db, "local")["notes"][0]
+        self.assertEqual(listed["anchor"]["occurrence"], 3)
+        short = services.create_note(self.db, "local", {
+            "quote": "太短的锚点没有消歧价值", "content": "",
+            "anchor": {"search": "ab", "occurrence": 1},
+        })
+        self.assertNotIn("anchor", short["note"])
+        clamped = services.create_note(self.db, "local", {
+            "quote": "另一条引文内容", "content": "",
+            "anchor": {"search": "另一条引文内容", "occurrence": 999},
+        })
+        self.assertEqual(clamped["note"]["anchor"]["occurrence"], 40, "序号要夹住")
+        export = services.export_data(self.db, "local")
+        exported = [n for n in export["notes"] if n["id"] == created["id"]][0]
+        self.assertIn("时，这是等价无穷小替换", exported.get("anchor_json") or "",
+                      "锚点要随导出/导入一起走")
+
     def test_notes_backup_and_semantic_search(self):
         out = self.onboard()
         unit_id = out["next_units"][0]["id"]

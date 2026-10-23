@@ -336,14 +336,16 @@ export async function render(el, ctx, params) {
     if (!main) return;
     // 等 renderMath 落地：KaTeX 生成的节点要跳过，否则会把公式源码当普通文字标注
     await new Promise(resolve => requestAnimationFrame(() => resolve()));
-    const marks = highlightQuotes(main, notes.map(n => ({
+    const hl = highlightQuotes(main, notes.map(n => ({
       text: n.quote,
+      search: n.anchor?.search,
+      occurrence: n.anchor?.occurrence,
       title: n.content ? `你的灵感：${n.content}` : "你存过的灵感",
     })));
-    if (!marks) return;
+    if (!hl.marks) return;
     const tip = document.createElement("div");
     tip.className = "note-hl-tip";
-    tip.innerHTML = `${icon("spark", 12)} <span>已在原文里标出 ${marks} 处灵感引文（这个单元存了 ${notes.length} 条）</span>`;
+    tip.innerHTML = `${icon("spark", 12)} <span>已标出 ${hl.marks} 段原文（来自 ${hl.quotes} 条灵感；跨公式的引文会被公式拆成几段）</span>`;
     main.insertBefore(tip, main.firstChild);
   })();
 

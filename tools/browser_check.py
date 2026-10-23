@@ -734,6 +734,81 @@ def main():
             errors.append(f"灵感引文没有高亮: {hl}")
         shot("unit-note-highlight.png")
 
+        # F12：跨公式的选区要存可读引文 + 锚点，重新打开还能高亮
+        math_id, math_note = "unit-browser-math", ""
+        try:
+            live_goal = (api("/api/dashboard")["data"].get("goal") or {}).get("id")
+            with _sq.connect(str(db_path), timeout=15) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO units (id, goal_id, pack_id, pack_unit_id, title,"
+                    " essence, steps_json, boundaries_json, misconceptions_json, faq_json,"
+                    " tags_json, key_points_json, order_index, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (math_id, live_goal, "browser.math", math_id, "等价无穷小替换",
+                     "用等价无穷小替换乘法因子，是求极限最省力的一步。",
+                     json.dumps(["先确认是乘除结构。",
+                                 "当 $x \\to 0$ 时，$\\sin x \\sim x$，这是常用起点。"],
+                                ensure_ascii=False),
+                     "[]", "[]", "[]", "[]", "[]", 901,
+                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                conn.commit()
+            goto(f"#/unit/{math_id}")
+            wait_for(".katex", None, 10)
+            evaluate(
+                "(()=>{const li=[...document.querySelectorAll('.unit-section li')]"
+                ".find(x=>x.textContent.includes('常用起点'));"
+                "const r=document.createRange();r.selectNodeContents(li);"
+                "const s=getSelection();s.removeAllRanges();s.addRange(r);})()")
+            time.sleep(0.8)
+            evaluate("document.querySelector('[data-sel=\"note\"]')?.click()")
+            time.sleep(0.5)
+            evaluate("document.querySelector('#sel-note').value='跨公式的回归探针';")
+            if not real_click("[data-note-save]"):
+                errors.append("跨公式笔记的保存按钮点不到")
+            else:
+                time.sleep(1.4)
+                saved = evaluate(
+                    "(async()=>{const r=await fetch('/api/notes');const j=await r.json();"
+                    "const n=j.data.notes.find(x=>x.content==='跨公式的回归探针');"
+                    "return n?{id:n.id, quote:n.quote, anchor:n.anchor||null}:null})()")
+                if not saved or not saved.get("id"):
+                    errors.append(f"跨公式的笔记没存下: {saved}")
+                else:
+                    math_note = saved["id"]
+                    quote_text = saved.get("quote") or ""
+                    if "$" not in quote_text or "\\sin x" not in quote_text:
+                        errors.append(f"跨公式引文没有换成 TeX: {quote_text[:80]}")
+                    if "𝑥" in quote_text or "\n" in quote_text:
+                        errors.append(f"跨公式引文仍带着 MathML 噪声: {quote_text[:80]}")
+                    if not (saved.get("anchor") or {}).get("search"):
+                        errors.append(f"跨公式笔记没有锚点: {saved}")
+                    goto("#/dashboard")
+                    time.sleep(0.4)
+                    goto(f"#/unit/{math_id}")
+                    time.sleep(2.4)
+                    hl = evaluate(
+                        "(()=>{const m=[...document.querySelectorAll('.note-hl')];"
+                        "return {marks:m.length, tip:!!document.querySelector('.note-hl-tip'),"
+                        " text:m.map(x=>x.textContent).join('|').slice(0,60)}})()")
+                    if not hl or hl.get("marks", 0) < 1 or not hl.get("tip"):
+                        errors.append(f"跨公式引文没有重新高亮: {hl}")
+                    else:
+                        print(f"  math highlight: {hl['marks']} 段，{hl.get('text')[:34]}")
+        except Exception as exc:
+            errors.append(f"跨公式高亮回归没跑成: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                if math_note:
+                    api("/api/notes/delete", {"id": math_note})
+                with _sq.connect(str(db_path), timeout=15) as conn:
+                    conn.execute("DELETE FROM units WHERE id=?", (math_id,))
+                    conn.commit()
+            except Exception as exc:
+                print("math seed cleanup warning:", exc, file=sys.stderr)
+            goto(f"#/unit/{unit_id}")
+            wait_for(".essence-text", "一句话本质", 10)
+
         # P3-12：触摸端 —— 手指拖选结束后浮条要自己出来，且不能超出屏幕
         call("Emulation.setDeviceMetricsOverride",
              {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True})

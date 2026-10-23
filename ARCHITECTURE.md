@@ -369,6 +369,8 @@ score = old * (1 - alpha) + evidence * alpha
 
 引用存的是**文字快照而不是字符偏移**，因此材料重排、单元重新安装都不会让笔记失效。单元页渲染完成后由 `static/js/quoteHighlight.js` 把引文在正文里出现的位置全部高亮（`<mark class="note-hl">`）：TreeWalker 建坐标 → 找全部匹配 → 丢弃重叠 → **倒序**逐个用 `Range.surroundContents` 包裹（逆序可避免前面的偏移被自己的改动破坏），并跳过 `code / pre / .katex` 子树；`box-decoration-break: clone` 让跨行高亮不断色。
 
+**公式（F12）**：`selection.toString()` 跨过 KaTeX 时返回的是 MathML + annotation + 两遍字形混杂的乱码（实测 `'当 \n𝑥\n→\n0\nx→0 时…'`），既不值得存也没法匹配。所以保存时先把克隆选区里的 `.katex` 换成 `$TeX$`（取自 `annotation[encoding="application/x-tex"]`）得到可读引文；同时用同一套 TreeWalker 坐标算出「去公式可见文本」的切片与它的出现序号，存进 `notes.anchor_json`。高亮时优先用这个锚点定位（只点亮那一处），失效才退回引文原文；被公式隔开的文字会落成几段 `<mark>`，公式本身不动——不往 KaTeX 的 DOM 里插节点。返回 `{marks, quotes}` 两个数，提示条写「已标出 N 段（来自 M 条灵感）」。追问的上下文也从 `innerText` 改成同样的 `$TeX$` 文本，`indexOf` 才对得上。
+
 ## 8. LLM 网关
 
 `llm.py` 是唯一模型出口：

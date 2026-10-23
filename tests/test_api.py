@@ -696,6 +696,16 @@ class ApiTest(unittest.TestCase):
             self.call("POST", "/api/focus/finish", {"minutes": 25})
         self.assertEqual(ctx.exception.code, 400)
 
+    def test_26_note_anchor_over_http(self):
+        note = self.call("POST", "/api/notes", {
+            "quote": "当 $x \\to 0$ 时，这是等价无穷小替换",
+            "content": "HTTP 锚点",
+            "anchor": {"search": "这是等价无穷小替换", "occurrence": 0},
+        })["data"]
+        self.assertEqual(note["note"]["anchor"]["search"], "这是等价无穷小替换")
+        listed = self.call("GET", "/api/notes")["data"]["notes"]
+        self.assertTrue(any(n.get("anchor", {}).get("occurrence") == 0 for n in listed))
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")

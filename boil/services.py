@@ -494,10 +494,21 @@ def list_notes(db: Database, user_id: str, unit_id: str | None = None,
     rows = db.query(sql, params)
     for r in rows:
         r["chars"] = len(r.get("content") or "") + len(r.get("quote") or "")
+        _note_anchor(r)
     goal = active_goal(db, user_id)
     return {"notes": rows, "total": db.scalar(
         "SELECT COUNT(*) FROM notes WHERE user_id=?", (user_id,), 0) or 0,
         "goal_id": goal["id"] if goal else None}
+
+
+def _note_anchor(row: dict[str, Any]) -> dict[str, Any]:
+    """anchor_json 是内部列：对外只给解析后的 {search, occurrence}。"""
+    raw = row.pop("anchor_json", "{}")
+    anchor = json_loads(raw or "{}", {})
+    if isinstance(anchor, dict) and anchor.get("search"):
+        row["anchor"] = {"search": anchor["search"],
+                         "occurrence": int(anchor.get("occurrence") or 0)}
+    return row
 
 
 def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -512,13 +523,24 @@ def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str
     source = str(payload.get("source") or "").strip()[:40]
     if source not in NOTE_SOURCES:
         source = ""
+    anchor = payload.get("anchor")
+    anchor_out: dict[str, Any] = {}
+    if isinstance(anchor, dict):
+        search = str(anchor.get("search") or "")[:4000]
+        try:
+            occurrence = int(anchor.get("occurrence") or 0)
+        except (TypeError, ValueError):
+            occurrence = 0
+        if len(search.strip()) >= 4:
+            anchor_out = {"search": search, "occurrence": max(0, min(occurrence, 40))}
     ts = now_iso()
     note_id = new_id("no")
     db.insert("notes", {
         "id": note_id, "user_id": user_id,
         "goal_id": str(payload.get("goal_id") or "").strip()[:80] or (goal["id"] if goal else None),
         "unit_id": unit_id, "kind": "inspiration",
-        "quote": quote, "content": content, "source": source,
+        "quote": quote, "content": content, "anchor_json": json_dumps(anchor_out),
+        "source": source,
         "created_at": ts, "updated_at": ts,
     })
     emit(db, "note.created", {"note_id": note_id, "unit_id": unit_id, "source": source,
@@ -526,7 +548,7 @@ def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str
     row = db.one("SELECT n.*, u.title AS unit_title FROM notes n "
                  "LEFT JOIN units u ON u.id = n.unit_id WHERE n.id=? AND n.user_id=?",
                  (note_id, user_id))
-    return {"note": row, "id": note_id}
+    return {"note": _note_anchor(dict(row)) if row else None, "id": note_id}
 
 
 def delete_note(db: Database, user_id: str, note_id: str) -> dict[str, Any]:
