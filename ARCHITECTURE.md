@@ -35,7 +35,10 @@ boil/
 │   ├── heat.py               # T 温度 / PN 缺口 / BoilRecord
 │   ├── advisor.py            # 强度阶梯推荐器 v0（规则 + 理由 + 成本）
 │   ├── embeddings.py         # 云端/本地向量：语义分组/搜索/相关单元
-│   ├── backup.py             # 完整备份导入（表/列白名单）
+│   ├── backup.py             # 完整备份导入（表/列白名单）+ 导入前 SQLite 快照
+│   ├── quality.py             # 编译产物质检：确定性检查 + 残差交给模型
+│   ├── markdown_fix.py        # 粘贴清洗：只形状归一，不改写内容
+│   ├── styles.py              # 学习风格测试 → 教学人设 → 提示词注入
 │   ├── mcp_server.py         # MCP stdio 服务（13 个工具）
 │   ├── socratic.py            # 苏格拉底状态机 + 流式 + 报告
 │   ├── feynman.py             # 费曼六维评分 + 缺口
@@ -44,10 +47,12 @@ boil/
 │   ├── srs/fsrs.py            # FSRS-5 四档调度
 │   └── config.py / utils.py
 ├── content/packs/             # 内置内容包
-├── prompts/                   # 苏格拉底 / 费曼 / 编译器 / 元信息 / 洞察解读提示词
+├── prompts/                   # 苏格拉底 / 费曼 / 编译器（整篇·大纲·分批）/ 元信息 / 速记 / 卡片 / 追问 / 洞察解读
 ├── static/                    # 自研 SPA（无构建链）+ 本地 KaTeX
-│   └── js/selectionMenu.js    # 全局划词浮条 + 右键菜单 → 灵感笔记
-├── tests/                     # unittest：核心 / API / LLM / live
+│   ├── js/selectionMenu.js    # 全局划词浮条 + 右键菜单 → 灵感 / 做卡片 / 问 AI
+│   ├── js/quoteHighlight.js   # 引文快照在单元页重现（TreeWalker + 逆序包裹）
+│   └── js/styleTest.js        # 5 题风格测试弹窗 → 写入目标人设
+├── tests/                     # unittest：核心 / API / LLM 网关 / 质检 / 风格 / 粘贴清洗 / live
 ├── tools/                     # examgen 导入器、浏览器验收
 ├── data/                      # 运行时数据（gitignore）
 ├── Dockerfile / compose / Makefile
@@ -68,7 +73,7 @@ boil/
 - **T / PN / BoilRecord**：火候状态、必要步骤缺口、每次模式尝试的前后温度与结果。
 - **Advice**：一个带理由、成本、目标与档位的下一步建议；采纳/否决进入事件日志。
 - **UnitNote**：速记/笔记，来自 mem 的速记与批注思路。
-- **Backup**：带白名单的完整 JSON 导出/导入；API Key 永不进入备份；另有只读的 Anki 制表符导出。
+- **Backup**：带白名单的完整 JSON 导出/导入；API Key 永不进入备份；另有只读的 Anki 制表符导出。`mode=replace` 的清库与写入共享一个事务（`reset_user(commit=False)`），插入失败整体回滚，不留空库。
 - **MCP Tools**：把同一批服务用例以 stdio JSON-RPC 暴露给 agent，不复制业务逻辑。
 - **Event**：所有上述行为的追加式记录。
 
@@ -127,6 +132,8 @@ POST /api/onboarding
   → 返回 dashboard（含 digest，前端据此渲染「材料总览」卡）
 ```
 
+SSE 断线不重打一遍：`stream_reply(retry=True)` 会比对最后一条用户消息，同一句话不重复入库、不白涨轮次；前端断开后先 `GET /api/socratic/{id}` 看回答是否已落库——落了就直接显示，没落才带 `retry` 退避重发（最多一次），仍失败则给出「再试一次」。
+
 呈现纪律：凡是 AI 生成的内容（总览、大纲、阶段、单元 angle、洞察解读），响应里都带
 `source`/`generated_by` 字段，前端渲染成「AI 分析」或「本地规则」badge。规则回退绝不冒充模型输出。
 
@@ -181,9 +188,11 @@ POST /api/feynman/evaluate
 GET /api/review
   → cards due_at <= now（新卡也进入队列）
   → 每张卡用同一 Scheduler.preview 生成四档间隔
+前端：翻面前先写「回忆」草稿 → 翻面后草稿排在标准答案上方做对照
 POST /api/review/{card}
   → Scheduler.schedule
   → cards 更新 + review_logs 插入
+  → recall 非空时 attempts 插入（kind="review_recall"，空白不写，不占 probe_id）
   → evidence(recall)
   → event: review.rated
 ```
@@ -194,6 +203,70 @@ FSRS-5：
 - 新卡 → learning 短步；review → 长间隔；again → relearning。
 - `preview` 与真实 `schedule` 共用逻辑，避免 UI 显示与实际到期漂移。
 - 目标保留率 0.9；最大间隔 100 年；保留率只用于显示与调度，不对外宣称“预测准确”。
+- **记忆健康度**（洞察页）= 全部 `state != 'new'` 卡片此刻的 `retrievability` 均值，直接复用 `Scheduler.retrievability`，不复制公式。它和「30 天保留率」是两件事：后者是历史答对率，前者是当下还能提取多少；无已学卡片时返回 `null` 而不是编一个数。
+
+### 4.5 速记与口诀
+
+```
+POST /api/units/{id}/mnemonic
+  → 服务端读 units 的 essence/steps/boundaries/misconceptions 组提示词
+  → llm.chat_json（prompts/mnemonic.md：只给记忆钩子，禁止复述与新增知识）
+  → 清洗：去重、≥4 字、每条 ≤60 字、最多 3 条
+  → 返回给前端，不写库
+用户确认「填进速记」→「保存速记」→ unit_notes(kind='mnemonic')
+  → 复习队列与卡片正面把它作为提取线索透出
+```
+
+AI 只给候选，落库由人决定；未配置模型时入口不渲染，服务端还会挡一层 `503`。
+
+### 4.6 复习增强：回忆、错因与提前加卡
+
+- 翻面前写「回忆」草稿 → 翻面后草稿排在标准答案上方做对照 → 随评分写入 `attempts(kind="review_recall")`（与探测题作答分开计数）。
+- 评分 1/2 时要求标错因（6 类固定 taxonomy），只拦一次、可跳过；标签写进 `review_logs.mistake_tags_json` 与卡片，答对则清空卡片上的旧标签。洞察页 `mistakes` 给分布与样本量。
+- 队列侧栏：跳转任意一张卡、勾选后「只练选中」（重排不改已做部分）、「提前加卡」用 `GET /api/cards` 从全量卡片里挑未到期的加进本轮。
+
+### 4.7 质检与合并（借鉴 examgen）
+
+```
+compile_material(_batched)
+  → normalize（补齐缺失的探针类型）
+  → quality.qa_pack
+       lint_pack         确定性：空本质 / 重复标题 / 步骤混数字 / 缺探针 / 正反面相同 / 近似重复对
+       apply_safe_repairs 只打安全补丁；补丁 == 原文则跳过（qa-skip，保护版本号与缓存键）
+       find_near_duplicates 两路候选：字面近乎逐字（0.82）或云端语义进候选带（0.74）
+       judge_residual / judge_pair  只把疑似重复交给模型判定；失败降级并留 note
+```
+
+### 4.7.1 重复裁决阶梯（阈值来自实测，且被真实模拟推翻过一次）
+
+用硅基流动 `BAAI/bge-m3`（1024 维）实测。**文本口径决定一切**：
+
+| 口径 | 真重复 | 最危险的假对 | 同主题其它对 |
+|---|---|---|---|
+| 标题 + 本质（`quality.dup_text`） | 0.870 | 0.797（提取练习 / 测试即学习） | 0.62–0.75 |
+| 完整 `unit_text`（含步骤/边界/要点） | 0.795 | **0.813**（间隔 / 测试） | 全部挤在 0.76–0.81 |
+
+完整口径下真重复排在假候选**之后**——所以检测只看标题+本质。即便如此，0.870 与 0.797 只差 0.07，一条阈值线分不开，于是：
+
+| 依据 | 条件 | 结果 |
+|---|---|---|
+| `lexical` | 字面 ≥ 0.62 | 代码放行 |
+| `model` | 语义 ≥ 0.74 **且**模型 `same: true` **且**请求带 `confirmed: true` | 放行 |
+| `user` | 以上都不够，`override: true` + 理由 ≥ 4 字 | 放行，`merged_reason` 记「学习者确认：<原话>」 |
+| 拒绝 | 都不满足且没署名 | 报错，把两个分数与合并线一起说清楚 |
+
+**语义分不再单独授权合并**（第一版给它设了 0.80 自动线，被完整真实模拟否掉：8 个单元的包里一次跳出 9 对候选、7 次模型判定，还把「间隔效应」和「测试即学习」判成可合并）。配套两条护栏：判定按分数排序且一次请求最多判 `JUDGE_LIMIT=3` 对，其余标 `pending_judgement`，用户点合并时才判（同一问法 → 命中内容寻址缓存）；打开地图页因此不会变成烧钱。
+
+另外两个由实测钉死的细节：模型对中间带同一对会**翻**（真实模拟里，候选列表刚说「不可合并」，端点自己再问一次就改判 `same=true` 并真的合了库），所以判定问法按单元 id 定序让两次共用同一提示词（缓存开着时同源），并且**非字面证据的合并在服务端强制要求 `confirmed`**——确认这件事不能只写在前端；嵌入不可用时 `semantic` 一律 `null`，阶梯退化为字面 + 署名，**绝不拿本地哈希向量冒充语义分**。
+
+合并语义：**单元不删除，只改指向归宿**。`units.merged_into` + `merged_reason`；`map_data` 与 `_next_units` 过滤被吸收的单元；`unit_detail` 返回 `merged_into` / `absorbed`；relations 自动重连到归宿（自环与重复边清掉）；卡片留在原单元继续到期，因此复习进度不丢。链式合并沿 `merged_into` 走到最终归宿（上限 12 跳），互相合并/成环被拒绝。
+
+### 4.8 长材料与风格测试
+
+- 材料 >24k 字符：先 `_skeleton`（每节标题 + 首句）出大纲与总览，再按 `_batch_sections` 分批（每批 ≤7k）逐批出单元；模型只给内容，**切片由代码做**（`_slice_at_anchors` 按逐字锚点切，锚点必须原样存在于正文，否则不切）。
+- 单次调用上限 `SINGLE_CALL_LIMIT = 6000`（原 24,000）：实测 8.6k 字材料能出可用 JSON，10.2k 字就在尾部被截成 `"difficulty":4,":5,":":40"`，能否修复成掷硬币；上限按真实输出能力定，不按上下文长度定。模型直接回一个单元数组时 `_normalize_llm_units` 也会接受，不再误判成本地编译。
+- 装不下预算的小节由 `_chunk_section` 无损切开（空行 → 句号 → 硬切，再把小块装回预算内），**没有任何字符被丢弃**；单元数超过上限（单次 10、分批 40）会写进 `warnings` 而不是静默吞掉。内容是「模型读完了全部材料」这句承诺的兑现处，截断必须吭声。
+- 风格测试在 `boil/styles.py`：5 题 × 3–4 选项，选项带 persona 权重；`questions_payload()` 故意不返回权重。人设写进 `goals.meta_json.persona`，`styles.persona_block_for(db, goal_id)` 渲染成提示词片段注入苏格拉底与费曼（放这里是因为这两个模块都不能 import services——会成环）。
 
 ## 5. 火候、PN 与 Advisor
 
@@ -286,7 +359,7 @@ score = old * (1 - alpha) + evidence * alpha
   → 事件 boil:note-saved → #/notes 视图自动刷新
 ```
 
-引用存的是**文字快照而不是字符偏移**，因此材料重排、单元重新安装都不会让笔记失效（后续 E2 会按引文在单元页把所有出现位置高亮出来）。
+引用存的是**文字快照而不是字符偏移**，因此材料重排、单元重新安装都不会让笔记失效。单元页渲染完成后由 `static/js/quoteHighlight.js` 把引文在正文里出现的位置全部高亮（`<mark class="note-hl">`）：TreeWalker 建坐标 → 找全部匹配 → 丢弃重叠 → **倒序**逐个用 `Range.surroundContents` 包裹（逆序可避免前面的偏移被自己的改动破坏），并跳过 `code / pre / .katex` 子树；`box-decoration-break: clone` 让跨行高亮不断色。
 
 ## 8. LLM 网关
 
@@ -298,9 +371,16 @@ score = old * (1 - alpha) + evidence * alpha
 - 认证：默认 `Authorization: Bearer`；支持自定义头名与前缀（Dots 使用 `api-key`）。
 - 高级请求体：`extra_body` 可合并 `chat_template_kwargs` 等供应商参数，不覆盖核心字段。
 - 失败：HTTP / 网络 / 空正文 / 非法 JSON 都有显式错误；`llm_state.json` 记录最近错误。
-- JSON 修复：去除代码围栏、截取首尾括号、去尾逗号。
+- 重试策略：`408/409/429/5xx` 指数退避；`400` 且提示 `response_format` 时去掉该参数降级重试；`finish_reason == "length"` 时把 `max_tokens` 提到 `max(4×, +800)`（上限 32000）重发一次，而不是把半截 JSON 交给业务层——**只有在我们自己设过 max_tokens 时才加额**，否则会凭空压低网关默认上限。
+- JSON 修复：去除代码围栏后做**括号配平扫描**（跳过字符串内的括号与转义），优先取第一个完整值；不完整时按未闭合栈补 `]}"` 再试；最后才退回尾逗号清理与 rfind 兜底。
+- 垃圾输出守卫：模型只回 `undefined/null/无/…` 这类占位字符串时判为失败（`junk_output`），不写进卡片、速记或笔记。
+- 内容寻址缓存：`chat_json` 按 `sha256(网关+模型+messages+温度+max_tokens)` 落盘 `data/llm_cache/`，命中复用原始文本再解析（所以解析器改进会 retroactively 生效）。网关地址进键是为了同名模型换服务商时不复用另一家的输出。只缓存结构化调用——流式对话带会话状态，缓存它等于伪造回答。
+- 缓存不固化失败：**解析成功才写盘**，命中坏条目时删掉它再走真实调用。否则一次截断输出会让同一个请求永久报错。可在设置页关闭或清空，`public_config()` 暴露 calls/hits/entries。
 - 无 Key：业务层走本地演示引擎，不在网关里伪造模型回答。
 - 真实模型失败：苏格拉底会显示“已切换到本地演示引擎”，报告会带 demo 标记；不会静默冒充 live。
+- AI 入口三态（前端 `utils.js`）：未配置 = **完全不渲染**（不是置灰）；可用 = 渲染；连续 2 次失败 = 熔断隐藏并提示已切本地模式。复习、苏格拉底、费曼、洞察主流程永不因网关挂掉而卡住。
+- 上游始终流式：`chat()` 默认用 `stream_upstream` 以 `stream:true` 请求上游、把分片拼回非流式形状再交给 `_extract_message`，避开思考型模型长推理被空闲网关 504；网关不认 `stream` 时按普通 JSON 原样返回。可用设置里的开关关掉。
+- 诊断可行动：网络异常按 `__cause__` 链归类为 dns / refused / timeout / tls / proxy / network，HTTP 状态码有建议表，回显的服务端内容先掩码（`sk-…`、`Bearer …`）再落盘与回传；`last_error` 带 base_url、模型与掩码 Key，设置页可一键复制整段诊断。
 
 ## 9. 前端
 
@@ -347,8 +427,8 @@ score = old * (1 - alpha) + evidence * alpha
 - HTTP：REST、SSE、静态资源、错误码、包导入/编译。
 - LLM：本地假端点的普通/流式/JSON/失败可见。
 - live 服务：假端点返回符合 schema 的报告/评分/内容包。
-- 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。
-- 备份：导出 → 合并导入 → 目标/单元/卡片/火候记录/速记一致。
+- 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。浮层必须用 CDP 真实鼠标事件走一遍（`real_click`）：`element.click()` 不派发 mousedown，「点外部关闭」这类 document 级逻辑用合成点击永远测不到——划词面板曾被自己的 hideAll 抢关，29 张截图全绿也发现不了。
+- 备份：导出 → 合并导入 → 目标/单元/卡片/火候记录/速记一致；替换导入中途插入失败要整体回滚，不许留下被清空的库。
 - Notes：速记保存 → 复习队列带出 mnemonic。
 - Embeddings：本地/云端语义分组、语义搜索、相关单元召回；批量、缓存、失败冷却、降级与错误可见。
 - 数学：数学包公式内容 + KaTeX 本地资源；真实浏览器检查 `.katex`。

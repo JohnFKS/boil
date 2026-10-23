@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -10,11 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import backup, compiler, config, embeddings, feynman, llm, mastery, planner, services, socratic
+from boil import (backup, compiler, config, embeddings, feynman, llm, mastery,
+                    planner, quality, services, socratic)
 from boil.compiler import compile_heuristic, compile_material
 from boil.db import Database, SCHEMA_VERSION
 from boil.packs import (all_available_packs, install_pack, validate_pack)
 from boil.srs.fsrs import Scheduler, interval_label
+from boil.utils import now_iso
 
 UTC = timezone.utc
 PACK_ID = "boil.xueshen.learning"
@@ -270,10 +273,10 @@ class AiPathTest(TempCase):
 
     def setUp(self):
         super().setUp()
-        self._llm_old = (llm.enabled, llm.chat_json)
+        self._llm_old = (llm.enabled, llm.chat_json, llm.chat, llm.load_prompt)
 
     def tearDown(self):
-        llm.enabled, llm.chat_json = self._llm_old
+        llm.enabled, llm.chat_json, llm.chat, llm.load_prompt = self._llm_old
         super().tearDown()
 
     def test_suggest_meta_model_path(self):
@@ -338,6 +341,460 @@ class AiPathTest(TempCase):
         self.assertEqual(errors, [])
 
 
+    def test_mnemonic_model_path_and_cleaning(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: True
+        seen = {}
+
+        def fake(messages, **kw):
+            seen["prompt"] = messages[1]["content"]
+            return {"mnemonics": ["  提取=合上书讲出来 ", "太短", "类比：肌肉记忆", "x" * 90],
+                    "note": "用了定义式与类比两种手法"}
+        llm.chat_json = fake
+        res = services.generate_mnemonic(self.db, "local", unit_id)
+        self.assertEqual(res["source"], "model")
+        self.assertEqual(res["mnemonics"][0], "提取=合上书讲出来")
+        self.assertNotIn("太短", res["mnemonics"], "少于 4 字的钩子要丢掉")
+        self.assertTrue(all(len(m) <= 60 for m in res["mnemonics"]), "超长钩子要截断")
+        self.assertLessEqual(len(res["mnemonics"]), 3)
+        self.assertEqual(res["unit_id"], unit_id)
+        self.assertIn("学习的本质是记忆", seen["prompt"], "材料必须由服务端读取单元得到")
+        self.assertIn("提高刺激强度", seen["prompt"], "单元的 essence 要进提示词")
+
+    def test_mnemonic_refuses_without_model(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: False
+        with self.assertRaises(PermissionError):
+            services.generate_mnemonic(self.db, "local", unit_id)
+
+    def test_mnemonic_rejects_empty_output(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: True
+        llm.chat_json = lambda messages, **kw: {"mnemonics": ["短", ""]}
+        with self.assertRaises(ValueError):
+            services.generate_mnemonic(self.db, "local", unit_id)
+
+    def test_mnemonic_never_trusts_client_text(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: True
+        captured = {}
+        llm.chat_json = lambda messages, **kw: captured.update(
+            {"n": len(messages), "prompt": messages[1]["content"]}) or {
+            "mnemonics": ["真实提示词只含服务端材料"], "note": ""}
+        services.generate_mnemonic(self.db, "local", unit_id)
+        self.assertNotIn("前端", captured["prompt"][:40])
+        self.assertIn(out["next_units"][0]["title"], captured["prompt"])
+
+
+    def test_cards_from_text_preview_then_confirm(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        preview = services.cards_from_text(
+            self.db, "local", "提取练习：合上书，用自己的话把核心讲出来。\n间隔复习？在快要忘但还没忘的时候复习最有效。",
+            unit_id)
+        self.assertEqual(preview["status"], "preview")
+        self.assertEqual(preview["engine"], "rules")
+        self.assertTrue(preview["cards"])
+        self.assertEqual(preview["unit_id"], unit_id)
+        self.assertTrue(preview["tool_args"]["cards"])
+        for card in preview["cards"]:
+            self.assertTrue(len(card["front"]) >= 4 and len(card["back"]) >= 2)
+
+        # 预览不能写库：确认之前，复习队列数量不变
+        before = services.review_queue(self.db, "local")["new_total"]
+        self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM cards WHERE user_id='local'", (), 0),
+                         before)
+        done = services.confirm_cards(self.db, "local", preview["cards"], unit_id)
+        self.assertEqual(done["count"], len(preview["cards"]))
+        self.assertIn("复习卡", done["summary"])
+        after = self.db.query("SELECT * FROM cards WHERE user_id='local' AND unit_id=? AND probe_id IS NULL",
+                              (unit_id,))
+        self.assertEqual(len(after), done["count"])
+        self.assertTrue(all(c["state"] == "new" for c in after))
+
+    def test_cards_rules_cloze_picks_later_term(self):
+        cards = services._rules_cards("海马体负责把短期痕迹整合成长期记忆，这个过程发生在睡眠期间。")
+        self.assertTrue(cards)
+        self.assertIn("（　）", cards[0]["front"])
+        self.assertNotEqual(cards[0]["front"], cards[0]["back"])
+
+    def test_cards_validation_paths(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        with self.assertRaises(ValueError):
+            services.cards_from_text(self.db, "local", "太短", unit_id)
+        with self.assertRaises(ValueError):
+            services.confirm_cards(self.db, "local", [{"front": "短", "back": "答"}], unit_id)
+        services.reset_user(self.db, "local")
+        with self.assertRaises(ValueError):
+            services.confirm_cards(self.db, "local", [{"front": "一个足够长的问题？", "back": "答案"}], None)
+
+    def test_cards_from_text_model_path_labels_engine(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: True
+        llm.chat_json = lambda messages, **kw: {"cards": [
+            {"front": "提取练习的关键动作是什么？", "back": "合上材料，用自己的话复述核心。"},
+            {"front": "重复", "back": "x"},
+        ]}
+        res = services.cards_from_text(self.db, "local", "提取练习就是合书复述，比反复阅读有效。", unit_id)
+        self.assertEqual(res["engine"], "model")
+        self.assertEqual(len(res["cards"]), 1, "过短或不完整的卡要丢掉")
+
+    def test_cards_model_failure_falls_back_to_rules(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        llm.enabled = lambda: True
+
+        def boom(messages, **kw):
+            raise RuntimeError("网关炸了")
+        llm.chat_json = boom
+        res = services.cards_from_text(self.db, "local", "间隔复习？在快要忘的时候复习最有效。", unit_id)
+        self.assertEqual(res["engine"], "rules")
+        self.assertIn("网关炸了", res["engine_note"])
+        self.assertTrue(res["cards"])
+
+    def test_quick_ask_requires_model_and_question(self):
+        llm.enabled = lambda: False
+        with self.assertRaises(PermissionError):
+            services.ask_about_selection(self.db, "local", "为什么？", "上下文")
+        llm.enabled = lambda: True
+        with self.assertRaises(ValueError):
+            services.ask_about_selection(self.db, "local", "   ", "上下文")
+        llm.chat = lambda messages, **kw: "因为提取会强化记忆痕迹。\n下一步：合上书讲一遍。"
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        res = services.ask_about_selection(self.db, "local", "为什么要合上书？",
+                                           "合书复述属于提取练习。", unit_id)
+        self.assertEqual(res["source"], "model")
+        self.assertIn("强化记忆痕迹", res["answer"])
+        self.assertEqual(res["unit_id"], unit_id)
+
+
+    def test_long_material_is_compiled_in_batches_covering_everything(self):
+        seen = {"prompts": [], "calls": 0}
+
+        def fake_json(messages, **kw):
+            prompt = messages[1]["content"]
+            seen["prompts"].append(prompt)
+            seen["calls"] += 1
+            if "全篇骨架" in prompt:
+                return {"name": "长材料包", "description": "覆盖全部小节", "subject": "学习科学",
+                        "outline": [{"title": "第一部分", "summary": "先立地基",
+                                     "section_titles": ["第 1 节"]}],
+                        "study_plan": [{"phase": "地基", "section_titles": ["第 1 节"],
+                                        "focus": "理解本质", "minutes": 200}],
+                        "digest": {"overview": "这份长材料分成多节讲提取与复习。",
+                                   "advice": ["先跑完第一批"]}}
+            marker = prompt.count("本批进度")
+            which = prompt.split("第 ")[-1].split(" /")[0].strip() or "1"
+            return {"units": [{
+                "title": f"批次{which}的单元",
+                "angle": "先复述再验证边界",
+                "essence": f"第 {which} 批的核心结论。",
+                "steps": ["读小标题", "合书复述"],
+                "boundaries": ["本批材料未覆盖时不外推"],
+                "key_points": ["核心结论"],
+                "probes": [], "cards": [],
+            }]}
+
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        old_limit = compiler.SINGLE_CALL_LIMIT
+        old_batch = compiler.BATCH_CHAR_BUDGET
+        compiler.SINGLE_CALL_LIMIT = 1000   # 让测试材料能越过单次阈值
+        compiler.BATCH_CHAR_BUDGET = 700    # 让测试材料真的被拆成多批
+        try:
+            text = "\n\n".join(f"## 第 {i} 节\n这一节讲提取练习的第 {i} 个侧面，需要正文足够长。"
+                               f"{'补充说明。' * 60}" for i in range(1, 9))
+            expected_batches = len(compiler._batch_sections(
+                compiler._split_sections(text, use_embeddings=False)))
+            pack, warnings = compile_material("长材料", "学习科学", text, use_llm=True,
+                                              use_embeddings=False)
+        finally:
+            compiler.SINGLE_CALL_LIMIT, compiler.BATCH_CHAR_BUDGET = old_limit, old_batch
+        self.assertEqual(warnings, [])
+        self.assertGreaterEqual(seen["calls"], 4, "应该是 1 次大纲 + 至少 3 次批次")
+        self.assertEqual(len(pack["units"]), seen["calls"] - 1)
+        self.assertEqual(pack["source"]["batches"], expected_batches)
+        self.assertEqual(pack["source"]["material_chars"], len(text))
+        self.assertEqual(pack["generated_by"], "model")
+        self.assertTrue(pack["outline"] and pack["digest"]["overview"])
+        # 每一批都必须真的被送进模型，不能只喂开头
+        joined = "".join(seen["prompts"])
+        for i in range(1, 9):
+            self.assertIn(f"第 {i} 节", joined, f"第 {i} 节没有进入任何一次调用")
+        self.assertEqual(validate_pack(pack), [])
+
+    def test_batch_failure_skips_only_that_batch(self):
+        calls = {"n": 0}
+
+        def fake_json(messages, **kw):
+            prompt = messages[1]["content"]
+            calls["n"] += 1
+            if "全篇骨架" in prompt:
+                return {"name": "包", "description": "d", "subject": "s",
+                        "outline": [], "study_plan": [], "digest": {"overview": "总览", "advice": []}}
+            if "第 2 /" in prompt:
+                raise RuntimeError("这一批网关炸了")
+            return {"units": [{"title": f"单元 {calls['n']}", "essence": "本质内容",
+                               "steps": ["步骤"], "key_points": ["要点"],
+                               "probes": [], "cards": []}]}
+
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        old_limit = compiler.SINGLE_CALL_LIMIT
+        old_batch = compiler.BATCH_CHAR_BUDGET
+        compiler.SINGLE_CALL_LIMIT = 1000
+        compiler.BATCH_CHAR_BUDGET = 500
+        try:
+            text = "\n\n".join(f"## 第 {i} 节\n内容足够长以撑开批次。{'补充。' * 80}" for i in range(1, 6))
+            pack, warnings = compile_material("材料", "学科", text, use_llm=True, use_embeddings=False)
+        finally:
+            compiler.SINGLE_CALL_LIMIT, compiler.BATCH_CHAR_BUDGET = old_limit, old_batch
+        self.assertTrue(any("批编译失败，已跳过" in w for w in warnings), warnings)
+        self.assertTrue(pack["units"], "单批失败不该让整个编译空手而归")
+
+    def test_oversized_section_is_never_silently_cut(self):
+        """小节超过批次预算必须无损切开：模型没读到的字，就没资格说「基于全部材料」。"""
+        seen = {"prompts": []}
+
+        def fake_json(messages, **kw):
+            prompt = messages[1]["content"]
+            seen["prompts"].append(prompt)
+            if "全篇骨架" in prompt:
+                return {"name": "包", "description": "d", "subject": "s", "outline": [],
+                        "study_plan": [], "digest": {"overview": "总览", "advice": []}}
+            return {"units": [{"title": f"批次单元 {len(seen['prompts'])}", "essence": "核心结论",
+                               "steps": ["步骤"], "key_points": ["要点"],
+                               "probes": [], "cards": []}]}
+
+        markers = [f"K{i:03d} 这一段讲提取练习的一个侧面，长度足够撑开预算所以要写满。"
+                   for i in range(1, 25)]
+        text = "# 长文\n\n" + "\n\n".join(markers)
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        old_limit = compiler.SINGLE_CALL_LIMIT
+        old_batch = compiler.BATCH_CHAR_BUDGET
+        compiler.SINGLE_CALL_LIMIT = 400      # 越过阈值，走分批编译
+        compiler.BATCH_CHAR_BUDGET = 300      # 一小节装不下，必须无损切开
+        try:
+            pack, warnings = compile_material("超长单节", "学科", text, use_llm=True,
+                                              use_embeddings=False)
+        finally:
+            compiler.SINGLE_CALL_LIMIT, compiler.BATCH_CHAR_BUDGET = old_limit, old_batch
+        self.assertTrue(any("全篇骨架" in p for p in seen["prompts"]),
+                        "根本没走分批编译，这条用例就白了")
+        joined = "".join(seen["prompts"])
+        for marker in markers:
+            self.assertIn(marker, joined, f"{marker[:6]} 没有进入任何一次调用")
+        self.assertEqual(warnings, [], f"不该有任何丢掉内容的告警: {warnings}")
+        self.assertGreaterEqual(len(pack["units"]), 3, "切开的每一批都该有自己的单元")
+
+    def test_chunk_section_packs_without_losing_text(self):
+        body = "\n\n".join(f"第 {i} 段：合上书用自己的话讲出本质与边界。" for i in range(1, 40))
+        pieces = compiler._chunk_section("长节", body, 120)
+        self.assertTrue(all(len(text) <= 120 for _, text in pieces),
+                        [len(t) for _, t in pieces])
+        self.assertEqual("".join(t for _, t in pieces).count("讲出本质与边界"), 39, "切开不能丢段")
+        self.assertLess(len(pieces), 15, "小块要装回预算内，不能一段一片")
+        self.assertEqual(pieces[0][0], "长节")
+        self.assertTrue(pieces[-1][0].startswith("长节（续"))
+
+    def test_bare_unit_list_response_is_accepted(self):
+        """模型偶尔不按包对象回答，而是直接回一个单元数组——不该因此就退回本地编译。"""
+        def fake_json(messages, **kw):
+            return [{"title": f"单元 {i}", "essence": "本质说明", "steps": ["步骤"],
+                     "boundaries": ["边界"], "key_points": ["要点"],
+                     "probes": [], "cards": []} for i in range(1, 4)]
+
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        pack, warnings = compile_material("数组回答", "学科", "## 一节\n正文说明足够长。" * 4,
+                                          use_llm=True, use_embeddings=False)
+        self.assertEqual(len(pack["units"]), 3)
+        self.assertEqual(pack["generated_by"], "model", "被误判成本地编译会谎报来源")
+
+    def test_unit_cap_is_announced_not_silent(self):
+        def fake_json(messages, **kw):
+            if "全篇骨架" in messages[1]["content"]:
+                return {"units": []}
+            return {"units": [{"title": f"单元 {i}", "essence": "本质说明",
+                               "steps": ["步骤"], "boundaries": ["边界"],
+                               "key_points": ["要点"], "probes": [], "cards": []}
+                              for i in range(1, 14)]}
+
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        pack, warnings = compile_material("材料", "学科", "## 一节\n正文说明足够长。" * 4,
+                                          use_llm=True, use_embeddings=False)
+        self.assertEqual(len(pack["units"]), compiler.MAX_UNITS_SINGLE)
+        self.assertTrue(any("只留下前" in w for w in warnings),
+                        f"超限单元被静默吞掉了: {warnings}")
+
+    def test_non_lexical_merge_needs_human_confirmation(self):
+        """非字面证据的合并必须有人点头。
+
+        真实模拟里抓到过：候选列表写「不可合并」，端点自己再问一次模型改判成
+        same=true，于是真的把两个不同的单元合了库——模型两次能给出相反答案。
+        """
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        for uid, title, essence in (("unit-cm-a", "工作记忆", "同时在线的元素数量有限"),
+                                    ("unit-cm-b", "认知负荷", "学习设计要压低外在负担")):
+            self.db.upsert("units", {"id": uid, "goal_id": goal_id, "pack_id": "p",
+                                     "pack_unit_id": uid, "title": title, "essence": essence,
+                                     "order_index": 70, "created_at": now_iso(),
+                                     "updated_at": now_iso()}, "id")
+        fake = {"allowed": True, "basis": "model", "reason": "模型判定同一件事",
+                "signals": {"lexical": 0.2, "semantic": 0.79}}
+        old = quality.merge_decision
+        quality.merge_decision = lambda *a, **k: dict(fake)
+        try:
+            with self.assertRaises(ValueError) as cm:
+                services.merge_units(self.db, "local", "unit-cm-a", "unit-cm-b")
+            self.assertIn("确认", str(cm.exception))
+            self.assertIsNone(self.db.one(
+                "SELECT merged_into FROM units WHERE id='unit-cm-a'")["merged_into"],
+                "没确认就不能改动数据库")
+            res = services.merge_units(self.db, "local", "unit-cm-a", "unit-cm-b",
+                                        confirmed=True)
+            self.assertEqual(res["basis"], "model")
+            self.assertEqual(self.db.one(
+                "SELECT merged_into FROM units WHERE id='unit-cm-a'")["merged_into"], "unit-cm-b")
+        finally:
+            quality.merge_decision = old
+
+    def test_merge_override_requires_a_written_reason(self):
+        """分数与模型都不同意时，人想合可以，但必须署名：一次点击不能冒充裁决。"""
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        db = self.db
+        rows = [
+            {"id": "unit-ov-a", "goal_id": goal_id, "pack_id": "p", "pack_unit_id": "a",
+             "title": "线性方程组求解", "essence": "消元法把未知数一个个消掉直到可回代",
+             "order_index": 80, "created_at": now_iso(), "updated_at": now_iso()},
+            {"id": "unit-ov-b", "goal_id": goal_id, "pack_id": "p", "pack_unit_id": "b",
+             "title": "牛顿第一定律", "essence": "物体不受外力时保持匀速直线运动状态",
+             "order_index": 81, "created_at": now_iso(), "updated_at": now_iso()},
+        ]
+        for row in rows:
+            db.upsert("units", row, "id")
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-ov-a", "unit-ov-b")
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-ov-a", "unit-ov-b",
+                                 reason="看着像", override=True)
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-ov-a", "unit-ov-b", override=True)
+        res = services.merge_units(db, "local", "unit-ov-a", "unit-ov-b",
+                                   reason="我的材料里这就是同一个概念的两种译名", override=True)
+        self.assertEqual(res["basis"], "user")
+        stored = db.one("SELECT merged_reason FROM units WHERE id='unit-ov-a'")["merged_reason"]
+        self.assertIn("学习者确认", stored)
+        self.assertIn("同一个概念", stored, "用户写的理由要能被后来的人看见")
+
+    def test_compile_heuristic_covers_all_sections(self):
+        text = "\n\n".join(f"## 第 {i} 节\n这是第 {i} 节的正文说明。" for i in range(1, 11))
+        pack = compile_heuristic("十节材料", "学科", text, use_embeddings=False)
+        self.assertGreaterEqual(len(pack["units"]), 8, "本地路径也应尽量覆盖多节，而不是只取开头")
+
+
+    def test_merge_is_code_enforced_and_never_deletes(self):
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        db = self.db
+        a = {"id": "unit-a", "goal_id": goal_id, "pack_id": "p", "pack_unit_id": "a",
+             "title": "间隔复习", "essence": "在快要忘但还没忘的时候复习最有效",
+             "order_index": 0, "created_at": now_iso(), "updated_at": now_iso()}
+        b = {"id": "unit-b", "goal_id": goal_id, "pack_id": "p", "pack_unit_id": "b",
+             "title": "间隔复习法", "essence": "在快要忘但还没忘的时候复习最有效",
+             "order_index": 1, "created_at": now_iso(), "updated_at": now_iso()}
+        c = {"id": "unit-c", "goal_id": goal_id, "pack_id": "p", "pack_unit_id": "c",
+             "title": "线性方程组求解", "essence": "消元法把未知数一个个消掉直到可回代",
+             "order_index": 2, "created_at": now_iso(), "updated_at": now_iso()}
+        for row in (a, b, c):
+            db.upsert("units", row, "id")
+        db.upsert("relations", {"id": "r1", "goal_id": goal_id, "from_unit": "unit-b",
+                                "to_unit": "unit-c", "kind": "prerequisite"}, "id")
+
+        # 阈值由代码判定：不像的一对直接被拒
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-a", "unit-c")
+
+        res = services.merge_units(db, "local", "unit-b", "unit-a", reason="同一件事的两种说法")
+        self.assertEqual(res["into"], "unit-a")
+        self.assertGreaterEqual(res["similarity"], quality.MERGE_LEXICAL_FLOOR)
+        self.assertEqual(res["basis"], "lexical", "没配嵌入时必须按字面放行并说清楚依据")
+        self.assertEqual(res["signals"]["semantic"], None, "云端向量不可用时不能假装有语义分")
+        self.assertEqual(db.one("SELECT merged_reason FROM units WHERE id='unit-b'")["merged_reason"],
+                         "同一件事的两种说法", "用户写了理由就要用用户的")
+        self.assertEqual(db.one("SELECT id FROM units WHERE id='unit-b'")["id"], "unit-b",
+                         "合并不能删除内容")
+        self.assertEqual(db.one("SELECT merged_into FROM units WHERE id='unit-b'")["merged_into"], "unit-a")
+
+        # 前置关系重连到归宿，且不留自环
+        rel = db.one("SELECT from_unit, to_unit FROM relations WHERE id='r1'")
+        self.assertEqual(rel["from_unit"], "unit-a")
+        self.assertEqual(rel["to_unit"], "unit-c")
+
+        # 地图与「下一步」不再出现被吸收的单元
+        m = services.map_data(db, "local", goal_id)
+        self.assertNotIn("unit-b", [n["id"] for n in m["nodes"]])
+        self.assertIn("unit-a", [n["id"] for n in m["nodes"]])
+        nxt = services._next_units(services.get_goal_units(db, goal_id),
+                                   services._unit_status_map(db, "local",
+                                                             services.get_goal_units(db, goal_id)))
+        self.assertNotIn("unit-b", [u["id"] for u in nxt])
+
+        detail = services.unit_detail(db, "local", "unit-b")
+        self.assertEqual(detail["merged_into"]["id"], "unit-a")
+        absorbed = services.unit_detail(db, "local", "unit-a")["absorbed"]
+        self.assertEqual([x["id"] for x in absorbed], ["unit-b"])
+        self.assertEqual(absorbed[0]["merged_reason"], "同一件事的两种说法")
+
+    def test_merge_chains_to_the_final_target(self):
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        db = self.db
+        rows = [("unit-x", "间隔复习", "在快要忘的时候复习最有效", 0),
+                ("unit-y", "间隔复习法", "在快要忘的时候复习最有效", 1),
+                ("unit-z", "间隔复习策略", "在快要忘的时候复习最有效", 2)]
+        for uid, title, essence, order in rows:
+            db.upsert("units", {"id": uid, "goal_id": goal_id, "pack_id": "p",
+                                "pack_unit_id": uid, "title": title, "essence": essence,
+                                "order_index": order, "created_at": now_iso(),
+                                "updated_at": now_iso()}, "id")
+        services.merge_units(db, "local", "unit-y", "unit-x")
+        services.merge_units(db, "local", "unit-z", "unit-y")
+        self.assertEqual(db.one("SELECT merged_into FROM units WHERE id='unit-z'")["merged_into"],
+                         "unit-x", "链要指到最终归宿，不要停在已被吸收的单元")
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-x", "unit-z")   # 不接受成环
+        self.assertEqual(db.one("SELECT merged_into FROM units WHERE id='unit-x'")["merged_into"], None)
+
+    def test_merge_validation_edges(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        db = self.db
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", unit_id, unit_id)
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", unit_id, "")
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", unit_id, "no-such-unit")
+        db.upsert("units", {"id": "unit-other-goal", "goal_id": "different-goal",
+                            "pack_id": "p", "pack_unit_id": "z", "title": "标题一样",
+                            "essence": "本质也一样", "order_index": 9,
+                            "created_at": now_iso(), "updated_at": now_iso()}, "id")
+        with self.assertRaises(ValueError):
+            services.merge_units(db, "local", "unit-other-goal", unit_id)
+
+
 class ServiceTest(TempCase):
     def test_onboarding_dashboard_map_unit_review(self):
         out = self.onboard()
@@ -372,6 +829,86 @@ class ServiceTest(TempCase):
         self.assertGreater(rated["result"]["interval_days"], 0)
         after = services.review_queue(self.db, "local")
         self.assertLess(after["new_total"], 16)
+
+    def test_memory_health_tracks_learned_cards(self):
+        out = self.onboard()
+        fresh = services.insights(self.db, "local", out["goal"]["id"])
+        self.assertIsNone(fresh["memory_health"], "没有已学卡片时不该编造数值")
+        self.assertEqual(fresh["learned_cards"], 0)
+
+        queue = services.review_queue(self.db, "local")
+        for card in queue["cards"][:4]:
+            services.rate_card(self.db, "local", card["id"], 3, 3000)
+        after = services.insights(self.db, "local", out["goal"]["id"])
+        self.assertEqual(after["learned_cards"], 4)
+        self.assertIsNotNone(after["memory_health"])
+        self.assertGreater(after["memory_health"], 0.0)
+        self.assertLessEqual(after["memory_health"], 1.0)
+        # 刚复习完应该接近 1，明显高于放很久不管的情况
+        self.assertGreater(after["memory_health"], 0.8)
+
+    def test_recall_before_reveal_is_persisted(self):
+        out = self.onboard()
+        queue = services.review_queue(self.db, "local")
+        card = queue["cards"][0]
+        services.rate_card(self.db, "local", card["id"], 3, 4000,
+                           recall="提取练习就是合上书用自己的话讲出来。")
+        rows = self.db.query("SELECT * FROM attempts WHERE user_id='local'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "review_recall")
+        self.assertEqual(rows[0]["response"], "提取练习就是合上书用自己的话讲出来。")
+        self.assertEqual(rows[0]["unit_id"], card["unit_id"])
+        self.assertEqual(json.loads(rows[0]["feedback_json"])["source"], "review")
+        self.assertAlmostEqual(rows[0]["score"], 0.8, places=3)
+        detail = services.unit_detail(self.db, "local", card["unit_id"])
+        self.assertTrue(any(a["kind"] == "review_recall" for a in detail["attempts"]))
+
+        # 复习时写的回忆不是「作答探测题」：卡片带着 probe_id 也不能把探测题的计数抬上去
+        probe_id = self.db.scalar("SELECT probe_id FROM cards WHERE id=?", (card["id"],))
+        self.assertIsNotNone(probe_id, "这条用例前提是编译产物把卡挂到了探测题上")
+        self.assertIsNone(rows[0]["probe_id"], "复习回忆不能占着探测题的 probe_id")
+        self.assertEqual(json.loads(rows[0]["feedback_json"])["probe_id"], probe_id,
+                         "来源探测题要留在 feedback 里，不能计进作答次数")
+        probe = [p for p in detail["probes"] if p["id"] == probe_id]
+        self.assertEqual(probe[0]["attempts"], 0, "探测题「N 次作答」被复习污染了")
+
+        second = services.review_queue(self.db, "local")
+        other = [c for c in second["cards"] if c["id"] != card["id"]][0]
+        services.rate_card(self.db, "local", other["id"], 4, 2000, recall="   ")
+        services.rate_card(self.db, "local", other["id"], 1, 2000)
+        self.assertEqual(self.db.scalar(
+            "SELECT COUNT(*) FROM attempts WHERE user_id='local'", (), 0), 1,
+            "空白回忆不该写库")
+
+    def test_stream_retry_does_not_duplicate_user_turn(self):
+        out = self.onboard()
+        unit_id = out["next_units"][0]["id"]
+        s = socratic.start_session(self.db, "local", out["goal"]["id"], unit_id)
+        sid = s["session"]["id"]
+        turn_before = socratic.get_session(self.db, sid)["session"]["turn"]
+
+        def drain(**kw):
+            return list(socratic.stream_reply(self.db, "local", sid, "学习是形成可提取的记忆。", **kw))
+
+        drain()
+        after_first = socratic.get_session(self.db, sid)["session"]
+        self.assertEqual(after_first["turn"], turn_before + 1)
+        self.assertEqual(self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'", (sid,), 0), 1)
+
+        # 断线重连：同一句话带 retry 再来一次，不该多出一条用户消息、也不该涨轮次
+        drain(retry=True)
+        after_retry = socratic.get_session(self.db, sid)["session"]
+        self.assertEqual(after_retry["turn"], after_first["turn"])
+        self.assertEqual(self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'", (sid,), 0), 1)
+
+        # 换个说法（不带 retry）就应该正常+1
+        list(socratic.stream_reply(self.db, "local", sid, "还需要及时复习来强化回路。"))
+        third = socratic.get_session(self.db, sid)["session"]
+        self.assertEqual(third["turn"], after_retry["turn"] + 1)
+        self.assertEqual(self.db.scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'", (sid,), 0), 2)
 
     def test_socratic_and_feynman(self):
         out = self.onboard()
@@ -485,6 +1022,157 @@ class ServiceTest(TempCase):
             "quote": "引用", "content": "内容", "unit_id": "no-such-unit", "source": "恶意来源"})
         self.assertIsNone(unknown["note"]["unit_id"])
         self.assertEqual(unknown["note"]["source"], "")
+
+    def test_mistake_tags_are_persisted_and_aggregated(self):
+        out = self.onboard()
+        queue = services.review_queue(self.db, "local")
+        self.assertTrue(queue["mistake_tags"], "分类要由后端下发，前端不复制一份")
+        keys = [t["key"] for t in queue["mistake_tags"]]
+        self.assertEqual(len(keys), 6)
+
+        first = queue["cards"][0]
+        res = services.rate_card(self.db, "local", first["id"], 1, 3000,
+                                 mistake_tags=["concept", "bogus", "concept", "step"])
+        self.assertEqual(res["mistake_tags"], ["concept", "step"], "未知标签丢弃、重复去重")
+        log = self.db.query("SELECT * FROM review_logs WHERE user_id='local'")[-1]
+        self.assertEqual(json.loads(log["mistake_tags_json"]), ["concept", "step"])
+        self.assertEqual(log["missed_points"], 1)
+        card = self.db.one("SELECT * FROM cards WHERE id=?", (first["id"],))
+        self.assertEqual(json.loads(card["mistake_tags_json"]), ["concept", "step"])
+
+        detail = services.unit_detail(self.db, "local", first["unit_id"])
+        again = [c for c in detail["cards"] if c["id"] == first["id"]][0]
+        self.assertEqual(again["mistake_tags"], ["concept", "step"])
+        self.assertEqual(again["mistake_labels"], ["概念没吃透", "步骤缺一环"])
+
+        second = queue["cards"][1]
+        services.rate_card(self.db, "local", second["id"], 4, 1200, mistake_tags=["blank"])
+        answered = self.db.one("SELECT * FROM cards WHERE id=?", (second["id"],))
+        self.assertEqual(json.loads(answered["mistake_tags_json"]), [],
+                         "答对后不该继续挂着上一次的错因")
+
+        agg = services.insights(self.db, "local", out["goal"]["id"])["mistakes"]
+        self.assertEqual(agg["tagged_reviews"], 1)
+        self.assertEqual(agg["missed_total"], 1)
+        counts = {t["key"]: t["count"] for t in agg["tags"]}
+        self.assertEqual(counts, {"concept": 1, "step": 1})
+
+    def test_more_than_four_tags_are_capped(self):
+        out = self.onboard()
+        card = services.review_queue(self.db, "local")["cards"][0]
+        res = services.rate_card(self.db, "local", card["id"], 2, 1000,
+                                 mistake_tags=["concept", "boundary", "step", "confusion",
+                                               "carelessness", "blank"])
+        self.assertEqual(len(res["mistake_tags"]), 4)
+
+    def test_list_cards_covers_not_due_cards(self):
+        out = self.onboard()
+        card = services.review_queue(self.db, "local")["cards"][0]
+        services.rate_card(self.db, "local", card["id"], 3, 2000)
+        listed = services.list_cards(self.db, "local")
+        self.assertGreater(listed["total"], 0)
+        self.assertTrue(any(c["id"] == card["id"] for c in listed["cards"]),
+                        "已复习（未到期）的卡也要能被列出来，否则无法提前加卡")
+        by_unit = services.list_cards(self.db, "local", unit_id=card["unit_id"])
+        self.assertTrue(all(c["unit_id"] == card["unit_id"] for c in by_unit["cards"]))
+        self.assertTrue(by_unit["cards"])
+        hit = services.list_cards(self.db, "local", q=card["front"][:4])
+        self.assertTrue(any(c["id"] == card["id"] for c in hit["cards"]))
+        miss = services.list_cards(self.db, "local", q="绝不存在的关键词zzz")
+        self.assertEqual(miss["cards"], [])
+        state = services.list_cards(self.db, "local", state="new")
+        self.assertTrue(all(c["state"] == "new" for c in state["cards"]))
+
+    def test_import_snapshots_database_first(self):
+        out = self.onboard()
+        goal_id = out["goal"]["id"]
+        payload = services.export_data(self.db, "local")
+
+        result = backup.import_backup(self.db, "local", payload, mode="merge")
+        self.assertTrue(result["snapshot"], "导入必须留下快照名")
+        snap = backup.backup_dir() / result["snapshot"]
+        self.assertTrue(snap.exists())
+        # 快照里应该是导入前的状态：同一个目标，且带 8 个单元
+        with sqlite3.connect(str(snap)) as conn:
+            conn.row_factory = sqlite3.Row
+            goals = conn.execute("SELECT id FROM goals WHERE id=?", (goal_id,)).fetchall()
+            units = conn.execute("SELECT COUNT(*) FROM units WHERE goal_id=?", (goal_id,)).fetchone()[0]
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        self.assertEqual(len(goals), 1)
+        self.assertEqual(units, 8)
+        self.assertEqual(integrity, "ok")
+
+        # 替换导入前先快照，旧数据要还能从快照里捞回来
+        services.reset_user(self.db, "local")
+        self.assertIsNone(services.active_goal(self.db, "local"))
+        replaced = backup.import_backup(self.db, "local", payload, mode="replace")
+        self.assertTrue(replaced["snapshot"])
+        self.assertEqual(services.list_goals(self.db, "local") and True, True)
+
+        names = [s["name"] for s in backup.list_snapshots()]
+        self.assertGreaterEqual(len(names), 2)
+        self.assertTrue(all(n.startswith("pre_import_") for n in names))
+        backup.prune_snapshots("pre_import")
+        self.assertLessEqual(len(backup.list_snapshots()), backup.SNAPSHOTS_KEPT)
+
+    def test_failed_replace_import_leaves_old_data_intact(self):
+        """替换导入必须整体回滚：不能出现「旧数据已删、新数据没进来」的空库。"""
+        self.onboard()
+        payload = services.export_data(self.db, "local")
+        cards = payload["cards"]
+        self.assertTrue(cards, "这条用例的前提是导出的数据里有卡片")
+        poisoned = [dict(c) for c in cards]
+        poisoned[0]["front"] = None          # front 是 NOT NULL，插入必然炸
+        bad = {**payload, "cards": poisoned}
+        before_cards = self.db.scalar("SELECT COUNT(*) FROM cards WHERE user_id='local'", (), 0)
+        before_goals = len(services.list_goals(self.db, "local") or [])
+        with self.assertRaises(sqlite3.Error):
+            backup.import_backup(self.db, "local", bad, mode="replace")
+        self.assertEqual(
+            self.db.scalar("SELECT COUNT(*) FROM cards WHERE user_id='local'", (), 0),
+            before_cards, "导入失败把复习卡删光了")
+        self.assertEqual(len(services.list_goals(self.db, "local") or []), before_goals,
+                         "导入失败把目标删光了")
+        self.assertIsNotNone(services.active_goal(self.db, "local"))
+
+    def test_reset_without_goals_still_clears_user_data(self):
+        """没有目标也要清干净：留着孤儿卡片，用户重建后它们会「复活」。"""
+        services.ensure_user(self.db, "")
+        ts = now_iso()
+        self.db.insert("cards", {
+            "id": "cd-orphan", "user_id": "local", "unit_id": "unit-gone", "probe_id": None,
+            "front": "无目标时的卡片", "back": "应该被清掉", "state": "new", "step": 0,
+            "stability": 0, "difficulty": 0, "due_at": ts, "last_review": None,
+            "reps": 0, "lapses": 0, "mistake_tags_json": "[]",
+            "created_at": ts, "updated_at": ts,
+        })
+        services.create_note(self.db, "local", {"quote": "没有目标也要能存", "content": "灵感"})
+        self.assertIsNone(services.active_goal(self.db, "local"))
+        services.reset_user(self.db, "local")
+        self.assertEqual(self.db.scalar(
+            "SELECT COUNT(*) FROM cards WHERE user_id='local'", (), 0), 0)
+        self.assertEqual(len(services.list_notes(self.db, "local")["notes"]), 0)
+
+    def test_search_tiers_put_exact_hits_before_lookalikes(self):
+        """语义分再高也不该压过精确命中：搜索框是给人用的，不是给模型喂片段。"""
+        out = self.onboard()
+        units = services.get_goal_units(self.db, out["goal"]["id"])
+        first = units[0]
+        order = [u for u in units if u["id"] != first["id"]] + [first]
+        old_rank, old_engine = embeddings.rank, embeddings.last_engine
+        embeddings.rank = lambda q, docs, text_fn: [
+            (0.9 - i * 0.05, d) for i, d in enumerate(order)]
+        embeddings.last_engine = lambda: "BAAI/bge-m3"
+        try:
+            found = services.search(self.db, "local", first["title"])
+        finally:
+            embeddings.rank, embeddings.last_engine = old_rank, old_engine
+        ids = [u["id"] for u in found["units"]]
+        self.assertEqual(ids[0], first["id"], "精确命中被「只是有点像」挤下去了")
+        self.assertEqual(found["units"][0]["matched_by"], ["lexical", "semantic"])
+        self.assertEqual(found["fusion"], "tiered")
+        self.assertTrue(all("lexical" not in u["matched_by"] for u in found["units"][1:]),
+                        "只有一个字面命中才对，多一个说明样例选得不干净")
 
     def test_notes_backup_and_semantic_search(self):
         out = self.onboard()

@@ -1,13 +1,78 @@
 """完整备份导入/导出。
 
 导出不包含 llm 配置（由调用方另行脱敏）；导入按表白名单过滤，避免任意 SQL/字段注入。
+导入前先把当前库快照到 data/backups/，替换导入失败时还能回到导入前的状态。
 """
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+from . import config
 from .db import Database, json_loads
 from .utils import now_iso
+
+SNAPSHOTS_KEPT = 10
+
+
+def backup_dir() -> Path:
+    """运行时读取 config.DATA_DIR，测试里换了数据目录不会写到仓库的 data/。"""
+    return config.DATA_DIR / "backups"
+
+
+def snapshot_db(db: Database, reason: str = "pre_import") -> str | None:
+    """用 SQLite 备份 API 而不是复制文件：WAL 下直接复制会拿到不一致的快照。"""
+    directory = backup_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    # 带微秒：同一秒内连续两次导入不能互相覆盖快照
+    stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S_%f")
+    target = directory / f"{reason}_{stamp}.db"
+    try:
+        with sqlite3.connect(str(db.path)) as src:
+            dest = sqlite3.connect(str(target))
+            try:
+                src.backup(dest)
+            finally:
+                dest.close()
+    except (sqlite3.Error, OSError):
+        # 快照失败不能阻断导入本身；但要把文件清干净，避免留下半成品
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    prune_snapshots(reason)
+    return target.name
+
+
+def prune_snapshots(reason: str = "pre_import") -> int:
+    removed = 0
+    directory = backup_dir()
+    if not directory.exists():
+        return 0
+    files = sorted(directory.glob(f"{reason}_*.db"), key=lambda p: p.name, reverse=True)
+    for old in files[SNAPSHOTS_KEPT:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def list_snapshots() -> list[dict[str, Any]]:
+    directory = backup_dir()
+    if not directory.exists():
+        return []
+    out = []
+    for p in sorted(directory.glob("*.db"), key=lambda x: x.name, reverse=True):
+        try:
+            out.append({"name": p.name, "bytes": p.stat().st_size})
+        except OSError:
+            continue
+    return out
 
 # 顺序：先父后子；没有外键，但顺序仍然让导入结果符合直觉。
 IMPORT_TABLES: list[tuple[str, bool]] = [
@@ -49,12 +114,15 @@ def import_backup(db: Database, user_id: str, payload: dict[str, Any],
         raise ValueError("备份缺少 goals/units，无法识别为 Boil 备份")
 
     from . import services
-    if mode == "replace":
-        services.reset_user(db, user_id)
-    services.ensure_user(db, user_id)
-
-    counts: dict[str, int] = {}
+    snapshot = snapshot_db(db, "pre_import")
+    # 清库与写入放进同一个事务：中途任何一条炸掉都整体回滚，
+    # 不会出现「旧的已删、新的没进来」的空库。
     with db.transaction():
+        if mode == "replace":
+            services.reset_user(db, user_id, commit=False)
+        services.ensure_user(db, user_id)
+
+        counts: dict[str, int] = {}
         for table, has_user in IMPORT_TABLES:
             rows = data.get(table) or []
             if not isinstance(rows, list):
@@ -81,6 +149,7 @@ def import_backup(db: Database, user_id: str, payload: dict[str, Any],
         "mode": mode,
         "counts": counts,
         "imported_at": now_iso(),
+        "snapshot": snapshot,
         "goals": int(counts.get("goals", 0)),
         "units": int(counts.get("units", 0)),
         "cards": int(counts.get("cards", 0)),

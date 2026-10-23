@@ -17,10 +17,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 import time
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "screenshots"
@@ -235,6 +236,25 @@ def main():
             return call("Runtime.evaluate", {"expression": expr, "returnByValue": True,
                                              "awaitPromise": True}).get("result", {}).get("value")
 
+        def real_click(selector: str) -> bool:
+            """派发真实鼠标事件。element.click() 不触发 mousedown，浮层的
+            「点外部就关闭」这类逻辑只有真鼠标才测得到。
+            只点已经在视口里的元素：划词浮层跟着滚动会被收掉。"""
+            spot = evaluate(
+                "(()=>{const e=document.querySelector(%s);if(!e)return null;"
+                "const r=e.getBoundingClientRect();"
+                "if(r.width<1||r.height<1)return null;"
+                "if(r.top<0||r.bottom>window.innerHeight||r.left<0||r.right>window.innerWidth)return null;"
+                "return JSON.stringify([r.x+r.width/2,r.y+r.height/2])})()"
+                % json.dumps(selector))
+            if not spot:
+                return False
+            x, y = json.loads(spot)
+            for kind in ("mousePressed", "mouseReleased"):
+                call("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1})
+            return True
+
         def wait_for(selector: str, text: str | None = None, timeout: float = 12.0):
             start = time.time()
             while time.time() - start < timeout:
@@ -269,11 +289,90 @@ def main():
 
         goto("#/map")
         wait_for(".map-svg", "知识地图")
+        # F15/F16：地图不崩、重复卡片按数据有无正确显隐
+        map_state = evaluate(
+            "(()=>({nodes:document.querySelectorAll('.map-node-wrap').length,"
+            "dup:!!document.querySelector('.dup-card')}))()")
+        if not map_state or map_state.get("nodes", 0) < 1:
+            errors.append(f"地图节点没有渲染: {map_state}")
         shot("map.png")
+
+        # E1/E3：真的种一个重复单元，用真鼠标走完「候选 → 依据 → 合并」这条链
+        seed_id = "unit-browser-dup"
+        dup_db = Path(os.environ.get("BOIL_DATA_DIR", str(ROOT / "data"))) / "boil.db"
+        try:
+            live = api("/api/dashboard")["data"]
+            live_goal = (live.get("goal") or {}).get("id")
+            if not live_goal:
+                raise RuntimeError("没有活动目标，种不了重复单元")
+            node = api(f"/api/units/{quote(unit_id)}")["data"]["unit"]
+            import sqlite3 as _sql
+            with _sql.connect(str(dup_db), timeout=15) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO units (id, goal_id, pack_id, pack_unit_id,"
+                    " title, essence, order_index, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (seed_id, live_goal, "browser.dup", seed_id,
+                     node["title"], node["essence"], 900,
+                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                conn.commit()
+            # goto() 只改 hash，同一个页面不会重渲染；必须硬刷新才会重新拉候选
+            call("Page.reload", {"ignoreCache": True})
+            wait_for(".dup-card", "疑似重复", 12)
+            card = evaluate(
+                "(()=>{const c=document.querySelector('.dup-card');if(!c)return {present:false};"
+                "const row=[...c.querySelectorAll('.dup-row')].find(r=>r.querySelector('[data-merge]'));"
+                "if(!row) return {present:true, head:c.querySelector('.side-label').textContent.trim(), missing:true};"
+                "const t=(sel)=>{const e=row.querySelector(sel);return e?e.textContent.trim():''};"
+                "return {present:true, head:c.querySelector('.side-label').textContent.trim(),"
+                " signal:t('.dup-titles .faint'), why:t('.dup-why'),"
+                " btn:t('.link-btn'), disabled:!!row.querySelector('.link-btn[disabled]'),"
+                " merge:row.querySelector('[data-merge]').getAttribute('data-merge'),"
+                " keep:row.querySelector('[data-keep]').getAttribute('data-keep')}})()")
+            if not card or not card.get("present"):
+                errors.append(f"种了重复单元但候选卡片没出现: {card}")
+            elif not card.get("btn") or card.get("disabled"):
+                errors.append(f"候选行的合并按钮不可用: {card}")
+            elif "字面" not in (card.get("why") or "") + (card.get("head") or ""):
+                errors.append(f"候选行没写明判据来源: {card}")
+            elif card.get("merge") != seed_id:
+                errors.append(f"候选把真单元当成了被吸收方，跳过点击以免误删: {card}")
+            else:
+                print(f"  dup card: {card['head']} | {card['why'][:40]}")
+                if not real_click(".dup-card .dup-row .link-btn"):
+                    errors.append("合并按钮真鼠标点不到（浮层/定位问题）")
+                else:
+                    time.sleep(2.2)
+                    done = evaluate("(document.querySelector('.toast')||{}).textContent||''")
+                    if "并入" not in done or "字面" not in done:
+                        errors.append(f"合并后 toast 没说清依据: {done}")
+                    else:
+                        print(f"  merged: {done[:60]}")
+        except Exception as exc:
+            errors.append(f"重复候选回归没跑成: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                import sqlite3 as _sql
+                with _sql.connect(str(dup_db), timeout=15) as conn:
+                    conn.execute("DELETE FROM units WHERE id=?", (seed_id,))
+                    conn.execute("DELETE FROM events WHERE payload_json LIKE ?", (f"%{seed_id}%",))
+                    conn.commit()
+            except Exception as exc:
+                print("seed cleanup warning:", exc, file=sys.stderr)
 
         goto(f"#/unit/{unit_id}")
         wait_for(".essence-card", "一句话本质")
         wait_for(".unit-heat-card", "本单元火候")
+        # E3/E5：AI 口诀入口只在模型可用时出现，未配置时应当完全不存在（而不是置灰）
+        ai_entry = evaluate(
+            "(async()=>{const h=await fetch('/api/health');const j=await h.json();"
+            "return {mode:j.data.llm.mode, btn:!!document.querySelector('[data-mnemonic-ai]')}})()"
+        )
+        if ai_entry:
+            expect_btn = ai_entry.get("mode") == "live"
+            if bool(ai_entry.get("btn")) != expect_btn:
+                errors.append(f"AI 速记入口的显隐与模型状态不符: {ai_entry}")
         shot("unit.png")
         shot("unit-full.png", full=True)
         evaluate("document.querySelector('[data-audio]')?.click()")
@@ -305,10 +404,46 @@ def main():
 
         goto("#/review")
         wait_for(".flashcard", "先回忆")
-        time.sleep(4.2)
+        # E1：翻面前要先写回忆
+        if not evaluate("!!document.querySelector('#recall-input')"):
+            errors.append("复习卡缺少回忆输入框")
+        evaluate("document.querySelector('#recall-input').value='浏览器回归写的回忆草稿';")
+        # F1：错因标签由后端下发，且没选标签前评分会被拦一次（不真的提交评分，避免扰动排程）
+        chips = evaluate(
+            "(()=>{document.querySelector('#reveal-btn').click();"
+            "const row=document.querySelector('#mistake-row');"
+            "return {shown:row?getComputedStyle(row).display:'none',"
+            "chips:[...document.querySelectorAll('.mistake-chip')].map(c=>c.textContent.trim())}})()")
+        if not chips or chips.get("shown") == "none" or len(chips.get("chips") or []) < 4:
+            errors.append(f"错因标签没有出现在翻面后: {chips}")
+        gate = evaluate(
+            "(()=>{const before=document.querySelector('#review-progress-label').textContent;"
+            "document.querySelector('[data-rate=\"1\"]').click();"
+            "const nudge=document.querySelector('#mistake-row').classList.contains('nudge');"
+            "return {nudge, same:document.querySelector('#review-progress-label').textContent===before}})()")
+        if not gate or not gate.get("nudge") or not gate.get("same"):
+            errors.append(f"未选错因时评分没有被拦一次: {gate}")
+        evaluate("document.querySelector('[data-tag-skip]').click()")
+        queue = evaluate(
+            "(()=>{const items=document.querySelectorAll('.queue-item');"
+            "return {items:items.length, add:!!document.querySelector('[data-queue-add]'),"
+            "select:!!document.querySelector('[data-queue-select]'),"
+            "current:!!document.querySelector('.queue-item.current')}})()"
+        )
+        if not queue or queue.get("items", 0) < 1 or not queue.get("add") \
+                or not queue.get("select") or not queue.get("current"):
+            errors.append(f"复习队列侧栏不完整: {queue}")
+        time.sleep(3.6)
         shot("review.png")
         evaluate("document.querySelector('#reveal-btn')?.click()")
         time.sleep(0.5)
+        echo = evaluate(
+            "(()=>{const e=document.querySelector('#recall-echo');"
+            "return {shown:e?getComputedStyle(e).display:'none',"
+            "text:(document.querySelector('.recall-echo-text')||{}).textContent||''}})()"
+        )
+        if not echo or echo.get("shown") == "none" or "回归" not in echo.get("text", ""):
+            errors.append(f"翻面后没有回显回忆内容: {echo}")
         shot("review-revealed.png")
 
         goto("#/library")
@@ -322,6 +457,28 @@ def main():
         goto("#/insights")
         wait_for(".insight-grid", "学习证据")
         wait_for(".heat-dist", "火候分布", 8)
+        # E6：记忆健康度卡片
+        health = evaluate(
+            "(()=>{const st=[...document.querySelectorAll('.stat')];"
+            "const h=st.find(x=>x.textContent.includes('记忆健康度'));"
+            "return {present:!!h, value:h?(h.querySelector('.stat-value')||{}).textContent:''}})()"
+        )
+        if not health or not health.get("present"):
+            errors.append(f"洞察页缺少记忆健康度: {health}")
+        # F1：错因标签不能只存在库里，洞察页要真的给出分布或诚实的空态
+        mist = evaluate(
+            "(()=>{const t=[...document.querySelectorAll('.section-title')]"
+            ".find(x=>x.textContent.includes('错因分布'));"
+            "if(!t) return {present:false};"
+            "const card=t.closest('.card');"
+            "return {present:true, rows:card.querySelectorAll('.mistake-dist-row').length,"
+            "empty:!!card.querySelector('.empty'), note:(card.querySelector('.faint')||{}).textContent||''}})()")
+        if not mist or not mist.get("present"):
+            errors.append(f"洞察页缺少错因分布: {mist}")
+        elif not mist.get("rows") and not mist.get("empty"):
+            errors.append(f"错因分布既没有行也没有空态: {mist}")
+        else:
+            print(f"  mistake tags: rows={mist.get('rows')} empty={mist.get('empty')}")
         shot("insights.png")
         if not evaluate("!!document.querySelector('#insight-ai-btn')"):
             errors.append("insights AI 解读入口不存在")
@@ -341,9 +498,77 @@ def main():
             "const c=getComputedStyle(m);"
             "return {display:c.display, btns:[...m.querySelectorAll('.sel-btn')].length}})()"
         )
-        if not menu or menu.get("display") != "flex" or menu.get("btns") != 2:
+        if not menu or menu.get("display") != "flex" or menu.get("btns", 0) < 2:
             errors.append(f"划词菜单没有出现: {menu}")
         shot("selection-menu.png")
+        # F11/F14：配置了模型时菜单要多出「做卡片」和「问 AI」
+        ai_items = evaluate(
+            "(async()=>{const h=await fetch('/api/health');const j=await h.json();"
+            "return {mode:j.data.llm.mode,"
+            "cards:!!document.querySelector('[data-sel=\"cards\"]'),"
+            "ask:!!document.querySelector('[data-sel=\"ask\"]')}})()")
+        if ai_items and ai_items.get("mode") == "live" and not (ai_items.get("cards") and ai_items.get("ask")):
+            errors.append(f"live 模式下划词菜单缺少 AI 动作: {ai_items}")
+        live = bool(ai_items and ai_items.get("mode") == "live")
+        if live and not real_click('[data-sel="cards"]'):
+            errors.append("划词菜单里的「做成复习卡」真鼠标点不到")
+        elif not live:
+            evaluate("document.querySelector('[data-sel=\"cards\"]')?.click()")
+        time.sleep(4.5)
+        preview = evaluate(
+            "(()=>{const p=document.querySelector('#sel-panel-cards');"
+            "if(!p) return {shown:false};"
+            "return {shown:getComputedStyle(p).display!=='none',"
+            "cards:p.querySelectorAll('.card-preview').length,"
+            "engine:!!p.querySelector('.badge'),"
+            "confirm:!!p.querySelector('[data-cards-confirm]')}})()")
+        if not preview or not preview.get("shown") or not preview.get("confirm"):
+            errors.append(f"卡片预览面板没有打开: {preview}")
+        elif preview.get("cards", 0) < 1:
+            errors.append(f"卡片预览没有内容: {preview}")
+        else:
+            print(f"  cards preview: {preview.get('cards')} 张, engine badge={preview.get('engine')}")
+        # 回归：面板内部的真实按下不能把它拆掉（document 级 hideAll 曾抢在 click 前清空 DOM，
+        # 于是「确认存入」永远点不动，而合成 click() 完全测不到这一层）
+        if not real_click("#sel-panel-cards .panel-body"):
+            errors.append("卡片面板内部无法用真鼠标点中")
+        else:
+            time.sleep(0.5)
+            survived = evaluate(
+                "(()=>{const p=document.querySelector('#sel-panel-cards');"
+                "if(!p) return {shown:false};"
+                "return {shown:getComputedStyle(p).display!=='none',"
+                "cards:p.querySelectorAll('.card-preview').length}})()")
+            if not survived or not survived.get("shown") or survived.get("cards", 0) < 1:
+                errors.append(f"点面板内部把它关掉了: {survived}")
+        if not real_click("#sel-panel-cards [data-panel-cancel]"):
+            evaluate("document.querySelector('#sel-panel-cards [data-panel-cancel]')?.click()")
+        time.sleep(0.4)
+        # F14：追问面板要能用真鼠标打开并输入文字（不提问，省一次模型调用）
+        if live:
+            evaluate("(()=>{const el=document.querySelector('.essence-text');"
+                     "const r=document.createRange();r.selectNodeContents(el);"
+                     "const s=getSelection();s.removeAllRanges();s.addRange(r);})()")
+            time.sleep(0.8)
+            if not real_click('[data-sel="ask"]'):
+                errors.append("「对这段追问」真鼠标点不到")
+            else:
+                time.sleep(0.5)
+                call("Input.insertText", {"text": "这跟前面的区别是什么？"})
+                time.sleep(0.3)
+                ask = evaluate(
+                    "(()=>{const p=document.querySelector('#sel-panel-ask');"
+                    "if(!p||getComputedStyle(p).display==='none') return {shown:false};"
+                    "return {shown:true,val:(p.querySelector('#ask-input')||{}).value||'',"
+                    "anchor:!!p.querySelector('.ask-anchor')}})()")
+                if not ask or not ask.get("shown"):
+                    errors.append(f"追问面板被真实点击关掉了: {ask}")
+                elif len(ask.get("val", "")) < 4:
+                    errors.append(f"追问输入框收不到文字: {ask}")
+                else:
+                    print(f"  ask panel: 输入 {len(ask.get('val'))} 字, 锚点={ask.get('anchor')}")
+                real_click("#sel-panel-ask [data-panel-cancel]")
+                time.sleep(0.3)
         evaluate("document.querySelector('[data-sel=\"note\"]')?.click()")
         time.sleep(0.5)
         pop = evaluate(
@@ -368,6 +593,21 @@ def main():
         )
         if not created or not created.get("id") or created.get("src") != "unit" or not created.get("unit"):
             errors.append(f"划词保存的笔记不完整: {created}")
+        # E2：保存过的引文要在单元页被重新点亮。
+        # 必须先去别的页面再回来：同一个 hash 不会触发重渲染，高亮那次就不会跑。
+        goto("#/dashboard")
+        wait_for(".hero", "学习闭环")
+        goto(f"#/unit/{unit_id}")
+        wait_for(".essence-text", "一句话本质")
+        time.sleep(1.6)
+        hl = evaluate(
+            "(()=>{const marks=[...document.querySelectorAll('.note-hl')];"
+            "return {marks:marks.length, tip:!!document.querySelector('.note-hl-tip'),"
+            "text:marks.map(m=>m.textContent).join('').slice(0,40)}})()"
+        )
+        if not hl or hl.get("marks", 0) < 1 or not hl.get("tip"):
+            errors.append(f"灵感引文没有高亮: {hl}")
+        shot("unit-note-highlight.png")
         goto("#/notes")
         wait_for(".note-card", "灵感库")
         notes_page = evaluate(
@@ -392,6 +632,17 @@ def main():
 
         goto("#/settings")
         wait_for(".settings-grid", "模型连接")
+        # E7：缓存开关与统计
+        cache = evaluate(
+            "(()=>{const t=document.querySelector('#llm-cache-enabled');"
+            "const row=t?t.closest('.cache-row'):null;"
+            "return {toggle:!!t, checked:t?t.checked:false,"
+            "hint:(row&&row.querySelector('.hint'))?row.querySelector('.hint').textContent:'',"
+            "clear:!!document.querySelector('#clear-cache')}})()"
+        )
+        if not cache or not cache.get("toggle") or not cache.get("clear") \
+                or "命中" not in cache.get("hint", ""):
+            errors.append(f"设置页缺少缓存控制: {cache}")
         shot("settings.png")
         anki = evaluate(
             "(async()=>{const r=await fetch('/api/export/anki');const t=await r.text();"
@@ -420,6 +671,42 @@ def main():
         # mobile
         call("Emulation.setDeviceMetricsOverride",
              {"width": 390, "height": 844, "deviceScaleFactor": 2, "mobile": True})
+        # F16：风格测试入口 → 5 题 → 人设落到目标 meta
+        goto("#/dashboard")
+        wait_for(".persona-card", "带法")
+        evaluate("document.querySelector('[data-style-test]').click()")
+        wait_for(".style-q", "希望教练怎么带你", 6)
+        style_state = evaluate(
+            "(()=>({qs:document.querySelectorAll('.style-q').length,"
+            "opts:[...document.querySelectorAll('.style-q')].map(q=>q.querySelectorAll('.style-opt').length)}))()")
+        if not style_state or style_state.get("qs") != 5:
+            errors.append(f"风格测试题数不对: {style_state}")
+        evaluate(
+            "(()=>{document.querySelectorAll('.style-q').forEach(q=>{"
+            "q.querySelector('.style-opt').click();});})()")
+        shot("style-test.png")
+        evaluate("document.querySelector('.modal-foot .btn-primary').click()")
+        time.sleep(1.6)
+        persona = evaluate(
+            "(async()=>{const r=await fetch('/api/dashboard');const j=await r.json();"
+            "const p=j.data.goal.meta.persona;"
+            "return {key:p?p.key:'',label:p?p.label:'',strategy:p?p.strategy:'',"
+            "card:!!document.querySelector('.persona-card .badge-violet')}})()")
+        if not persona or not persona.get("key") or not persona.get("strategy"):
+            errors.append(f"风格测试没有写入人设: {persona}")
+        else:
+            print(f"  style persona: {persona.get('label')} (card={persona.get('card')})")
+        goto("#/settings")
+        wait_for(".settings-grid", "模型连接")
+        # F6：诊断面板要么给出成功态，要么给出可复制的分类诊断
+        diag = evaluate(
+            "(()=>({ok:!!document.querySelector('.diag-ok'),"
+            "box:!!document.querySelector('.diag-box'),"
+            "hint:(document.querySelector('.diag-body .callout')||{}).textContent||'',"
+            "copy:!!document.querySelector('[data-diag-copy]')}))()")
+        if not diag or not (diag.get("ok") or diag.get("box")):
+            errors.append(f"模型诊断区没有渲染: {diag}")
+        shot("settings-desktop.png")
         goto("#/dashboard")
         wait_for(".hero", "学习闭环")
         shot("dashboard-mobile.png")

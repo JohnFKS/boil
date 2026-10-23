@@ -467,6 +467,13 @@ export function openModal({ title = "", subtitle = "", body = "", actions = [], 
   return { close, modal, body: bodyEl, root: backdrop };
 }
 
+/** 浮层（划词菜单、灵感气泡、划词面板、模态框）打开时，页面级快捷键要让路。 */
+export function overlayOpen() {
+  if (document.querySelector(".modal-backdrop")) return true;
+  return [...document.querySelectorAll(".selection-menu, .note-popover, .sel-panel")]
+    .some(x => x.style.display !== "none");
+}
+
 export function confirmDialog({ title = "确认", message = "", confirmLabel = "确认", danger = false } = {}) {
   return new Promise((resolve) => {
     let settled = false;
@@ -505,4 +512,33 @@ export function autoResize(el) {
 
 export function scrollToTop() {
   window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+/* AI 可用性三态：未配置 = 入口不渲染；可用 = 渲染；连续失败 = 熔断隐藏。
+   核心学习流程（复习、苏格拉底、费曼、洞察）永远不依赖这里。 */
+const AI_FAIL_LIMIT = 2;
+
+export function aiMode(ctx) {
+  const s = ctx?.state || {};
+  return s.dashboard?.llm?.mode || s.me?.llm?.mode || "demo";
+}
+
+export function aiBroken(ctx) {
+  return ((ctx?.state?.aiFails) || 0) >= AI_FAIL_LIMIT;
+}
+
+export function aiEnabled(ctx) {
+  return aiMode(ctx) === "live" && !aiBroken(ctx);
+}
+
+export function aiSuccess(ctx) {
+  if (ctx?.state) ctx.state.aiFails = 0;
+}
+
+export function aiFailure(ctx) {
+  if (!ctx?.state) return;
+  ctx.state.aiFails = (ctx.state.aiFails || 0) + 1;
+  if (ctx.state.aiFails === AI_FAIL_LIMIT) {
+    toast("AI 暂时不可用，已临时隐藏 AI 入口；烧水的主流程不受影响。", "info", 5200);
+  }
 }

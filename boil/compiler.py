@@ -23,6 +23,15 @@ PROBE_TEMPLATES = {
 
 HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$", re.M)
 NUMBERED_RE = re.compile(r"^\s*(?:\d+[.、)]|[-*•])\s+(.+)$")
+SENT_END_RE = re.compile(r"[。！？!?；;\n]")
+
+# 长材料的三道闸门：单次调用上限、每批预算、单元数量上限
+BATCH_CHAR_BUDGET = 7000
+# 实测（Dots 网关）：8.6k 字材料单次调用能出可用 JSON，10.2k 字就在尾部被截成
+# "difficulty":4,":5,":":40"——能否修好变成掷硬币。上限按真实输出能力定，不按上下文长度定。
+SINGLE_CALL_LIMIT = 6000
+MAX_UNITS_SINGLE = 10
+MAX_UNITS_BATCHED = 40
 
 
 def _norm_text(value: Any, limit: int) -> str:
@@ -277,10 +286,64 @@ def _heuristic_unit(title: str, body: str, index: int, subject: str) -> dict[str
     return unit
 
 
+SECTION_SPLIT_THRESHOLD = 3000
+
+
+def _anchors_from_llm(body: str) -> list[str]:
+    """让模型只给**逐字锚点**，切片仍由代码做：模型不碰原文，就不会改写内容。"""
+    prompt = (
+        "下面是一段没有小标题的长正文。请挑出 2–5 个话题转折点的**逐字片段**"
+        "（每段 8–30 字，必须原样出现在正文里，不要改写、不要加省略号）。\n\n"
+        "只输出 JSON：{\"anchors\": [\"逐字片段\"]}\n\n正文：\n" + body[:12000]
+    )
+    data = llm.chat_json([
+        {"role": "system", "content": "你只负责定位，不改写文本。只输出合法 JSON。"},
+        {"role": "user", "content": prompt},
+    ], model=llm.model_name(), temperature=0.1, max_tokens=500)
+    anchors = data.get("anchors") if isinstance(data, dict) else None
+    out = []
+    for raw in (anchors or [])[:6]:
+        anchor = str(raw or "").strip()
+        if 4 <= len(anchor) <= 60 and anchor in body and anchor not in out:
+            out.append(anchor)
+    return out
+
+
+def _slice_at_anchors(body: str, anchors: list[str]) -> list[tuple[str, str]]:
+    positions = sorted({body.find(a) for a in anchors if body.find(a) >= 0})
+    positions = [p for p in positions if p > 0]
+    if not positions:
+        return []
+    pieces = []
+    bounds = [0, *positions, len(body)]
+    for i in range(len(bounds) - 1):
+        chunk = body[bounds[i]:bounds[i + 1]].strip()
+        if len(chunk) < 60:
+            continue
+        first = re.split(r"[。！？!?\n]", chunk)[0].strip()
+        pieces.append((first[:28] or f"片段 {len(pieces) + 1}", chunk))
+    return pieces
+
+
+def _split_oversized(title: str, body: str) -> list[tuple[str, str]]:
+    """超长小节（常见于没有小标题的 PDF 粘贴）按锚点切开；失败就原样返回。"""
+    if len(body) <= SECTION_SPLIT_THRESHOLD or not llm.enabled():
+        return [(title, body)]
+    try:
+        pieces = _slice_at_anchors(body, _anchors_from_llm(body))
+    except Exception:
+        return [(title, body)]
+    return pieces if len(pieces) >= 2 else [(title, body)]
+
+
 def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool = True) -> dict[str, Any]:
     sections = _split_sections(text, use_embeddings=use_embeddings)
     if not sections:
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
+    expanded: list[tuple[str, str]] = []
+    for sec_title, sec_body in sections:
+        expanded.extend(_split_oversized(sec_title, sec_body))
+    sections = expanded
     units = [_heuristic_unit(t, b, i, subject) for i, (t, b) in enumerate(sections[:8])]
     pid = f"user.{slugify(subject or title, 'material')}.{new_id('')[:6]}"
     pack = {
@@ -304,11 +367,18 @@ def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool 
     return normalize_pack(pack, source="compiler")
 
 
-def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict[str, Any]:
+def _normalize_llm_units(data: Any, title: str, subject: str,
+                         limit: int = MAX_UNITS_SINGLE,
+                         warnings: list[str] | None = None) -> dict[str, Any]:
+    if isinstance(data, list):        # 模型偶尔直接回一个单元数组，而不是包对象
+        data = {"units": data}
     if not isinstance(data, dict) or not isinstance(data.get("units"), list):
         raise PackError("模型返回的 Pack 结构不正确", ["缺少 units 数组"])
+    if len(data["units"]) > limit and warnings is not None:
+        warnings.append(f"模型返回 {len(data['units'])} 个单元，只留下前 {limit} 个；"
+                        "这份材料建议拆成两次导入")
     units = []
-    for i, raw in enumerate(data["units"][:10]):
+    for i, raw in enumerate(data["units"][:limit]):
         if not isinstance(raw, dict):
             continue
         u = {
@@ -349,6 +419,13 @@ def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict
             })
         if not probes:
             probes = _make_probes(u)
+        else:
+            # 模型只给了部分类型时补齐缺的那几种：四个维度缺一，掌握度就少一路证据
+            have = {p.get("kind") for p in probes}
+            missing = [k for k in PROBE_TEMPLATES if k not in have]
+            for k in missing:
+                probes.extend(p for p in _make_probes(u) if p["kind"] == k)
+            probes = probes[:8]
         u["probes"] = probes
         raw_cards = raw.get("cards") or []
         cards = []
@@ -381,6 +458,155 @@ def _normalize_llm_units(data: dict[str, Any], title: str, subject: str) -> dict
     return normalize_pack(pack, source="compiler")
 
 
+def _cut_at_sentence(text: str, limit: int) -> str:
+    """在前 limit 个字里找最后一个句子结尾；找不到就硬切，保证一定有进展。"""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    best = -1
+    for m in SENT_END_RE.finditer(window):
+        best = m.end()
+    cut = best if best >= limit // 3 else limit
+    return text[:cut]
+
+
+def _chunk_section(title: str, body: str, budget: int) -> list[tuple[str, str]]:
+    """无损切开超长小节：先按空行拆段，超长段再按句号切，然后把小块装回预算内。
+
+    这里以前写的是 body[:budget]——后半篇被静默丢掉，而产品对用户承诺的是
+    「模型读完了全部材料」，截断不吭声就是在说谎。
+    """
+    if len(body) <= budget:
+        return [(title, body)]
+    atoms: list[str] = []
+    for block in re.split(r"\n\s*\n", body):
+        block = block.strip()
+        if not block:
+            continue
+        while len(block) > budget:
+            head = _cut_at_sentence(block, budget)
+            atoms.append(head)
+            block = block[len(head):].lstrip()
+        if block:
+            atoms.append(block)
+    pieces: list[str] = []
+    for atom in atoms:
+        if pieces and len(pieces[-1]) + len(atom) + 2 <= budget:
+            pieces[-1] = pieces[-1] + "\n\n" + atom
+        else:
+            pieces.append(atom)
+    out = [(title if i == 0 else f"{title}（续 {i}）", piece)
+           for i, piece in enumerate(pieces) if piece.strip()]
+    return out or [(title, _cut_at_sentence(body, budget))]
+
+
+def _batch_sections(sections: list[tuple[str, str]],
+                    budget: int | None = None) -> list[list[tuple[str, str]]]:
+    """按预算把小节装成批次；超长小节先无损切开，绝不丢字。
+
+    budget 在调用时才读全局值，写成默认参数会把常量冻结在定义时刻，测试就无法调整。
+    """
+    budget = budget or BATCH_CHAR_BUDGET
+    batches: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    used = 0
+    for title, body in sections:
+        for piece_title, piece in _chunk_section(title, body, budget):
+            size = len(piece_title) + len(piece)
+            if current and used + size > budget:
+                batches.append(current)
+                current, used = [], 0
+            current.append((piece_title, piece))
+            used += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _skeleton(sections: list[tuple[str, str]]) -> str:
+    """全篇骨架：标题 + 首句。让模型在第一批之前就看见整份材料的形状。"""
+    lines = []
+    for title, body in sections:
+        first = _first_sentences(body, 1, 90)
+        lines.append(f"- {title[:40]}：{first}" if first else f"- {title[:40]}")
+    return "\n".join(lines)[:12000]
+
+
+def _outline_pass(title: str, subject: str, sections: list[tuple[str, str]],
+                  char_total: int) -> dict[str, Any]:
+    prompt = (llm.load_prompt("compiler_outline.md")
+              .replace("{title}", title).replace("{subject}", subject or "未指定")
+              .replace("{section_total}", str(len(sections)))
+              .replace("{char_total}", f"{char_total:,}")
+              .replace("{skeleton}", _skeleton(sections)))
+    data = llm.chat_json([
+        {"role": "system", "content": "你是严谨的学习内容规划器。只输出合法 JSON。"},
+        {"role": "user", "content": prompt},
+    ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=4000)
+    return data if isinstance(data, dict) else {}
+
+
+def _outline_titles(outline: dict[str, Any]) -> str:
+    entries = (outline.get("outline") or [])[:12]
+    if not entries:
+        return "（未提供大纲，按材料原顺序处理）"
+    return "；".join(str(e.get("title") or "") for e in entries if isinstance(e, dict))
+
+
+def compile_material_batched(title: str, subject: str, text: str,
+                             use_embeddings: bool = True
+                             ) -> tuple[dict[str, Any], list[str]]:
+    """长材料分批编译：先全篇骨架出大纲，再逐批只针对本批出单元。
+
+    单次调用截断到 24k 会让模型只看得到开头——那不等于"分析完所有素材"。
+    """
+    warnings: list[str] = []
+    sections = _split_sections(text, use_embeddings=use_embeddings)
+    if not sections:
+        raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
+    outline_data = _outline_pass(title, subject, sections, len(text))
+    outline_hint = _outline_titles(outline_data)
+    batches = _batch_sections(sections)
+    collected: list[dict[str, Any]] = []
+    for i, batch in enumerate(batches):
+        # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
+        body = "\n\n".join(f"## {t}\n{b}" for t, b in batch)
+        prompt = (llm.load_prompt("compiler_batch.md")
+                  .replace("{title}", title).replace("{subject}", subject or "未指定")
+                  .replace("{outline}", outline_hint)
+                  .replace("{batch_index}", str(i + 1)).replace("{batch_total}", str(len(batches)))
+                  .replace("{text}", body))
+        try:
+            data = llm.chat_json([
+                {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=9000)
+        except Exception as exc:
+            warnings.append(f"第 {i + 1}/{len(batches)} 批编译失败，已跳过：{str(exc)[:140]}")
+            continue
+        for unit in (data.get("units") or []) if isinstance(data, dict) else []:
+            if isinstance(unit, dict):
+                collected.append(unit)
+    if not collected:
+        raise PackError("分批编译没有产出任何单元", ["请重试或使用本地编译器"])
+    merged = {"name": outline_data.get("name") or title,
+              "description": outline_data.get("description") or "",
+              "subject": outline_data.get("subject") or subject,
+              "outline": outline_data.get("outline") or [],
+              "study_plan": outline_data.get("study_plan") or [],
+              "digest": outline_data.get("digest") or {},
+              "units": collected}
+    pack = _normalize_llm_units(merged, title, subject,
+                                limit=MAX_UNITS_BATCHED, warnings=warnings)
+    if len(batches) > 1:
+        pack["source"]["batches"] = len(batches)
+        pack["source"]["material_chars"] = len(text)
+    errors = validate_pack(pack)
+    if errors:
+        raise PackError("分批编译的 Pack 未通过校验", errors)
+    return pack, warnings
+
+
 def compile_material(title: str, subject: str, text: str,
                      use_llm: bool = True,
                      use_embeddings: bool = True) -> tuple[dict[str, Any], list[str]]:
@@ -388,18 +614,29 @@ def compile_material(title: str, subject: str, text: str,
     subject = (subject or "").strip()
     warnings: list[str] = []
     if use_llm and llm.enabled():
+        if len(text) > SINGLE_CALL_LIMIT:
+            try:
+                return compile_material_batched(title, subject, text, use_embeddings=use_embeddings)
+            except Exception as exc:
+                warnings.append(f"分批编译失败，已回退单次抽取或本地编译器：{str(exc)[:160]}")
         prompt = llm.load_prompt("compiler_extract.md")
         prompt = prompt.replace("{title}", title).replace("{subject}", subject or "未指定")
-        prompt = prompt.replace("{text}", text[:24000])
+        body = text if len(text) <= SINGLE_CALL_LIMIT else text[:SINGLE_CALL_LIMIT]
+        if body != text:
+            warnings.append(f"只送进了前 {SINGLE_CALL_LIMIT:,} 字（材料共 {len(text):,} 字），"
+                            "后半篇没有被模型读到；建议缩短材料或重试分批编译")
+        prompt = prompt.replace("{text}", body)
         try:
             data = llm.chat_json([
                 {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
                 {"role": "user", "content": prompt},
             ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=12000)
-            pack = _normalize_llm_units(data, title, subject)
+            trimmed: list[str] = []
+            pack = _normalize_llm_units(data, title, subject, warnings=trimmed)
             errors = validate_pack(pack)
             if errors:
                 raise PackError("模型生成的 Pack 未通过校验", errors)
+            warnings.extend(trimmed)
             return pack, warnings
         except Exception as exc:
             warnings.append(f"真实模型编译失败，已回退本地编译器：{str(exc)[:180]}")

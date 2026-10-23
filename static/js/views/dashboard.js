@@ -1,8 +1,9 @@
 /* Dashboard: one screen to decide the next best action. */
 import {
   escapeHTML, icon, pct, relativeTime, ringSVG, radarSVG, statusMeta,
-  eventMeta, daysUntil, formatMinutes, truncate,
+  eventMeta, daysUntil, formatMinutes, truncate, toast,
 } from "../utils.js";
+import { openStyleTest } from "../styleTest.js";
 
 function greeting() {
   const h = new Date().getHours();
@@ -63,6 +64,7 @@ export async function render(el, ctx, params) {
   const facetLabels = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
   const facetValues = ["recall", "explain", "apply", "transfer"].map(k => mastery.facets?.[k] || 0);
   const digest = d.digest || goal?.meta?.ai_digest || {};
+  const persona = goal?.meta?.persona || null;
   const byModel = (d.generated_by || goal?.meta?.ai_generated_by) === "model";
   const currentUnitId = unit?.id;
   const mapUnits = d.map_preview?.units || d.next_units?.slice(0, 6) || [];
@@ -146,6 +148,24 @@ export async function render(el, ctx, params) {
             ${(d.study_plan_phases || []).length ? `<div class="phase-strip">${d.study_plan_phases.map(p => `<span class="phase-chip"><strong>${escapeHTML(p.phase || "")}</strong>${escapeHTML(p.focus || "")}</span>`).join("")}</div>` : ""}
           </div>` : ""}
 
+          ${persona ? `
+          <div class="card card-pad persona-card">
+            <div class="between">
+              <div><div class="section-title">教练的带法</div><div class="section-sub">${escapeHTML(persona.strategy || "")}</div></div>
+              <span class="badge badge-violet">${icon("compass", 12)} ${escapeHTML(persona.label)}</span>
+            </div>
+            <div class="row mt-2" style="gap:8px;flex-wrap:wrap">
+              ${persona.secondary_label ? `<span class="badge badge-muted">次倾向：${escapeHTML(persona.secondary_label)}</span>` : ""}
+              <button class="btn btn-ghost btn-sm" data-style-test>${icon("refresh", 13)} 重测带法</button>
+            </div>
+          </div>` : `
+          <div class="card card-pad persona-card">
+            <div class="between">
+              <div><div class="section-title">还没测过带法</div><div class="section-sub">5 道情境题，决定追问是「拆小步」还是「多对照」。不测也能正常学习。</div></div>
+              <button class="btn btn-ghost btn-sm" data-style-test>${icon("compass", 13)} 花 3 分钟测一下</button>
+            </div>
+          </div>`}
+
           <div class="grid grid-2">
             <div class="card card-pad">
               <div class="section-head"><div><div class="section-title">掌握雷达</div><div class="section-sub">证据来自复习、对话、讲解与探针</div></div><span class="badge badge-teal">${pct(mastery.average || 0)}</span></div>
@@ -218,6 +238,12 @@ export async function render(el, ctx, params) {
   el.querySelectorAll("[data-unit]").forEach(node => {
     node.addEventListener("click", () => ctx.navigate(`#/unit/${node.dataset.unit}`));
   });
+  el.querySelector("[data-style-test]")?.addEventListener("click", () => {
+    openStyleTest(ctx, () => {
+      ctx.refreshView().catch(() => toast("刷新失败，刷新页面可看到新带法", "info"));
+    });
+  });
+
   const advisorState = { advice: null, minutes: Math.min(60, Math.max(10, goal.daily_minutes || 30)) };
   el.querySelector("#advisor-card")?.addEventListener("click", (e) => {
     const minuteBtn = e.target.closest("[data-advice-minutes]");

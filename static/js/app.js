@@ -2,7 +2,7 @@
 import * as api from "./api.js";
 import {
   escapeHTML, escapeAttr, icon, qs, qsa, toast, openModal, renderMath,
-  debounce, formatDate, daysUntil, pct, truncate, statusMeta, uid,
+  debounce, formatDate, daysUntil, pct, truncate, statusMeta, uid, overlayOpen,
 } from "./utils.js";
 import * as onboardingView from "./views/onboarding.js";
 import * as dashboardView from "./views/dashboard.js";
@@ -26,6 +26,7 @@ const state = {
   route: "dashboard",
   params: {},
   loading: true,
+  aiFails: 0,
 };
 
 let cleanupFn = null;
@@ -241,6 +242,15 @@ function bindShell() {
 
 function globalKeyHandler(e) {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openSearch();
+    return;
+  }
+  // 「/」= 搜索：输入框里打字、或已经有浮层时不能抢键
+  if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const tag = (e.target?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || e.target?.isContentEditable) return;
+    if (overlayOpen()) return;
     e.preventDefault();
     openSearch();
   }

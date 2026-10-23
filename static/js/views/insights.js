@@ -2,6 +2,7 @@
 import {
   escapeHTML, escapeAttr, icon, pct, radarSVG, lineChartSVG, barChartSVG,
   heatmapHTML, formatMinutes, relativeTime, formatDate, statusMeta,
+  aiEnabled, aiMode, aiFailure, aiSuccess,
 } from "../utils.js";
 
 const FACETS = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
@@ -36,6 +37,9 @@ export async function render(el, ctx, params) {
   const next = data.next_action || {};
   const sessions = data.recent_sessions || [];
   const gaps = data.gaps || [];
+  const mistakes = data.mistakes || {};
+  const mistakeTags = mistakes.tags || [];
+  const mistakeMax = Math.max(1, ...mistakeTags.map(t => Number(t.count) || 0));
 
   el.innerHTML = `
     <div class="page-head">
@@ -55,15 +59,21 @@ export async function render(el, ctx, params) {
       <div class="stat"><span class="stat-icon teal">${icon("review", 18)}</span><div><div class="stat-value">${pct(stats.retention_30d || 0)}</div><div class="stat-label">30 天保留率</div></div></div>
       <div class="stat"><span class="stat-icon gold">${icon("flame", 18)}</span><div><div class="stat-value">${Math.round(data.average_heat || 0)}°</div><div class="stat-label">平均火候</div></div></div>
       <div class="stat"><span class="stat-icon violet">${icon("flame", 18)}</span><div><div class="stat-value">${stats.streak || 0} 天</div><div class="stat-label">连续学习</div></div></div>
+      <div class="stat"><span class="stat-icon teal">${icon("brain", 18)}</span><div><div class="stat-value">${data.memory_health === null || data.memory_health === undefined ? "—" : pct(data.memory_health)}</div><div class="stat-label">记忆健康度</div></div></div>
     </div>
+    <p class="faint tiny mt-2">记忆健康度 = 所有已学卡片此刻平均还能提取多少（按 FSRS 的遗忘曲线算）。它和上面的「30 天保留率」不是一回事：那个看的是过去复习答对的比例，这个看的是现在的状态。目标同样停在 85–90%，掉到 80% 以下就该先补复习。</p>
 
     <div class="card card-pad mt-4" id="insight-ai-card" data-selectable data-source="insights">
       <div class="section-head">
         <div><div class="section-title">本周解读</div><div class="section-sub">把全部证据与材料总览一起交给模型，再回给你一段判断</div></div>
-        <button class="btn btn-ghost btn-sm" id="insight-ai-btn" type="button">${icon("wand", 13)} 生成解读</button>
+        ${aiEnabled(ctx) ? `<button class="btn btn-ghost btn-sm" id="insight-ai-btn" type="button">${icon("wand", 13)} 生成解读</button>` : ""}
       </div>
       <div id="insight-ai-body" class="mt-2">
-        <p class="muted small">还没有生成。点击「生成解读」，AI 会读完掌握度、保留率、火候分布与材料总览后给出结论。</p>
+        <p class="muted small">${aiEnabled(ctx)
+          ? "还没有生成。点击「生成解读」，AI 会读完掌握度、保留率、火候分布与材料总览后给出结论。"
+          : aiMode(ctx) === "live"
+            ? "AI 暂时不可用，入口已隐藏；下面的证据与图表都是本地计算的，可以照常使用。"
+            : "没有配置模型。证据与图表都来自本地计算；配置模型后可以点这里生成一句话解读。"}</p>
       </div>
     </div>
 
@@ -79,6 +89,12 @@ export async function render(el, ctx, params) {
         <div class="section-head"><div><div class="section-title">保留率趋势</div><div class="section-sub">每次复习前的可提取概率</div></div><span class="badge badge-teal">近 30 天</span></div>
         ${lineChartSVG(retentionPoints, { width: 440, height: 210, color: "var(--teal)" })}
         <p class="faint tiny mt-2">保留率不是越高越好；目标是 85–90% 附近，保留一点“合意困难”更有利于长期记忆。</p>
+      </div>
+      <div class="card chart-card">
+        <div class="section-head"><div><div class="section-title">错因分布</div><div class="section-sub">答得不好时你自己标的「哪里没对上」</div></div><span class="badge badge-muted">近 ${mistakes.sample || 0} 次复习</span></div>
+        ${mistakeTags.length ? `<div class="mistake-dist">${mistakeTags.map(t => `<div class="mistake-dist-row"><span class="mistake-dist-label">${escapeHTML(t.label)}</span><span class="mistake-dist-bar" style="width:${Math.max(4, (Number(t.count) || 0) / mistakeMax * 100)}%"></span><span class="mistake-dist-count">${t.count}</span></div>`).join("")}</div>
+          <p class="faint tiny mt-2">${mistakes.tagged_reviews || 0} / ${mistakes.sample || 0} 次复习标了错因，没标的不算在内；共有 ${mistakes.missed_total || 0} 次评成「忘了」或「模糊」。</p>`
+          : `<div class="empty" style="padding:22px"><div class="empty-icon">${icon("review", 20)}</div><p>还没有错因记录。复习评「忘了／模糊」时勾一个「哪里没对上」，这里才会积累。</p></div>`}
       </div>
       <div class="card chart-card wide">
         <div class="section-head"><div><div class="section-title">学习热力</div><div class="section-sub">最近 8 周每天投入的分钟数</div></div><span class="badge badge-muted">${formatMinutes(stats.week_minutes || 0)} / 本周</span></div>
@@ -148,6 +164,7 @@ export async function render(el, ctx, params) {
     aiBody.innerHTML = `<p class="muted small">AI 正在把全部证据与材料总览放在一起分析，可能需要十几秒…</p>`;
     try {
       const res = await ctx.api.post("/api/insights/synthesize", {}, { timeout: 120000 });
+      aiSuccess(ctx);
       const badge = res.source === "model"
         ? `<span class="badge badge-teal">AI 分析</span>`
         : `<span class="badge badge-muted">本地规则</span>`;
@@ -157,7 +174,9 @@ export async function render(el, ctx, params) {
         ${(res.suggestions || []).length ? `<div class="side-label mt-2">建议</div><ul class="digest-advice">${res.suggestions.map(s => `<li>${escapeHTML(s)}</li>`).join("")}</ul>` : ""}
         ${(res.risks || []).length ? `<div class="callout ember mt-2"><div class="side-label">风险</div><ul class="digest-advice">${res.risks.map(r => `<li>${escapeHTML(r)}</li>`).join("")}</ul></div>` : ""}`;
     } catch (e) {
-      aiBody.innerHTML = `<p class="muted small">生成失败：${escapeHTML(e.message || "未知错误")}</p>`;
+      aiFailure(ctx);
+      aiBody.innerHTML = `<p class="muted small">生成失败：${escapeHTML(e.message || "未知错误")}。已临时隐藏这个入口，证据与图表照常可用。</p>`;
+      aiBtn.style.display = "none";
     } finally {
       aiBtn.disabled = false;
       aiBtn.innerHTML = label;

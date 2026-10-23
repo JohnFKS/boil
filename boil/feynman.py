@@ -216,10 +216,12 @@ def evaluate(db: Database, user_id: str, unit: dict[str, Any], text: str,
     result = None
     fallback_reason = ""
     if llm.enabled():
+        from . import styles
         prompt = llm.load_prompt("feynman_eval.md")
         prompt = prompt.replace("{mode_label}", MODES[mode]["label"])
         prompt = prompt.replace("{unit_context}", _unit_context(unit))
         prompt = prompt.replace("{explanation}", text)
+        prompt += styles.persona_block_for(db, unit.get("goal_id"))
         try:
             data = llm.chat_json([
                 {"role": "system", "content": "你是严格的费曼讲解评分员。只输出合法 JSON。"},

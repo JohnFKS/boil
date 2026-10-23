@@ -7,7 +7,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import config, embeddings, heat, llm, mastery, planner, socratic
+from . import (config, embeddings, heat, llm, mastery, planner, quality, socratic, styles)
 from .compiler import compile_material
 from .db import Database, SCHEMA_VERSION, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
@@ -321,6 +321,8 @@ def _next_units(units: list[dict[str, Any]], statuses: dict[str, dict[str, Any]]
                 limit: int = 4) -> list[dict[str, Any]]:
     out = []
     for u in sorted(units, key=lambda x: (x.get("order_index") or 0, x["id"])):
+        if u.get("merged_into"):
+            continue          # 被吸收的单元不再被推荐，内容仍在归宿里
         st = statuses.get(u["id"], {})
         if st.get("status") in ("boiled",):
             continue
@@ -415,8 +417,9 @@ def map_data(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
     units = get_goal_units(db, goal["id"])
     relations = get_goal_relations(db, goal["id"])
     statuses = _unit_status_map(db, user_id, units)
+    live_units = [u for u in units if not u.get("merged_into")]
     nodes = []
-    for i, u in enumerate(units):
+    for i, u in enumerate(live_units):
         st = statuses[u["id"]]
         nodes.append({**_unit_card(u, st), "order_index": i,
                       "facets": st.get("facets") or {},
@@ -552,6 +555,378 @@ def export_notes_markdown(db: Database, user_id: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def generate_mnemonic(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
+    """给单元编记忆钩子。材料由服务端读取，不接受前端传来的原文。"""
+    row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
+    if not row:
+        raise ValueError("单元不存在")
+    unit = unit_from_row(row)
+    if not llm.enabled():
+        raise PermissionError("没有配置模型；速记仍然可以自己写")
+    prompt = (llm.load_prompt("mnemonic.md")
+              .replace("{title}", unit.get("title") or "")
+              .replace("{essence}", _meta_field(unit.get("essence"), 600))
+              .replace("{steps}", "\n".join(f"- {s}" for s in (unit.get("steps") or [])[:8]) or "-（无）")
+              .replace("{boundaries}", "\n".join(f"- {b}" for b in (unit.get("boundaries") or [])[:6]) or "-（无）")
+              .replace("{misconceptions}", "\n".join(f"- {m}" for m in (unit.get("misconceptions") or [])[:6]) or "-（无）"))
+    try:
+        data = llm.chat_json([
+            {"role": "system", "content": "你只负责编记忆钩子，不复述内容、不新增知识。只输出合法 JSON。"},
+            {"role": "user", "content": prompt},
+        ], model=llm.model_name(), temperature=0.5, max_tokens=600)
+    except Exception as exc:
+        raise ValueError(f"模型没有返回可用的速记：{str(exc)[:140]}") from exc
+    items = data.get("mnemonics") if isinstance(data, dict) else None
+    hooks = []
+    for raw in (items or []):
+        text = _meta_field(raw, 60)
+        if len(text) >= 4 and text not in hooks:
+            hooks.append(text)
+    if not hooks:
+        raise ValueError("模型没有给出可用的记忆钩子，可以试一次「重新生成」或自己写")
+    return {
+        "mnemonics": hooks[:3],
+        "note": _meta_field(data.get("note") if isinstance(data, dict) else "", 80),
+        "unit_id": unit_id,
+        "source": "model",
+    }
+
+
+CLOZE_MIN, CLOZE_MAX = 3, 8
+
+
+def _rules_cards(text: str) -> list[dict[str, str]]:
+    """没有模型时的确定性抽取：问答、配对、完形三种形状，只从原文取词。"""
+    out: list[dict[str, str]] = []
+    lines = [re.sub(r"^[\s>\-*•·]+", "", l).strip() for l in (text or "").splitlines()]
+    lines = [l for l in lines if 4 <= len(l) <= 400]
+    for line in lines:
+        if len(out) >= 6:
+            break
+        m = re.match(r"^(.{2,60}?)[？?]\s*[:：]?\s*(.{2,300})$", line)
+        if m and len(m.group(2)) >= 4:
+            out.append({"front": m.group(1).strip() + "？", "back": m.group(2).strip()})
+            continue
+        m = re.match(r"^(.{2,40}?)\s*[:：=→]\s*(.{2,300})$", line)
+        if m:
+            out.append({"front": f"{m.group(1).strip()}是什么？", "back": m.group(2).strip()})
+    if not out:
+        for line in lines:
+            words = re.findall(r"[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9_]{2,7}", line)
+            if not words or len(line) < 12:
+                continue
+            pick = max(words, key=lambda w: (len(w) >= CLOZE_MIN and len(w) <= CLOZE_MAX, line.rfind(w)))
+            if not (CLOZE_MIN <= len(pick) <= CLOZE_MAX):
+                continue
+            blank = line.replace(pick, "（　）", 1)
+            if blank == line:
+                continue
+            out.append({"front": blank[:300], "back": f"{pick}（原文：{line[:160]}）"})
+            if len(out) >= 3:
+                break
+    return out
+
+
+def cards_from_text(db: Database, user_id: str, text: str,
+                    unit_id: str | None = None) -> dict[str, Any]:
+    """把选中的文字提炼成复习卡——只出预览，用户确认后才入库（借鉴 testlearn 的 memorize）。"""
+    source = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    clipped = ""
+    if len(source) < 8:
+        raise ValueError("选中内容太短，至少 8 个字才能提炼卡片")
+    if len(source) > 4000:
+        clipped = f"选中 {len(source):,} 字太长，只送了前 4,000 字。"
+        source = source[:4000]
+    unit = None
+    if unit_id:
+        unit = db.one("SELECT id, title, essence FROM units WHERE id=?", (unit_id,))
+        if not unit:
+            unit = None
+    cards: list[dict[str, str]] = []
+    engine = "rules"
+    note = "没有配置模型，以下卡片由本地规则（问答/配对/完形）生成。"
+    if llm.enabled():
+        try:
+            prompt = (llm.load_prompt("cards_from_text.md")
+                      .replace("{unit}", (unit or {}).get("title") or "（未关联单元）")
+                      .replace("{text}", source))
+            data = llm.chat_json([
+                {"role": "system", "content": "你只把给定文字变成复习卡，不新增事实。只输出合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ], model=llm.model_name(), temperature=0.3, max_tokens=900)
+            raw = data.get("cards") if isinstance(data, dict) else data
+            seen: set[str] = set()
+            for item in (raw or [])[:8]:
+                if not isinstance(item, dict):
+                    continue
+                front = _meta_field(item.get("front"), 300)
+                back = _meta_field(item.get("back"), 600)
+                if len(front) < 4 or len(back) < 2 or front in seen:
+                    continue
+                seen.add(front)
+                cards.append({"front": front, "back": back})
+            engine = "model"
+            note = "由模型基于选中文字提炼；确认前不会进入复习队列。"
+        except Exception as exc:
+            note = f"模型提炼失败，已改用本地规则：{str(exc)[:120]}"
+    if not cards:
+        cards = _rules_cards(source)
+        engine = "rules"
+    if not cards:
+        raise ValueError("这段文字里没能提炼出可用的卡片，换一段有结论性的内容再试")
+    if clipped:
+        note = f"{note}{clipped}"
+    return {
+        "status": "preview",
+        "cards": cards,
+        "engine": engine,
+        "engine_note": note,
+        "unit_id": unit["id"] if unit else None,
+        "unit_title": unit["title"] if unit else None,
+        "tool_args": {"cards": cards, "unit_id": unit["id"] if unit else None},
+    }
+
+
+def confirm_cards(db: Database, user_id: str, cards: Any, unit_id: str | None) -> dict[str, Any]:
+    """确认后的卡片写入复习队列：必须挂在某个单元上，否则 FSRS 无法排程。"""
+    unit = None
+    if unit_id:
+        unit = db.one("SELECT id, title FROM units WHERE id=?", (unit_id,))
+    if not unit:
+        goal = active_goal(db, user_id)
+        if goal:
+            row = db.one("SELECT id, title FROM units WHERE goal_id=? ORDER BY order_index, id",
+                         (goal["id"],))
+            unit = row
+    if not unit:
+        raise ValueError("需要先有学习目标的单元，卡片才能被排进复习")
+    ts = now_iso()
+    created = []
+    for item in (cards or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        front = _meta_field(item.get("front"), 300)
+        back = _meta_field(item.get("back"), 600)
+        if len(front) < 4 or len(back) < 2:
+            continue
+        card_id = new_id("cd")
+        db.insert("cards", {
+            "id": card_id, "user_id": user_id, "unit_id": unit["id"], "probe_id": None,
+            "front": front, "back": back, "state": "new", "step": 0, "stability": 0,
+            "difficulty": 0, "due_at": ts, "last_review": None, "reps": 0, "lapses": 0,
+            "created_at": ts, "updated_at": ts,
+        })
+        created.append(card_id)
+    if not created:
+        raise ValueError("没有有效的卡片可保存")
+    emit(db, "cards.generated", {"unit_id": unit["id"], "count": len(created),
+                                "source": "selection"}, user_id)
+    return {
+        "ok": True, "count": len(created), "card_ids": created,
+        "unit_id": unit["id"], "unit_title": unit["title"],
+        "summary": f"已加入 {len(created)} 张复习卡到「{unit['title']}」，今天就会到期一次。",
+    }
+
+
+def ask_about_selection(db: Database, user_id: str, question: str,
+                        context: str, unit_id: str | None = None) -> dict[str, Any]:
+    """对选中内容追问一句：带上锚点上下文，单轮回答，可存成灵感。"""
+    if not llm.enabled():
+        raise PermissionError("没有配置模型；追问需要真实模型")
+    q = str(question or "").strip()[:500]
+    if not q:
+        raise ValueError("问题不能为空")
+    anchor = re.sub(r"\r\n?", "\n", str(context or ""))[:2400]
+    unit = db.one("SELECT id, title, essence FROM units WHERE id=?", (unit_id,)) if unit_id else None
+    prompt = (llm.load_prompt("quick_ask.md")
+              .replace("{unit}", (unit or {}).get("title") or "（未关联单元）")
+              .replace("{context}", anchor or "（没有上下文）")
+              .replace("{question}", q))
+    try:
+        answer = llm.chat([
+            {"role": "system", "content": "你是学习教练，只根据给出的上下文与常识回答，简洁。"},
+            {"role": "user", "content": prompt},
+        ], model=llm.model_name(), temperature=0.4, max_tokens=800)
+    except Exception as exc:
+        raise ValueError(f"模型没有回答：{str(exc)[:140]}") from exc
+    return {
+        "question": q,
+        "answer": answer.strip()[:2000],
+        "source": "model",
+        "unit_id": unit["id"] if unit else None,
+    }
+
+
+def save_style_test(db: Database, user_id: str, answers: Any) -> dict[str, Any]:
+    """学习风格测试：5 题 → 教学人设，写进当前目标的 meta，供追问与讲解带法使用。"""
+    goal = active_goal(db, user_id)
+    if not goal:
+        raise ValueError("还没有学习目标；先创建目标再测")
+    persona = styles.compute_persona(answers)
+    persona["answers"] = [int(a) for a in answers]
+    persona["taken_at"] = now_iso()
+    meta = dict(goal.get("meta") or {})
+    meta["persona"] = persona
+    db.execute("UPDATE goals SET meta_json=?, updated_at=? WHERE id=?",
+               (json_dumps(meta), now_iso(), goal["id"]))
+    emit(db, "style.tested", {"goal_id": goal["id"], "persona": persona["key"],
+                              "secondary": persona.get("secondary")}, user_id)
+    return {"goal_id": goal["id"], "persona": persona}
+
+
+def persona_for_goal(db: Database, user_id: str, goal_id: str | None) -> dict[str, Any]:
+    if not goal_id:
+        goal = active_goal(db, user_id)
+        goal_id = goal["id"] if goal else None
+    if not goal_id:
+        return {}
+    row = db.one("SELECT meta_json FROM goals WHERE id=?", (goal_id,))
+    if not row:
+        return {}
+    return (json_loads(row["meta_json"], {}) or {}).get("persona") or {}
+
+
+def _chain_target(db: Database, unit_id: str, limit: int = 12) -> str | None:
+    """沿 merged_into 走到最终归宿；链太长或成环就停下，绝不静默丢内容。"""
+    seen = {unit_id}
+    current = unit_id
+    for _ in range(limit):
+        row = db.one("SELECT merged_into FROM units WHERE id=?", (current,))
+        nxt = (row or {}).get("merged_into")
+        if not nxt or nxt in seen:
+            return current if current != unit_id else None
+        seen.add(nxt)
+        current = nxt
+    return current
+
+
+def unit_duplicates(db: Database, user_id: str, goal_id: str | None = None,
+                    judge: bool = True) -> dict[str, Any]:
+    """当前目标里疑似重复的存活单元对：分数只提候选，能不能合并由裁决阶梯决定。"""
+    goal = active_goal(db, user_id, goal_id)
+    if not goal:
+        raise ValueError("还没有学习目标")
+    units = [u for u in get_goal_units(db, goal["id"]) if not u.get("merged_into")]
+    pairs = quality.find_near_duplicates({"units": units})
+    by_id = {u["id"]: u for u in units}
+    judged = 0
+    for pair in pairs[:8]:
+        a, b = by_id.get(pair["keep"]), by_id.get(pair["merge"])
+        if not a or not b:
+            continue
+        verdict = None
+        # 字面不够硬的候选都要模型签字，但一次请求最多判 JUDGE_LIMIT 对：
+        # 剩下的标 pending，用户真要点合并时再判（同样命中缓存），别让打开地图变成烧钱
+        need_model = not pair["auto"]
+        if judge and need_model and judged < quality.JUDGE_LIMIT:
+            verdict = quality.judge_pair(a, b)
+            judged += 1
+        decision = quality.merge_decision(a, b, verdict=verdict, semantic=pair["semantic"])
+        pair["pending_judgement"] = bool(need_model and verdict is None)
+        pair["same"] = None if verdict is None else verdict.get("same")
+        pair["model_reason"] = (verdict or {}).get("reason") or ""
+        pair["allowed"] = decision["allowed"]
+        pair["basis"] = decision["basis"]
+        pair["decision_reason"] = decision["reason"]
+    semantic_used = any(p.get("semantic") is not None for p in pairs)
+    return {"goal_id": goal["id"], "pairs": pairs,
+            "engine": "semantic" if semantic_used else "rules",
+            "checked": len(units), "judged": judged,
+            "thresholds": {"lexical": quality.MERGE_LEXICAL_FLOOR,
+                           "candidate": quality.SEMANTIC_CANDIDATE_RATIO,
+                           "list": quality.DUPLICATE_TITLE_RATIO,
+                           "judge_limit": quality.JUDGE_LIMIT}}
+
+
+def merge_units(db: Database, user_id: str, from_id: str, into_id: str,
+                reason: str = "", override: bool = False,
+                confirmed: bool = False) -> dict[str, Any]:
+    """合并单元：被吸收的单元不删除，只改指向归宿，卡片与笔记都还在原处。
+
+    裁决用三级阶梯（见 quality.merge_decision）：字面近乎逐字、或语义过自动线，
+    代码直接放行；两者之间的中间带必须有模型「是同一件事」的判定才放行。
+    模型会翻，所以**非字面证据的合并一律要求 `confirmed: true`**（前端确认框），
+    否则就出现「页面写不可合并、端点自己改判真合了库」这种事故；人被分数挡住但坚持要合的，
+    必须写明理由（basis="user" 记账），不能让一次点击冒充裁决。
+    前置关系会重连到归宿上，其中自环与重复边会被删掉——所以图结构改动当前不可撤销。
+    """
+    from_id, into_id = (from_id or "").strip(), (into_id or "").strip()
+    if not from_id or not into_id:
+        raise ValueError("需要 from 与 into 两个单元")
+    if from_id == into_id:
+        raise ValueError("不能把单元合并到自己")
+    source = db.one("SELECT * FROM units WHERE id=?", (from_id,))
+    target = db.one("SELECT * FROM units WHERE id=?", (into_id,))
+    if not source or not target:
+        raise ValueError("单元不存在")
+    if source["goal_id"] != target["goal_id"]:
+        raise ValueError("只能合并同一目标下的单元")
+    hop = _chain_target(db, into_id)
+    if hop:
+        into_id = hop
+        target = db.one("SELECT * FROM units WHERE id=?", (into_id,))
+    if into_id == from_id:
+        raise ValueError("这两个单元已经指向同一个归宿，不能再互相合并")
+    # 裁决要对准**最终归宿**，不是用户点的那个中间单元
+    semantic = quality.semantic_pair(source, target)
+    decision = quality.merge_decision(source, target, semantic=semantic)
+    if (not decision["allowed"] and decision["basis"] == "none" and semantic is not None
+            and semantic >= quality.SEMANTIC_CANDIDATE_RATIO):
+        decision = quality.merge_decision(
+            source, target, verdict=quality.judge_pair(source, target), semantic=semantic)
+    if decision["allowed"] and decision["basis"] != "lexical" and not confirmed:
+        # 非字面的合并必须由人点头：模型两次能给出相反答案，缓存关掉时更是如此。
+        # 少了这个闸，页面写「不可合并」而端点自己改判并真的合了库（真实模拟抓到过）。
+        raise ValueError(f"需要你先确认：{decision['reason']}。"
+                         "这一步会重写前置关系且当前不能撤销")
+    if not decision["allowed"]:
+        if override and len(str(reason or "").strip()) >= 4:
+            decision = {"allowed": True, "basis": "user",
+                        "reason": f"学习者确认：{_meta_field(reason, 120)}",
+                        "signals": decision["signals"]}
+        else:
+            raise ValueError(f"不能合并：{decision['reason']}。"
+                             "请保留两个单元，或写明理由后坚持合并")
+    similarity = max(decision["signals"]["lexical"], decision["signals"]["semantic"] or 0.0)
+
+    ts = now_iso()
+    note = reason or decision["reason"]
+    stored_reason = _meta_field(
+        f"学习者确认：{note}" if decision["basis"] == "user" else note, 200)
+    with db.transaction():
+        db.execute("UPDATE units SET merged_into=?, merged_reason=?, updated_at=? WHERE id=?",
+                   (into_id, stored_reason, ts, from_id))
+        # 前置关系重连：指向被合并单元的边改指归宿，自己指向自己的边删掉
+        for rel in db.query("SELECT * FROM relations WHERE from_unit=? OR to_unit=?",
+                            (from_id, from_id)):
+            new_from = into_id if rel["from_unit"] == from_id else rel["from_unit"]
+            new_to = into_id if rel["to_unit"] == from_id else rel["to_unit"]
+            if new_from == new_to:
+                db.execute("DELETE FROM relations WHERE id=?", (rel["id"],))
+                continue
+            exists = db.one("SELECT id FROM relations WHERE goal_id=? AND from_unit=? "
+                            "AND to_unit=? AND kind=?",
+                            (rel["goal_id"], new_from, new_to, rel["kind"]))
+            if exists:
+                db.execute("DELETE FROM relations WHERE id=?", (rel["id"],))
+            else:
+                db.execute("UPDATE relations SET from_unit=?, to_unit=? WHERE id=?",
+                           (new_from, new_to, rel["id"]))
+        # 卡片不动：它们仍指向被合并的单元，复习照常发生，只是地图上不再单独出现
+    emit(db, "unit.merged", {"from": from_id, "into": into_id,
+                             "similarity": round4(similarity),
+                             "basis": decision["basis"],
+                             "signals": decision["signals"]}, user_id)
+    return {
+        "from": from_id, "into": into_id,
+        "from_title": source["title"], "into_title": target["title"],
+        "similarity": round4(similarity),
+        "basis": decision["basis"], "signals": decision["signals"],
+        "decision_reason": decision["reason"],
+        "cards_kept": db.scalar("SELECT COUNT(*) FROM cards WHERE unit_id=?", (from_id,), 0) or 0,
+    }
+
+
 def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
     if not row:
@@ -572,6 +947,7 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
         d = dict(c)
         d["preview"] = scheduler.preview_labels(card_from_row(d))
         d["due_label"] = _due_label(d)
+        attach_mistake_tags(d, d)
         cards.append(d)
     sessions = db.query(
         "SELECT * FROM sessions WHERE unit_id=? AND user_id=? ORDER BY started_at DESC LIMIT 5",
@@ -597,8 +973,16 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     records = heat.history(db, user_id, unit_id=unit_id, limit=6)
     all_units = get_goal_units(db, unit["goal_id"])
     related = embeddings.related_units(unit, all_units)
+    merged_into = None
+    if unit.get("merged_into"):
+        row = db.one("SELECT id, title FROM units WHERE id=?", (unit["merged_into"],))
+        merged_into = {"id": row["id"], "title": row["title"]} if row else None
+    absorbed = db.query("SELECT id, title, merged_reason FROM units "
+                        "WHERE goal_id=? AND merged_into=? ORDER BY title",
+                        (unit["goal_id"], unit_id))
     return {"unit": unit, "mastery": m, "status": st[unit_id],
             "heat": h, "heat_label": heat.heat_label(h), "pn": pn,
+            "merged_into": merged_into, "absorbed": absorbed,
             "records": records, "notes": get_unit_notes(db, user_id, unit_id),
             "related": related,
             "probes": probes, "cards": cards, "sessions": sessions,
@@ -651,6 +1035,7 @@ def review_queue(db: Database, user_id: str, limit: int = 30,
         d["retention"] = round4(scheduler.retrievability(float(d.get("stability") or 0),
                                                          _elapsed_days(d)))
         d["mnemonic"] = mnemonics.get(d["unit_id"], "")
+        attach_mistake_tags(d, d)
         cards.append(d)
     due_total = db.scalar(
         "SELECT COUNT(*) FROM cards c JOIN units u ON u.id=c.unit_id "
@@ -663,7 +1048,42 @@ def review_queue(db: Database, user_id: str, limit: int = 30,
         (user_id, *([unit_id] if unit_id else [])), 0,
     ) or 0
     return {"cards": cards, "due_total": int(due_total), "new_total": int(new_total),
+            "mistake_tags": [{"key": k, "label": v} for k, v in MISTAKE_TAGS],
             "stats": _study_stats(db, user_id)}
+
+
+def list_cards(db: Database, user_id: str, q: str | None = None,
+               unit_id: str | None = None, state: str | None = None,
+               limit: int = 60) -> dict[str, Any]:
+    """全量卡片清单：复习中途「提前加卡」与按单元筛选用。"""
+    limit = int(clamp(int(limit or 60), 1, 200))
+    sql = ("SELECT c.*, u.title AS unit_title FROM cards c "
+           "JOIN units u ON u.id=c.unit_id WHERE c.user_id=?")
+    params: list[Any] = [user_id]
+    if unit_id:
+        sql += " AND c.unit_id=?"
+        params.append(unit_id)
+    if state in ("new", "learning", "review", "relearning"):
+        sql += " AND c.state=?"
+        params.append(state)
+    keyword = (q or "").strip()
+    if keyword:
+        sql += " AND (c.front LIKE ? OR c.back LIKE ? OR u.title LIKE ?)"
+        params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+    sql += " ORDER BY CASE WHEN c.state='new' THEN 0 ELSE 1 END, c.due_at, c.created_at LIMIT ?"
+    params.append(limit)
+    rows = db.query(sql, params)
+    now_s = now_iso()
+    cards = []
+    for r in rows:
+        d = _public_card(dict(r))
+        d["unit_title"] = r.get("unit_title") or ""
+        d["due_label"] = _due_label(r)
+        d["is_due"] = bool(r.get("due_at") and r["due_at"] <= now_s)
+        attach_mistake_tags(d, dict(r))
+        cards.append(d)
+    return {"cards": cards, "total": db.scalar(
+        "SELECT COUNT(*) FROM cards WHERE user_id=?", (user_id,), 0) or 0}
 
 
 def _elapsed_days(card: dict[str, Any]) -> float:
@@ -673,8 +1093,31 @@ def _elapsed_days(card: dict[str, Any]) -> float:
     return max(0.0, (now() - parse_iso(last)).total_seconds() / 86400.0)
 
 
+MISTAKE_TAGS: tuple[tuple[str, str], ...] = (
+    ("concept", "概念没吃透"),
+    ("boundary", "条件/边界漏了"),
+    ("step", "步骤缺一环"),
+    ("confusion", "跟别的记混了"),
+    ("carelessness", "粗心笔误"),
+    ("blank", "完全没印象"),
+)
+MISTAKE_KEYS = {k for k, _ in MISTAKE_TAGS}
+MISTAKE_LABELS = dict(MISTAKE_TAGS)
+
+
+def normalize_mistake_tags(raw: Any) -> list[str]:
+    """固定 taxonomy：只认已知标签，去重、保序、最多 4 个。"""
+    out: list[str] = []
+    for item in (raw or []):
+        key = str(item or "").strip()[:20]
+        if key in MISTAKE_KEYS and key not in out:
+            out.append(key)
+    return out[:4]
+
+
 def rate_card(db: Database, user_id: str, card_id: str, rating: int,
-              elapsed_ms: int = 0) -> dict[str, Any]:
+              elapsed_ms: int = 0, recall: str = "",
+              mistake_tags: Any = None) -> dict[str, Any]:
     card = db.one("SELECT * FROM cards WHERE id=? AND user_id=?", (card_id, user_id))
     if not card:
         raise ValueError("卡片不存在")
@@ -683,11 +1126,15 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
     before = dict(card)
     result = scheduler.schedule(card_from_row(card), rating)
     ts = now_iso()
+    tags = normalize_mistake_tags(mistake_tags)
+    # 答对了就不继续挂着上一次的错因；答错/模糊时记下这次的标签
+    logged_tags = tags if rating <= 2 else []
+    card_tags = logged_tags
     db.execute(
         "UPDATE cards SET state=?, step=?, stability=?, difficulty=?, due_at=?, "
-        "last_review=?, reps=?, lapses=?, updated_at=? WHERE id=?",
+        "last_review=?, reps=?, lapses=?, mistake_tags_json=?, updated_at=? WHERE id=?",
         (result.state, result.step, result.stability, result.difficulty,
-         result.due_iso(), ts, result.reps, result.lapses, ts, card_id),
+         result.due_iso(), ts, result.reps, result.lapses, json_dumps(card_tags), ts, card_id),
     )
     db.insert("review_logs", {
         "id": new_id("rv"),
@@ -704,9 +1151,29 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
         "retention_before": round4(result.retention_before),
         "state_before": before.get("state") or "new",
         "state_after": result.state,
+        "mistake_tags_json": json_dumps(logged_tags),
+        "missed_points": 1 if rating <= 2 else 0,
         "source": "web",
     })
     score = {1: 0.1, 2: 0.45, 3: 0.8, 4: 0.95}[rating]
+    said = re.sub(r"\r\n?", "\n", str(recall or "")).strip()[:4000]
+    if said:
+        # kind=review_recall、probe_id=None：探测题的「N 次作答」按 probe_id 统计，
+        # 复习时写的回忆不是作答那道题，混进去计数就成谎话了。
+        db.insert("attempts", {
+            "id": new_id("at"),
+            "user_id": user_id,
+            "unit_id": card["unit_id"],
+            "probe_id": None,
+            "kind": "review_recall",
+            "response": said,
+            "score": score,
+            "confidence": 0.0,
+            "hints_used": 0,
+            "feedback_json": json_dumps({"source": "review", "card_id": card_id,
+                                         "probe_id": card.get("probe_id")}),
+            "created_at": ts,
+        })
     add = mastery.add_evidence(db, user_id, card["unit_id"], "recall", score,
                                confidence=0.8, weight=0.9, source="review")
     after_heat = heat.heat_for_unit(db, user_id, card["unit_id"])
@@ -729,13 +1196,26 @@ def rate_card(db: Database, user_id: str, card_id: str, rating: int,
             "retention_before": round4(result.retention_before),
         },
         "mastery": add,
+        "mistake_tags": logged_tags,
         "remaining": review_queue(db, user_id, limit=1)["due_total"],
     }
 
 
 def _public_card(card: dict[str, Any]) -> dict[str, Any]:
-    return {k: card.get(k) for k in ("id", "unit_id", "front", "back", "state", "due_at",
-                                     "reps", "lapses", "stability", "difficulty")}
+    out = {k: card.get(k) for k in ("id", "unit_id", "front", "back", "state", "due_at",
+                                    "reps", "lapses", "stability", "difficulty")}
+    attach_mistake_tags(out, card)
+    return out
+
+
+def attach_mistake_tags(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """把 mistake_tags_json 解析成前端好用的两个字段；原始 JSON 列不外泄。"""
+    raw = source.get("mistake_tags_json")
+    tags = [t for t in json_loads(raw or "[]", []) if t in MISTAKE_KEYS]
+    target["mistake_tags"] = tags
+    target["mistake_labels"] = [MISTAKE_LABELS.get(t, t) for t in tags]
+    target.pop("mistake_tags_json", None)
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -808,8 +1288,33 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
 
     next_action = _next_action(sum(s["due_count"] for s in statuses.values()),
                                _next_units(units, statuses, 2), statuses)
+    # 记忆健康度：全部已学卡片「此刻」的平均可提取性，与 30 天保留率（历史成功率）不同
+    learned = db.query("SELECT stability, last_review FROM cards "
+                       "WHERE user_id=? AND state != 'new' AND stability > 0", (user_id,))
+    memory_health = round4(sum(
+        scheduler.retrievability(float(c["stability"] or 0), _elapsed_days(c))
+        for c in learned
+    ) / len(learned)) if learned else None
+    # 错因分布：最近 200 次复习里主动标记的错因，按标签聚合并带上样本量
+    tag_rows = db.query("SELECT mistake_tags_json FROM review_logs WHERE user_id=? "
+                        "ORDER BY reviewed_at DESC LIMIT 200", (user_id,))
+    tally: dict[str, int] = {}
+    tagged_reviews = 0
+    for r in tag_rows:
+        keys = [t for t in json_loads(r.get("mistake_tags_json") or "[]", []) if t in MISTAKE_KEYS]
+        if not keys:
+            continue
+        tagged_reviews += 1
+        for k in keys:
+            tally[k] = tally.get(k, 0) + 1
+    mistake_summary = [{"key": k, "label": MISTAKE_LABELS[k], "count": tally[k]}
+                       for k, _ in MISTAKE_TAGS if tally.get(k)]
+    lapses = db.scalar("SELECT COALESCE(SUM(missed_points), 0) FROM review_logs "
+                       "WHERE user_id=? AND rating<=2", (user_id,), 0) or 0
     return {
         "goal": goal,
+        "mistakes": {"tags": mistake_summary, "tagged_reviews": tagged_reviews,
+                     "missed_total": int(lapses), "sample": len(tag_rows)},
         "mastery": msummary,
         "statuses": statuses,
         "counts": {
@@ -821,6 +1326,8 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
         },
         "plan_progress": progress,
         "average_heat": round4(sum(s["heat"] for s in statuses.values()) / len(statuses)) if statuses else 0.0,
+        "memory_health": memory_health,
+        "learned_cards": len(learned),
         "records": heat.history(db, user_id, limit=10),
         "retention": retention,
         "forecast": forecast,
@@ -1024,13 +1531,18 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
     pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
                                       use_embeddings=use_embeddings)
+    qa = quality.qa_pack(pack)
+    warnings = warnings + qa["warnings"]
     if docs:
         pack.setdefault("source", {})["documents"] = [
             {"name": d["name"], "chars": d["chars"]} for d in docs
         ]
         pack["source"]["material_chars"] = len(merged)
     save_user_pack(pack)
-    return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings}
+    return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
+            "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
+                        "near_duplicates": qa["near_duplicates"],
+                        "engine": qa["engine"]}}
 
 
 # ---------------------------------------------------------------------------
@@ -1043,33 +1555,49 @@ def search(db: Database, user_id: str, q: str) -> dict[str, Any]:
     goal = active_goal(db, user_id)
     units = get_goal_units(db, goal["id"]) if goal else []
     qlow = q.lower()
-    scored: dict[str, float] = {}
+    lexical: list[str] = []
     for u in units:
         hay = (str(u.get("title") or "") + " " + str(u.get("essence") or "") + " " +
                " ".join(str(x) for x in (u.get("tags") or []))).lower()
         if qlow in hay:
-            scored[u["id"]] = 1.0
+            lexical.append(u["id"])
     semantic = embeddings.rank(q, units, embeddings.unit_text)
     engine = embeddings.last_engine()
     min_score = 0.20 if engine != embeddings.LOCAL_MODEL else 0.06
-    for score, u in semantic:
-        if score >= min_score:
-            scored[u["id"]] = max(scored.get(u["id"], 0.0), score)
+    kept = [(score, u) for score, u in semantic if score >= min_score]
+    sem_ids = [u["id"] for _, u in kept]
+    sem_by_id = {u["id"]: score for score, u in kept}
+    # 分级排序：双命中 > 只字面命中 > 只语义相近；同级再按语义分与字面命中先后排。
+    # 没用 RRF（testlearn 给模型检索片段时用它是合适的）：给人的搜索框里，
+    # 标题精确命中的东西不该被「只是有点像」的结果挤到后面。
+    lex_rank = {uid: i for i, uid in enumerate(lexical)}
+    sem_rank = {uid: i for i, uid in enumerate(sem_ids)}
     by_id = {u["id"]: u for u in units}
-    ranked = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:20]
+    candidates = sorted(set(lexical) | set(sem_ids),
+                        key=lambda uid: (
+                            0 if (uid in lex_rank and uid in sem_rank) else
+                            (1 if uid in lex_rank else 2),
+                            -sem_by_id.get(uid, 0.0),
+                            lex_rank.get(uid, 10_000), sem_rank.get(uid, 10_000)))[:20]
     found = []
-    for uid, score in ranked:
+    for uid in candidates:
         u = by_id.get(uid)
         if not u:
             continue
+        matched = [m for m, hit in (("lexical", uid in lex_rank),
+                                    ("semantic", uid in sem_rank)) if hit]
+        score = max(sem_by_id.get(uid, 0.0), 1.0 if uid in lex_rank else 0.0)
         found.append({
             "id": u["id"], "title": u.get("title"), "essence": u.get("essence"),
             "tags": u.get("tags") or [], "goal_id": u["goal_id"],
             "score": round(score, 3),
+            "matched_by": matched,
         })
     packs = [pack_summary(p) for p in all_available_packs()
              if q.lower() in (p.get("name", "") + p.get("description", "") + " ".join(p.get("tags", []))).lower()]
-    return {"units": found, "packs": packs[:8], "engine": engine if units else embeddings.active_model()}
+    return {"units": found, "packs": packs[:8], "fusion": "tiered",
+            "engine": engine if units else embeddings.active_model()}
+
 
 def export_data(db: Database, user_id: str) -> dict[str, Any]:
     user = db.one("SELECT * FROM users WHERE id=?", (user_id,))
@@ -1153,23 +1681,37 @@ def export_anki(db: Database, user_id: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def reset_user(db: Database, user_id: str = config.DEFAULT_USER) -> None:
+RESET_USER_TABLES = ("sessions", "explanations", "attempts", "evidence", "mastery",
+                     "review_logs", "cards", "boil_records", "unit_notes", "notes",
+                     "events", "study_days")
+
+
+def reset_user(db: Database, user_id: str = config.DEFAULT_USER,
+               commit: bool = True) -> None:
+    """清空这个用户的数据。
+
+    commit=False 供替换导入使用：清库和新写入必须同生共死，否则导入中途报错就
+    只剩下一个被清空的库（快照躺在 data/backups 里，但没有任何一键回来的入口）。
+    """
     goal_ids = [r["id"] for r in db.query("SELECT id FROM goals WHERE user_id=?", (user_id,))]
-    with db.transaction():
+
+    def apply() -> None:
+        db.execute("DELETE FROM messages WHERE session_id IN "
+                   "(SELECT id FROM sessions WHERE user_id=?)", (user_id,))
         if goal_ids:
             ph = ",".join("?" for _ in goal_ids)
-            db.execute(f"DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE user_id=?)", (user_id,))
-            for table in ("sessions", "explanations", "attempts", "evidence", "mastery",
-                          "review_logs", "cards", "probes", "relations", "units", "plans",
-                          "goal_packs", "boil_records", "unit_notes", "notes"):
-                if table == "probes":
-                    db.execute(f"DELETE FROM probes WHERE unit_id IN (SELECT id FROM units WHERE goal_id IN ({ph}))", tuple(goal_ids))
-                elif table in ("relations", "units", "plans", "goal_packs"):
-                    db.execute(f"DELETE FROM {table} WHERE goal_id IN ({ph})", tuple(goal_ids))
-                else:
-                    db.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+            db.execute(f"DELETE FROM probes WHERE unit_id IN "
+                       f"(SELECT id FROM units WHERE goal_id IN ({ph}))", tuple(goal_ids))
+            for table in ("relations", "units", "plans", "goal_packs"):
+                db.execute(f"DELETE FROM {table} WHERE goal_id IN ({ph})", tuple(goal_ids))
             db.execute(f"DELETE FROM goals WHERE id IN ({ph})", tuple(goal_ids))
-        db.execute("DELETE FROM events WHERE user_id=?", (user_id,))
-        db.execute("DELETE FROM study_days WHERE user_id=?", (user_id,))
+        for table in RESET_USER_TABLES:
+            db.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
         db.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+    if commit:
+        with db.transaction():
+            apply()
+    else:
+        apply()
     emit(db, "data.reset", {}, user_id)

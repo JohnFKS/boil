@@ -241,12 +241,47 @@ function bindChat(el, ctx, data, sid) {
     input.style.height = "auto";
     setBusy(true);
     appendUser(msg);
-    const placeholder = appendAssistantPlaceholder();
+    await runTurn(msg, 0);
+  }
+
+  // 断线不该让人重新打一遍刚才那句话：先看服务端是否已经把回答落库，
+  // 没有落库才带 retry 重发（retry 让服务端跳过重复写入用户消息）。
+  async function recoverOrRetry(msg, attempt, placeholder) {
+    const status = placeholder.status;
+    const typing = placeholder.typing;
+    try {
+      const fresh = await ctx.api.get(`/api/socratic/${encodeURIComponent(sid)}`);
+      const list = fresh.session?.messages || [];
+      const lastUserAt = [...list].reverse().findIndex(m => m.role === "user");
+      const answered = lastUserAt >= 0
+        && list.slice(0, list.length - lastUserAt).some(m => m.role === "assistant");
+      if (answered) {
+        session = fresh.session;
+        messages = session.messages || messages;
+        const finalText = [...messages].reverse().find(m => m.role === "assistant")?.content || "";
+        placeholder.textEl.innerHTML = renderMarkdown(finalText);
+        turnBadge.textContent = `第 ${session.turn || 0} 轮`;
+        stageBadge.textContent = STAGE_LABELS[session.stage] || session.stage;
+        toast("连接断了，但教练的回答已经存好了。", "info", 4200);
+        return true;
+      }
+    } catch { /* 查不到就按没落库处理，继续重试 */ }
+    if (attempt >= 1) return false;
+    if (typing) { typing.style.display = "flex"; status.textContent = `正在重连 (${attempt + 1})…`; }
+    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+    await runTurn(msg, attempt + 1, true);
+    return true;
+  }
+
+  async function runTurn(msg, attempt, isRetry = false) {
+    const placeholder = attempt === 0
+      ? appendAssistantPlaceholder()
+      : reusePlaceholder();
     let full = "";
     let serverSession = null;
     let report = null;
     try {
-      await ctx.api.stream("/api/socratic/stream", { session_id: sid, message: msg }, (event, payload) => {
+      await ctx.api.stream("/api/socratic/stream", { session_id: sid, message: msg, retry: isRetry }, (event, payload) => {
         if (event === "status") {
           placeholder.status.textContent = payload.text || "正在思考…";
           placeholder.typing.style.display = "flex";
@@ -294,11 +329,30 @@ function bindChat(el, ctx, data, sid) {
       input.focus();
     } catch (e) {
       if (e.name === "AbortError") return;
-      placeholder.typing.style.display = "none";
-      placeholder.textEl.innerHTML = `<span class="danger">${escapeHTML(e.message || "连接失败")}</span>`;
-      toast(e.message || "连接失败", "error");
+      setBusy(true);
+      const recovered = await recoverOrRetry(msg, attempt, placeholder);
+      if (!recovered) {
+        placeholder.typing.style.display = "none";
+        placeholder.textEl.innerHTML = `<span class="danger">${escapeHTML(e.message || "连接失败")}<br><button class="link-btn" data-ask-retry>再试一次</button></span>`;
+        placeholder.textEl.querySelector("[data-ask-retry]")
+          ?.addEventListener("click", () => runTurn(msg, 0, true));
+        toast(e.message || "连接失败", "error");
+      }
       setBusy(false);
     }
+  }
+
+  function reusePlaceholder() {
+    const root = document.getElementById("stream-msg");
+    if (!root) return appendAssistantPlaceholder();
+    const textEl = root.querySelector("#stream-text");
+    if (textEl) textEl.innerHTML = "";
+    return {
+      textEl,
+      typing: root.querySelector("#stream-typing"),
+      status: root.querySelector("#stream-status"),
+      root,
+    };
   }
 
   async function finish() {

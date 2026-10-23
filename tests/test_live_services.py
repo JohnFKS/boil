@@ -79,19 +79,8 @@ class FakeHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         messages = payload.get("messages") or []
         text = "\n".join(str(m.get("content", "")) for m in messages)
-        stream = bool(payload.get("stream"))
-        if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            for piece in ("你提到了核心。", "为什么它成立？"):
-                self.wfile.write(f"data: {json.dumps({'choices':[{'delta':{'content':piece}}]}, ensure_ascii=False)}\n\n".encode())
-                self.wfile.flush()
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-            self.close_connection = True
-            return
+        # 内容先决定，传送方式后决定：Boil 的 chat 现在也向上游要 stream:true，
+        # 如果流式分支只会回固定台词，JSON 模式的结构化调用就会「测不出真东西」。
         if payload.get("response_format"):
             if "费曼" in text or "评分标准" in text:
                 content = json.dumps(FEYNMAN, ensure_ascii=False)
@@ -101,6 +90,21 @@ class FakeHandler(BaseHTTPRequestHandler):
                 content = json.dumps(REPORT, ensure_ascii=False)
         else:
             content = "先用自己的话说说：这个单元最核心的一句话是什么？"
+        if bool(payload.get("stream")):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            mid = max(1, len(content) // 2)
+            for piece in (content[:mid], content[mid:]):
+                if not piece:
+                    continue
+                self.wfile.write(f"data: {json.dumps({'choices':[{'delta':{'content':piece}}]}, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            self.close_connection = True
+            return
         body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

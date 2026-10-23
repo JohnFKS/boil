@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS units (
   estimated_minutes INTEGER NOT NULL DEFAULT 45,
   order_index INTEGER NOT NULL DEFAULT 0,
   angle TEXT NOT NULL DEFAULT '',
+  merged_into TEXT,
+  merged_reason TEXT NOT NULL DEFAULT '',
   source_ref_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -133,6 +135,7 @@ CREATE TABLE IF NOT EXISTS cards (
   last_review TEXT,
   reps INTEGER NOT NULL DEFAULT 0,
   lapses INTEGER NOT NULL DEFAULT 0,
+  mistake_tags_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -216,6 +219,8 @@ CREATE TABLE IF NOT EXISTS review_logs (
   retention_before REAL NOT NULL DEFAULT 0,
   state_before TEXT NOT NULL DEFAULT 'new',
   state_after TEXT NOT NULL DEFAULT 'new',
+  mistake_tags_json TEXT NOT NULL DEFAULT '[]',
+  missed_points INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'web'
 );
 
@@ -304,7 +309,11 @@ CREATE INDEX IF NOT EXISTS idx_notes_unit ON notes(user_id, unit_id);
 
 # 旧库升级用：新库由 SCHEMA 直接带上，旧库启动时幂等补列。
 EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
-    "units": [("angle", "TEXT NOT NULL DEFAULT ''")],
+    "units": [("angle", "TEXT NOT NULL DEFAULT ''"),
+              ("merged_into", "TEXT"), ("merged_reason", "TEXT NOT NULL DEFAULT ''")],
+    "cards": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'")],
+    "review_logs": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("missed_points", "INTEGER NOT NULL DEFAULT 0")],
 }
 
 

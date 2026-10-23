@@ -15,7 +15,7 @@
 - 后端：Python 3.10+ **纯标准库**（`ThreadingHTTPServer` + SQLite WAL + REST/SSE），禁止引入任何 pip 依赖
 - 前端：`static/` 下**原生 ES Modules**，无构建链，无 CDN（KaTeX 已本地化）
 - 启动：`python run.py`（默认端口 7860，数据在 `data/`）
-- 测试：`python -m unittest discover -s tests -v`（当前 66 个全绿）
+- 测试：`python -m unittest discover -s tests -v`（当前 155 个全绿）
 - JS 语法检查：`make check-js`
 - 浏览器回归：需要**两个**服务实例——日常使用的 `python3 run.py`（7860）与验收用的 `BOIL_PORT=7861 python3 run.py`；然后 `python3 tools/browser_check.py`（CDP 驱动，默认打 7861，截图输出到 `screenshots/`）
 
@@ -140,8 +140,8 @@ examgen 是「只归纳不生成题」的知识挖掘流水线，它的**机器�
 | B | 编译时 AI 生成大纲 + 阶段计划 + 材料总览 | P0 | 中（prompt + compiler + planner + step3 UI） | 无 |
 | C | 全站内容 AI 合成 + engine 诚实标签 | P0 | 中（angle 列迁移 + 仪表盘/单元/洞察三处呈现） | B |
 | D | 划词灵感笔记（选择浮条 + 右键菜单 + 灵感库页） | P0 | 大（新表 + 3 路由 + 新前端模块 + 7 个视图挂 data-selectable） | 无 |
-| E | P1 迁移批次（回忆优先、口诀 AI、网关加固、缓存、健康度、AI 熔断、高亮重现） | P1 | 每项小-中 | A-D 之后按序 |
-| F1-F16 | P2 迁移批次 | P2 | 每项小-中 | E 之后 |
+| E | P1 迁移批次（回忆优先、口诀 AI、网关加固、缓存、健康度、AI 熔断、高亮重现） | P1 | ✅ 已完成 | A-D 之后按序 |
+| F | P2 迁移批次（错因标签、队列侧栏、键盘、快照、粘贴清洗、诊断、合并链、质检、锚点、检索注入、做卡片、重连、风格测试） | P2 | ✅ 已完成（F12 可选未做） | E 之后 |
 
 ---
 
@@ -567,7 +567,7 @@ export function initSelectionMenu(ctx) { /* 幂等：window.__boilSelMenu 已存
 
 ---
 
-## 7. P1 迁移批次（任务 E，A-D 完成后按序执行）
+## 7. P1 迁移批次（任务 E，A-D 完成后按序执行）—— ✅ 全部完成于 2026-10-21，详见第 11 节
 
 每项都遵循同一格式：改哪里 / 怎么改 / 验收。规模都不大，低阶模型可一次一项。
 
@@ -614,7 +614,7 @@ boil/llm.py 的 `chat`/`chat_json` 增加四个机制（全部带注释级小改
 
 ---
 
-## 8. P2 迁移批次（任务 F，E 之后，按价值排序）
+## 8. P2 迁移批次（任务 F，E 之后，按价值排序）—— ✅ F1–F11、F13–F16 已完成于 2026-10-21；F12 按原计划仍属可选，见第 11 节
 
 | # | 功能 | 源 | Boil 落点要点 |
 |---|---|---|---|
@@ -643,7 +643,7 @@ P3（远期，本计划不展开）：番茄钟、记忆 diff/撤销、移动端
 
 ```bash
 cd /workspace/testweb3/boil
-python -m unittest discover -s tests -v          # 全部通过（当前 66）
+python -m unittest discover -s tests -v          # 全部通过（当前 155）
 make check-js                                    # JS 语法
 python run.py &                                   # 起服务（或确认已运行）
 python tools/browser_check.py                     # 23+ 截图零报错
@@ -689,3 +689,165 @@ python tools/browser_check.py                     # 23+ 截图零报错
 执行 E2 时注意：`notes` 已带 `unit_id`，前端可直接 `GET /api/notes?unit_id=…` 取引用做高亮，无需后端改动。
 执行 E3 时注意：口诀的存储与展示已存在（`unit_notes` kind=`mnemonic`，复习队列已透出），只缺 AI 生成；服务端取单元内容，不要信前端传的原文。
 执行 E5 时注意：`insights_synthesize`、`suggest_meta` 已把失败写进 `warnings`/回退 `rules`，熔断只需在前端计数并隐藏入口。
+
+### 2026-10-21 · E 批次完成（E1–E7）
+
+| 项 | 落地 | 验证 |
+|---|---|---|
+| E1 先回忆再翻面 | review.js 回忆框 + 翻面后草稿排在答案上方；`rate_card(..., recall=)` 非空写入 `attempts(kind="recall")` | `test_recall_before_reveal_is_persisted`、`test_16` HTTP 层、浏览器断言回显内容 |
+| E2 引文重现 | 新 `quoteHighlight.js`（TreeWalker 建坐标 → 全量匹配 → 去重叠 → **倒序** surroundContents，跳过 code/pre/.katex）；单元页顶部提示已标处数 | `unit-note-highlight.png` + 回归断言 marks≥1 且 tip 存在 |
+| E3 AI 编口诀 | 新 `prompts/mnemonic.md`（严格任务边界）+ `POST /api/units/{id}/mnemonic`；服务端取材料、清洗去重；结果需「填进速记」→「保存速记」两步才落库 | 4 个 AiPathTest 用例 + 真实模型 1.6s 产出「口诀/类比/反差」三条且不复制内容 |
+| E4 网关加固 | `finish_reason=length` 加额重试；括号配平扫描 + 截断补全；`junk_output` 守卫（`response_format` 400 降级原本已有） | `test_llm.py` 新增 9 个用例（含截断 JSON、字符串内括号、400 降级） |
+| E5 AI 三态熔断 | `utils.js` 的 `aiEnabled/aiSuccess/aiFailure`；未配置或连续 2 次失败 → 入口**不渲染**；主流程不依赖模型 | 回归断言「入口显隐与 /api/health 的 llm.mode 一致」 |
+| E6 记忆健康度 | `insights.memory_health`（复用 `Scheduler.retrievability`）+ `learned_cards`；洞察页指标卡与解释文案；无数据 `null` → 「—」 | `test_memory_health_tracks_learned_cards` + 回归断言卡片存在 |
+| E7 内容寻址缓存 | `chat_json` 按 `sha256(model+messages+temp+max_tokens)` 落盘 `data/llm_cache/`；命中复用原文再解析；设置页开关 + 一键清空 + 统计 | 5 个 CacheTest；真实模型实测同一请求 **1.15s → 0.00s**、结果一致、calls 不增 |
+
+| 汇总 | 结果 |
+|---|---|
+| 单元测试 | 66 → **86** 全绿 |
+| 浏览器回归 | **27 张截图，errors: none** |
+| 新增端点 | `POST /api/units/{id}/mnemonic`、`POST /api/settings/llm/cache/clear` |
+| 新增请求字段 | `POST /api/review/{card}` 的 `recall`；`POST /api/settings/llm` 的 `cache_enabled` |
+| 数据库 | 无新表；开始写 `attempts`（此前只有读方） |
+
+**执行 E 批次时得到的经验（写给下一个执行者）**：
+
+1. **测试打桩要注意 fixture 键名冲突**：`AiPathTest.setUp` 里若沿用 `self._old` 会覆盖 `TempCase` 的同名字典，`tearDown` 直接 `AttributeError`。用 `self._llm_old` 之类的前缀名。
+2. **重定向配置要在 setUp 里补全**：`llm` 的缓存目录取自 `config.DATA_DIR`，测试若不把 `DATA_DIR` 指到临时目录，就会往仓库的 `data/` 里写缓存文件。
+3. **写库函数改动要顺带查读方**：`attempts` 表此前只有读方（计数与展示），确认没有指标依赖它之后才敢往里写。
+4. **`finish_reason=length` 加额重试要有前提**：只在请求里本来就有 `max_tokens` 时才加额；否则新增的额度会**低于**网关默认值，反而更容易截断。
+5. **DOM 批量改写要倒序**：高亮多处引文时，正序包裹会让后面的偏移失效；倒序 + 每轮重建坐标最稳。
+6. **别用 `pkill -f "python3 run.py"`**：模式会匹配到执行命令的 shell 自身，把自己的会话杀掉。用 `pgrep` 取 PID 再 `kill`，或给进程加唯一标识。
+
+下一批从 **F1 错因标签**开始（顺序见第 8 节）。F2 复习队列侧栏与 F3 键盘复习是纯前端，风险最低，适合先热身。
+
+### 2026-10-21 · F 批次完成（F1–F11、F13–F16；F12 仍为可选）
+
+| 项 | 落地 | 验证 |
+|---|---|---|
+| F1 错因标签 | 6 类固定 taxonomy 由后端下发（`/api/review.mistake_tags`）；`review_logs/cards` 加 `mistake_tags_json`、`missed_points`；答对即清空卡片旧标签；洞察页 `mistakes` 给分布 + 样本量 | `test_mistake_tags_are_persisted_and_aggregated`、`test_17`、浏览器断言「没选标签时评分被拦一次且进度未变」 |
+| F2 队列侧栏 | 跳转/勾选/只练选中/提前加卡；新 `GET /api/cards`（含未到期卡、搜索、按单元/状态筛） | `test_list_cards_covers_not_due_cards` + 浏览器断言 items/add/select/current |
+| F3 键盘复习 | 空格翻面、1–4 评分、`/` 搜索（与 ⌘K 并存）；输入框、浮层、模态打开时一律不抢键 | 浏览器手工 + 现有 keyHandler 单测路径 |
+| F4 导入前快照 | `backup.snapshot_db` 用 SQLite 备份 API 写 `data/backups/pre_import_<µs>.db`，保留 10 份；结果回 `snapshot` | `test_import_snapshots_database_first`（校验快照内 integrity_check 与导入前状态） |
+| F5 粘贴清洗 | 新 `boil/markdown_fix.py`：LF、零宽、全角空格、项目符号、编号、标题空格、`\[..\]→$$..$$`；代码块/行内代码内部不动；`POST /api/material/fix` + onboarding paste 拦截 | `tests/test_markdown_fix.py` 14 例 + `test_18` |
+| F6 诊断面板 | 异常链归类（dns/refused/timeout/tls/proxy/network）、HTTP 状态建议表、回显内容掩码后落盘、`last_error` 带 base_url/model/掩码 Key、设置页可复制诊断 | `DiagnosticsTest` 4 例 |
+| F13 上游始终流式 | `chat()` 默认 `stream_upstream`：向网关切 `stream:true` 再拼回非流式形状；网关不认流式时按原 JSON 返回；可关 | `StreamUpstreamTest` 2 例 |
+| F7 合并链 | `units.merged_into/merged_reason`；`POST /api/units/{id}/merge`、`GET /api/units/duplicates`；代码判阈值 0.62；relations 自动重连、卡片保留；地图与推荐过滤；单元页横幅 | 3 个合并测试 + `test_21`（含成环、跨目标、回指被吸收者均被拒） |
+| F8 质检 | 新 `boil/quality.py`：确定性 lint → 安全补丁（**补丁=原文则 qa-skip**）→ 近似重复 → 残差交模型解释；编译响应新增 `quality` | `tests/test_quality.py` 18 例 |
+| F9 锚点修复 | 超 3000 字的无小标题长节：模型只给逐字锚点，代码切片；锚点不在原文/只切出一段则保持原样；失败静默回退 | `AnchorRepairTest` 6 例 |
+| F10 检索式分批 | 材料 >24k：先 `_skeleton` 出大纲/总览，再按 7k 预算逐批出单元；`source.batches` 记录批数；单批失败只跳过该批 | 2 个分批测试（逐节都进过模型 + 单批失败不空手） |
+| F11 做卡片 | 划词「做卡片」→ `POST /api/cards/preview`（`engine: model/rules`）→ 预览卡 → 确认才 `POST /api/cards/confirm` 入队 | `test_cards_*` 5 例 + `test_19` + 浏览器预览断言 |
+| F14 选中追问 | 划词「问 AI」→ `POST /api/ask`（±800 字锚点上下文，单轮）；demo 模式不渲染该动作 | `test_quick_ask_*` + `test_19` |
+| F15 SSE 重连 | `stream_reply(retry=True)` 比对最后一条用户消息，不重复入库、不涨轮次；前端先查会话是否已落库，未落才带 retry 重发 | `test_stream_retry_does_not_duplicate_user_turn` |
+| F16 风格测试 | `boil/styles.py` 5 题 → 5 人设 + 权重（不下发权重）；人设注入苏格拉底与费曼提示词；仪表盘卡片 + 弹窗 | `tests/test_styles.py` 6 例 + `test_20`（断言人设真的出现在 system 提示词里） |
+
+| 汇总 | 结果 |
+|---|---|
+| 单元测试 | 86 → **155** 全绿（新增 69） |
+| 浏览器回归 | **29 张截图，errors: none** |
+| 新增模块 | `boil/quality.py`、`boil/markdown_fix.py`、`boil/styles.py`、`static/js/styleTest.js` |
+| 新增端点 | `/api/cards`、`/api/cards/preview`、`/api/cards/confirm`、`/api/ask`、`/api/units/duplicates`、`/api/units/{id}/merge`、`/api/styles/questions`、`/api/styles/apply`、`/api/material/fix`、`/api/settings/llm/cache/clear` |
+| 数据库 | `SCHEMA_VERSION` 3→6；`cards.mistake_tags_json`、`review_logs.{mistake_tags_json,missed_points}`、`units.{merged_into,merged_reason}`（旧库启动自动补列） |
+
+**F 批次的踩坑（务必读）**：
+
+1. **默认参数会冻结常量**：`def _batch_sections(sections, budget=BATCH_CHAR_BUDGET)` 让测试改 `compiler.BATCH_CHAR_BUDGET` 完全无效——需要运行时可调的阈值请在函数体里读全局。
+2. **`x = x.f(...)` 会毁掉模块名**：`quality = quality.qa_pack(pack)` 让 `quality` 变成本地变量，`UnboundLocalError`。局部名换个叫法（`qa`）。
+3. **模块内的私有 helper 不要靠 import 偷用**：`services` 里直接写 `_norm(...)` 会 `NameError`；跨模块要用的就把它做成公开函数（评审后已改名 `quality.norm` / `quality.similar`，下划线只留给模块内部）。
+4. **幂等判断要看「最后一条用户消息」而不是「最后一条消息」**：一轮答完后最后一条是教练的回答，`retry` 永远判不出来，会重复入库并白涨轮次。
+5. **新表/新列同样要过三处白名单**（`backup.IMPORT_TABLES`、`services.export_data`、`reset_user`）——这次是在 `cards`/`review_logs` 上加列，`SELECT *` 路径自动带上，但**别加新表**，加了必须同步（E 批已经为 `notes` 踩过）。
+6. **合并的落点必须在 units 已入库之后**：step3 预览阶段 units 还没安装，`/api/units/{id}/merge` 会 404/400；所以 step3 只读展示质检结果，合并动作放在地图页（有 `GET /api/units/duplicates` 现算）。
+7. **回归脚本里 `goto()` 只改 hash**：导航到同一个 hash 不会重渲染，依赖挂载时才跑的逻辑（引文高亮）不会被触发——断言前要经过别的页面再回来。
+8. **`/api/units/duplicates` 必须排在 `/api/units/([^/]+)` 之前**，否则会被通用路由吃掉。
+9. **假网关要能演「流式」**：`chat()` 改流式后，测试桩如果只按 `stream` 回固定台词，就会把「质检 warnings」这类真信号测错方向——先决定内容，再决定传输方式。
+
+下一批建议从 F12（公式感知高亮，需先观察 E2 上线后的断裂率）或 P3（番茄钟、记忆 diff/撤销、移动端划词劫持）开始；也可回到第 1 节挑新的迁移项。
+
+---
+
+## 12. 评审与修复轮（E+F 提交前）
+
+用户要求「暂不提交，先 review 一遍」。下面是评审发现并已修掉的项，全部带回归用例。
+
+| 级别 | 缺陷 | 修法 | 回归 |
+|---|---|---|---|
+| **P0** | 划词面板被 document 级 `mousedown → hideAll()` 抢关：真实鼠标点面板内部（含「确认存入」「问 AI」的输入框）会先清空 DOM，click 永远落不到处理函数——F11/F14 对真用户**完全不可用** | `onMouseDown` 放行 `.sel-panel`；键盘浮层守卫统一成 `utils.overlayOpen()`（原来漏了 `.sel-panel`，面板开着时空格/1–4 仍在翻面评分） | `tools/browser_check.py` 新增 `real_click()`（CDP `Input.dispatchMouseEvent`）+ 三条断言；撤掉修复后实测报 `点面板内部把它关掉了 {shown:false, cards:0}` |
+| P1 | 复习时写的回忆以 `kind="recall"` + `card.probe_id` 写进 `attempts`，把探测题「N 次作答」变成复习计数（live 库 10/10 张卡都挂 probe_id） | 改 `kind="review_recall"`、`probe_id=None`（来源探测题留在 `feedback_json`），文档同步 | `test_recall_before_reveal_is_persisted` 直接断言探测题计数仍为 0 |
+| P1 | 分批编译静默丢内容：每节被 `body[:budget]` 截断、超过 10 个单元被 `collected[:10]` 吞掉、回退单次时 `text[:24000]` 也没有提示——与「模型读完了全部材料」的承诺冲突 | 新增 `_chunk_section`（空行→句号→硬切，再把小块装回预算内，**无损**）；`_normalize_llm_units` 接受 `warnings` 并在超限时明说；划词做卡片截断也写进 `engine_note` | `test_oversized_section_is_never_silently_cut`（24 个标记逐条断言进过模型）、`test_chunk_section_packs_without_losing_text`、`test_unit_cap_is_announced_not_silent` |
+| P1 | `mode=replace` 导入：先提交 `reset_user` 再在事务里插入，插入炸掉就留下**被清空的库**；快照在盘上但没有 restore 端点。附带：没有目标时 `reset_user` 不删用户级数据，孤儿卡片会在用户重建后「复活」 | 清库与写入并进同一事务（`reset_user(db, uid, commit=False)`），用户级表移出 `if goal_ids` 守卫 | `test_failed_replace_import_leaves_old_data_intact`（撤掉修复实测 16 张卡被删光 → 现在 0 损失）、`test_reset_without_goals_still_clears_user_data` |
+| P1 | `chat_json` 在解析前写缓存：一次截断/占位输出会被永久复用，同一个请求此后每次都炸在缓存命中上 | **解析成功才写盘**；命中坏条目就删掉条目回落到真实调用；缓存键加入 `base_url`（同名模型换网关不复用另一家输出） | `test_unparseable_output_is_not_cached`、`test_poisoned_cache_entry_self_heals`、`test_cache_key_separates_gateway_endpoint` |
+| P1 | README 写「洞察页汇总成错因分布」，但前端**从来没渲染过** `insights.mistakes`（F1 计划里也明确要求洞察页有分布 + 样本量）——只做了后端聚合就宣称完成 | 新增「错因分布」卡片（条形 + `tagged_reviews / sample / missed_total` 口径说明）与 `.mistake-dist` 样式；浏览器断言行数或空态 | `browser_check` 的 `mistake tags: rows=… empty=…` 断言；窄屏几何用一次性 CDP 探针核过（无溢出） |
+
+**评审本身的教训**（写下来防下次重犯）：
+
+1. **合成 `element.click()` 测不出浮层交互**。`browser_check.py` 全程 `.click()`，29 张截图全绿也发现不了「面板一按就关」。凡是「点外部关闭」「面板内输入」这类交互，必须用 `Input.dispatchMouseEvent` 走真事件，并且要**反向验证**：撤掉修复看用例是否变红（这轮两次都验了：P0 与导入回滚）。
+2. **接口返回了数据 ≠ 功能完成**。F1 的错因分布在后端聚合、被测试断言、在 README 被宣称，但没有任何一行 UI 读它。验收要看「用户看得见的东西」。
+3. **计数口径要写进文案**。`memory_health`/`mistakes` 是全局口径而其它字段按目标过滤——查证后发现文案已如实写「所有已学卡」，所以不改语义只补文档；而 `attempts` 的污染是真的会读出假数字，必须改。
+4. **评审里我自己有两条报错了**：`GET /api/styles/questions` 其实早就写在 API.md 里（两条空格让我的正则没匹配上，别用单一 grep 下结论）；`list_snapshots()` 不是死代码，剪枝测试要用它。报错的结论要当场撤掉，不要留着好看。
+5. **默认参数冻结常量**这条（F 批第 1 条）在 `_normalize_llm_units` 上又差点重演：`limit=MAX_UNITS_SINGLE` 写在签名里会把默认值固定在 import 时刻——这里因为是纯常量才没问题，但把可调阈值放签名里之前先想清楚。
+
+| 汇总 | 结果 |
+|---|---|
+| 单元测试 | 155 → **163** 全绿（新增 8） |
+| 浏览器回归 | 29 张截图 **errors: none** + 真实鼠标三条断言 + 错因分布断言 |
+| 文档 | API.md 补 `GET /api/cards`、`mistakes`、缓存自愈、导入同事务；ARCHITECTURE.md 补无损切分、缓存自愈、真鼠标回归；README 计数与两处功能描述改为兑现得了的说法 |
+
+---
+
+## 13. 语义去重与检索分级（用硅基流动 embeddings）
+
+评审留下的第一条开放项：`find_near_duplicates` 用字符集合 Jaccard，实测只能抓近乎逐字重复，同义改写只有 0.17，导致 F7 的合并入口在真实数据上几乎不出现。这一轮按用户指示改用真实嵌入服务（`data/embedding.json` 里的 SiliconFlow `BAAI/bge-m3`，1024 维），并参考 testlearn `ranking.py` 的「字面 + 语义」双路思路。
+
+**先测量，再定阈值**（脚本一次性跑真网关，不写库）：
+
+| 配对 | 字面 Jaccard | bge-m3 余弦 | 事实 |
+|---|---|---|---|
+| 沸腾 / 水的沸腾（改写） | 0.18 | 0.80–0.85 | 真重复 |
+| 间隔复习 / 分布练习 | 0.20 | 0.749 | 真重复 |
+| 蒸发 / 沸腾 | 0.18 | 0.75–0.79 | 相关但**不同** |
+| 同一目标库里 5 个不同单元 | ≤0.40 | ≤0.72 | 不同 |
+| 密度 / 牛顿第一定律 | 0.11 | 0.46 | 不同 |
+
+结论：**两个分数各自都会错**——字面漏掉改写，语义把相关概念判成重复。所以分数只提候选，裁决走阶梯（`quality.merge_decision`，详见 ARCHITECTURE 4.7.1）：`lexical ≥ 0.62` 或 `semantic ≥ 0.80` 由代码放行；0.74–0.80 中间带必须有模型 `same: true`；都不够时人可署名坚持（`override` + 理由 ≥ 4 字，`basis="user"` 落库）。
+
+做完之后实测发现的两件事：
+
+1. **模型对同一对会翻**。第一次跑：蒸发/沸腾 → `same=false`（「沸腾与蒸发是不同汽化现象」），合并被拒；第二次跑同一对 → `same=true`（「均描述液体汽化现象」），合并被放行。单次模型裁决不配拥有破坏性权力 → 于是 (a) 判定问法按 id 定序，让候选列表与合并复查共用同一个提示词，第二次直接命中内容寻址缓存（实测 `calls: 1, hits: 3`，页面显示的依据与端点采用的依据必然同源）；(b) `basis="model"` 的放行在前端必须再点一次确认。
+2. **「拒绝」不等于封死**。分数与模型都不同意时用户仍可能知道自己那两条是一回事，所以给了署名越权：不写理由就报「至少 4 个字」，写了就把「学习者确认：<原话>」存进 `merged_reason`，日后审计分得清是谁的决定（`test_merge_override_requires_a_written_reason`）。
+
+搜索侧参考 testlearn 的 hybrid，但**没有照搬 RRF**：名次融合会让「只是有点像」挤掉精确命中，那适合给模型喂片段，不适合给人的搜索框。改成分级——双命中 > 只字面 > 只语义，每条带 `matched_by`（`test_search_tiers_put_exact_hits_before_lookalikes`）。
+
+诚实性收口：嵌入不可用时 `semantic` 一律 `null` 并在文案里说明，**绝不拿本地哈希向量冒充语义分**（`_pair_semantics` 只走 `embed_texts`，不走 `embed` 的本地回退）。
+
+| 汇总 | 结果 |
+|---|---|
+| 新增/改动 | `quality.{lexical_score,semantic_pair,signals,judge_pair,merge_decision,_pair_semantics}`、`find_near_duplicates` 双路候选、`services.{unit_duplicates,merge_units,search}`、`server` merge 传 `override`、`map.js` 候选行显示判据/依据/不可合并与署名对话框 |
+| 测试 | 168 全绿（新增阶梯表、候选只由语义带提出、署名越权、搜索分级 4 条）；`tests/test_quality.py` 加 `setUpModule` 隔离嵌入配置，防止测试打真网络 |
+| 浏览器 | harness 新增「种一个重复单元 → 真鼠标走完候选→依据→合并」回归，含防误删护栏（被吸收方必须是种子单元才点） |
+| 实跑证据 | `dup card: 疑似重复 1 对 · 语义 + 字面 ｜ 字面近乎一致`；`merged: 已把「…」并入「…」`；override 路径 `basis="user"` 且 `merged_reason=学习者确认：…` |
+| 已知未覆盖 | `basis="model"` 的确认弹窗只在服务层与离线用例验证过，浏览器回归没造出「语义落在中间带且模型判 same」的数据 |
+
+下一步仍可回到：合并的 unmerge（当前关系边重写不可撤销）、嵌入缓存与 llm_cache 的容量上限、F12 公式感知高亮、P3（番茄钟 / 记忆 diff / 移动端划词）。
+
+### 13.1 完整真实模拟（P1–P16）抓出并修掉的四个问题
+
+模拟跑在隔离实例上：把 `data/boil.db` 用 SQLite 备份 API 复制到 `/tmp/boiljourney`，连同一份 `llm.json`/`embedding.json`，用真 Dots 模型 + 真 bge-m3 走 16 个阶段（元信息建议 → 10,204 字长材料编译 → 建目标 → 语义候选与合并阶梯 → 速记 → 苏格拉底真流式与重连 → 费曼六维 → 复习与错因 → 洞察与 AI 解读 → 搜索 → 划词三动作 → 风格测试 → 粘贴清洗 → 设置与缓存 → 导出/合并/坏替换回滚 → 数据审计）。
+
+| 抓到的问题 | 严重度 | 修法 | 现在的证据 |
+|---|---|---|---|
+| `SINGLE_CALL_LIMIT = 24000` 是按上下文长度定的，但 10,204 字材料的真返回在尾部被截成 `"difficulty":4,":5,":":40"`，能否修复成掷硬币（第一次模拟就回退成了本地编译） | 高：直接决定「AI 读完全部材料」是不是空话 | 上限按实测输出能力降到 6000；`_normalize_llm_units` 接受模型直接回的单元数组；前端编译请求超时从 90s 提到 600s（分批要串多次调用，默认值会先炸）；编译 warnings 现在渲染进 step3 的质检框而不是只弹 5 秒 toast | 模拟重跑：`batches=2 material_chars=10204 generated_by=model` |
+| 语义候选用完整 `unit_text`，同主题单元全挤在 0.76–0.81，8 个单元的包一次跳 **9 对候选 / 7 次模型判定**，还把「间隔效应」和「测试即学习」判成可合并 | 高：噪声让合并入口不可用，且打开地图页变成烧钱 | 判定文本改成只看标题+本质（真重复 0.870 / 最危险假对 0.797）；一次最多判 `JUDGE_LIMIT=3` 对，其余标 `pending_judgement` 用户点了才判 | 模拟重跑：**0→2 对候选、2 次判定**，两对假候选都被模型判「原理与应用不同」而拒绝 |
+| 候选列表刚写「不可合并」，合并端点自己再问一次模型就改判 `same=true` **并真的合了库**（缓存被关掉时尤其明显） | 高：破坏性操作被执行了，而 UI 说的是相反的话 | 非字面证据的合并在服务端强制要求 `confirmed: true`；判定问法按 id 定序；前端把「确认合并」「请模型判定」「坚持合并（写理由）」拆成三条路径 | `test_non_lexical_merge_needs_human_confirmation` + 模拟：不带 confirmed 报「需要你先确认」且库里一个字没改，带 confirmed 才合 |
+| 用户手改的备份文件不合法时报 **500「服务器内部错误」**，而回滚其实是对的 | 中：错误级别与信息都误导人 | `sqlite3.Error` 映射成 `400 import_conflict`，消息里直接写「本次导入已整体回滚，原有数据未受影响」 | `test_22_bad_backup_rolls_back_and_says_400`：400 + 四张表计数一条不少 + 坏行没进去 |
+
+**顺带修的一处自伤**：`map.js` 里 `/api/map` 与 `/api/units/duplicates` 串行 await，把两个延迟加起来等；改并行。
+
+**关于探针的教训**（模拟脚本自身的错，记下来免得下次误判产品）：SSE 要按 `event:` 行取类型（`data:` 里的 JSON 已不含 type）；`/api/export` 与 `/api/notes/export` 返回裸文件不是 `{ok,data}` 信封；`/api/settings/embeddings/test` 只认 POST；`/api/import` 的请求体就是导出文档本身，且 replace 需要 `confirm=IMPORT`。**最后一条差点让我把「回滚通过」记成假通过**——报错其实是闸门挡的，根本没走到插入。断言必须区分「因为正确所以通过」和「因为没跑到所以通过」。
+
+| 最终验证 | 结果 |
+|---|---|
+| 单元/集成/HTTP/LLM 测试 | **172 全绿**（本轮 +13） |
+| `make check-js` | 通过 |
+| 浏览器回归 | **36 张截图，errors: none**；`dup card: 疑似重复 1 对 · 语义 + 字面 ｜ 字面近乎一致`、`merged: 已把…（字面近乎一致）`、真鼠标面板三条断言、错因分布断言全过 |
+| 真实模拟 | P1–P16 全部通过（隔离实例，日常库未动） |
+

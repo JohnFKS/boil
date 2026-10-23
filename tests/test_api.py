@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import config, embeddings, llm
+from boil import config, embeddings, llm, quality, socratic
 from boil.db import Database
 from boil.server import App, Handler
 from http.server import ThreadingHTTPServer
@@ -393,6 +393,243 @@ class ApiTest(unittest.TestCase):
             self.fail("missing id should 400")
         except urllib.error.HTTPError as exc:
             self.assertEqual(exc.code, 400)
+
+    def test_16_mnemonic_requires_model_and_recall_roundtrip(self):
+        unit_id = self.call("GET", "/api/map")["data"]["nodes"][0]["id"]
+        try:
+            self.call("POST", "/api/units/" + urllib.parse.quote(unit_id) + "/mnemonic", {})
+            self.fail("demo mode should refuse mnemonic generation")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 503)
+            payload = json.loads(exc.read())
+            self.assertEqual(payload["error"]["code"], "ai_not_configured")
+            self.assertNotIn("api_key", json.dumps(payload))
+        try:
+            self.call("POST", "/api/units/nope/mnemonic", {})
+            self.fail("missing unit should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        queue = self.call("GET", "/api/review?limit=5")["data"]
+        card_id = queue["cards"][0]["id"]
+        res = self.call("POST", f"/api/review/{urllib.parse.quote(card_id)}", {
+            "rating": 2, "elapsed_ms": 6000, "recall": "合上书讲出本质与边界。",
+        })["data"]
+        self.assertTrue(res["result"]["interval_label"])
+        detail = self.call("GET", "/api/units/" + urllib.parse.quote(queue["cards"][0]["unit_id"]))["data"]
+        self.assertTrue(any(a["kind"] == "review_recall" and a["response"] == "合上书讲出本质与边界。"
+                            for a in detail["attempts"]), "HTTP 层要把回忆写进 attempts")
+
+    def test_17_cards_endpoint_and_mistake_tags(self):
+        cards = self.call("GET", "/api/cards?limit=5")["data"]
+        self.assertTrue(cards["cards"])
+        self.assertGreaterEqual(cards["total"], len(cards["cards"]))
+        sample = cards["cards"][0]
+        for key in ("id", "unit_id", "front", "state", "due_label", "is_due", "mistake_tags"):
+            self.assertIn(key, sample)
+        self.assertNotIn("mistake_tags_json", json.dumps(cards))
+        unit_id = sample["unit_id"]
+        scoped = self.call("GET", "/api/cards?unit_id=" + urllib.parse.quote(unit_id))["data"]
+        self.assertTrue(all(c["unit_id"] == unit_id for c in scoped["cards"]))
+        bad_state = self.call("GET", "/api/cards?state=nonsense")["data"]
+        self.assertIsInstance(bad_state["cards"], list)
+
+        queue = self.call("GET", "/api/review?limit=5")["data"]
+        self.assertEqual(len(queue["mistake_tags"]), 6)
+        card = queue["cards"][0]
+        res = self.call("POST", f"/api/review/{urllib.parse.quote(card['id'])}", {
+            "rating": 1, "elapsed_ms": 2000, "mistake_tags": ["boundary", "unknown_key"],
+        })["data"]
+        self.assertEqual(res["mistake_tags"], ["boundary"])
+        echoed = self.call("GET", "/api/cards?unit_id=" + urllib.parse.quote(card["unit_id"]))["data"]
+        marked = [c for c in echoed["cards"] if c["id"] == card["id"]][0]
+        self.assertEqual(marked["mistake_tags"], ["boundary"])
+        self.assertEqual(marked["mistake_labels"], ["条件/边界漏了"])
+        mist = self.call("GET", "/api/insights")["data"]["mistakes"]
+        self.assertEqual(mist["tagged_reviews"], 1)
+        self.assertEqual(mist["tags"][0]["key"], "boundary")
+
+    def test_18_material_fix(self):
+        res = self.call("POST", "/api/material/fix", {
+            "text": "#　提取练习\r\n• 合书复述\r\n公式 \\[x^2\\] 与 `\\[y\\]`\r\n",
+        })["data"]
+        self.assertTrue(res["changed"])
+        self.assertIn("# 提取练习", res["text"])
+        self.assertIn("- 合书复述", res["text"])
+        self.assertIn("$$x^2$$", res["text"])
+        self.assertIn("`\\[y\\]`", res["text"], "行内代码里的公式不该被改写")
+        self.assertTrue(res["applied"])
+        untouched = self.call("POST", "/api/material/fix", {"text": "# 已经很干净\n正文。"})["data"]
+        self.assertFalse(untouched["changed"])
+        self.assertEqual(untouched["applied"], [])
+        empty = self.call("POST", "/api/material/fix", {"text": "   "})["data"]
+        self.assertEqual(empty["text"], "")
+        try:
+            self.call("POST", "/api/material/fix", {"text": "x" * 200_001})
+            self.fail("oversized text should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/material/fix", {"text": "abc", "options": "nope"})
+            self.fail("bad options should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        disabled = self.call("POST", "/api/material/fix", {
+            "text": "• 项目", "options": {"bullets": False},
+        })["data"]
+        self.assertTrue(disabled["text"].startswith("•"))
+
+    def test_19_cards_preview_confirm_and_quick_ask(self):
+        unit_id = self.call("GET", "/api/map")["data"]["nodes"][0]["id"]
+        preview = self.call("POST", "/api/cards/preview", {
+            "text": "提取练习：合上书，用自己的话把核心讲出来。\n间隔复习？在快要忘但还没忘的时候最有效。",
+            "unit_id": unit_id,
+        })["data"]
+        self.assertEqual(preview["status"], "preview")
+        self.assertEqual(preview["engine"], "rules")
+        self.assertTrue(preview["cards"])
+        self.assertTrue(preview["tool_args"]["cards"])
+        queue_before = self.call("GET", "/api/review?limit=100")["data"]["new_total"]
+        confirmed = self.call("POST", "/api/cards/confirm", {
+            "cards": preview["cards"], "unit_id": unit_id,
+        })["data"]
+        self.assertEqual(confirmed["count"], len(preview["cards"]))
+        queue_after = self.call("GET", "/api/review?limit=100")["data"]["new_total"]
+        self.assertEqual(queue_after - queue_before, confirmed["count"],
+                         "预览不该进队列，确认后才算")
+
+        try:
+            self.call("POST", "/api/cards/preview", {"text": "短"})
+            self.fail("too short should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/cards/confirm", {"cards": "not-a-list"})
+            self.fail("bad cards should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/ask", {"question": "为什么", "context": "材料"})
+            self.fail("demo mode should 503")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 503)
+            self.assertEqual(json.loads(exc.read())["error"]["code"], "ai_not_configured")
+
+    def test_20_style_test_flow(self):
+        questions = self.call("GET", "/api/styles/questions")["data"]
+        self.assertEqual(len(questions["questions"]), 5)
+        self.assertTrue(all("weights" not in o for q in questions["questions"] for o in q["options"]),
+                        "不能把权重泄漏给前端")
+        answers = [0, 1, 0, 2, 1]
+        applied = self.call("POST", "/api/styles/apply", {"answers": answers})["data"]
+        self.assertTrue(applied["persona"]["label"])
+        self.assertTrue(applied["persona"]["strategy"])
+        self.assertEqual(applied["persona"]["answers"], answers)
+        dash = self.call("GET", "/api/dashboard")["data"]
+        self.assertEqual(dash["goal"]["meta"]["persona"]["key"], applied["persona"]["key"])
+
+        # 人设要真的进到追问的提示词里，而不只是存起来
+        captured = {}
+        old_enabled, old_chat = llm.enabled, llm.chat
+        llm.enabled = lambda: True
+        llm.chat = lambda messages, **kw: captured.update({"system": messages[0]["content"]}) or "先说说你的理解？"
+        try:
+            unit_id = self.call("GET", "/api/map")["data"]["nodes"][0]["id"]
+            goal_id = dash["goal"]["id"]
+            session = self.call("POST", "/api/socratic/start", {"unit_id": unit_id, "goal_id": goal_id})["data"]
+            list(socratic.stream_reply(self.db, config.DEFAULT_USER,
+                                       session["session"]["id"], "我先说说我的理解。"))
+        finally:
+            llm.enabled, llm.chat = old_enabled, old_chat
+        self.assertIn("这位学习者的带法", captured.get("system", ""))
+        self.assertIn(applied["persona"]["strategy"], captured.get("system", ""))
+
+        try:
+            self.call("POST", "/api/styles/apply", {"answers": [0, 1]})
+            self.fail("wrong answer count should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/styles/apply", {"answers": [0, 1, 2, 3, 99]})
+            self.fail("out-of-range option should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
+    def test_21_duplicate_endpoint_and_merge_http(self):
+        dup = self.call("GET", "/api/units/duplicates")["data"]
+        self.assertIn("pairs", dup)
+        self.assertEqual(dup["engine"], "rules")
+        self.assertGreaterEqual(dup["checked"], 1)
+        db = self.db
+        goal = db.one("SELECT id FROM goals WHERE status='active' ORDER BY created_at DESC LIMIT 1")
+        from boil.utils import now_iso
+        for uid, order in (("unit-dup-a", 90), ("unit-dup-b", 91)):
+            db.upsert("units", {"id": uid, "goal_id": goal["id"], "pack_id": "p",
+                                "pack_unit_id": uid, "title": "间隔复习",
+                                "essence": "在快要忘但还没忘的时候复习最有效",
+                                "order_index": order, "created_at": now_iso(),
+                                "updated_at": now_iso()}, "id")
+        listed = self.call("GET", "/api/units/duplicates")["data"]
+        self.assertTrue(listed["pairs"], "重复的一对要被检出")
+        pair = listed["pairs"][0]
+        self.assertEqual(sorted([pair["keep"], pair["merge"]]), ["unit-dup-a", "unit-dup-b"])
+        self.assertTrue(pair["titles"])
+        self.assertEqual(pair["basis"], "lexical", "没配嵌入时依据要说清楚是字面")
+        self.assertTrue(pair["allowed"])
+        self.assertIsNone(pair["semantic"], "云端向量不可用就不能编一个语义分")
+        self.assertGreaterEqual(pair["lexical"], quality.MERGE_LEXICAL_FLOOR)
+        self.assertEqual(listed["engine"], "rules")
+        self.assertEqual(listed["judged"], 0, "字面过硬的不该白花模型判定")
+        self.assertIn("candidate", listed["thresholds"])
+        nodes_before = len(self.call("GET", "/api/map")["data"]["nodes"])
+        merged = self.call("POST", "/api/units/unit-dup-b/merge", {"into": "unit-dup-a"})["data"]
+        self.assertEqual(merged["into"], "unit-dup-a")
+        nodes_after = self.call("GET", "/api/map")["data"]["nodes"]
+        self.assertEqual(len(nodes_after), nodes_before - 1)
+        self.assertNotIn("unit-dup-b", [n["id"] for n in nodes_after])
+        detail = self.call("GET", "/api/units/unit-dup-b")["data"]
+        self.assertEqual(detail["merged_into"]["id"], "unit-dup-a")
+        after = self.call("GET", "/api/units/duplicates")["data"]
+        self.assertEqual([p for p in after["pairs"] if p["merge"] == "unit-dup-b"], [],
+                         "合并后不该再被推荐")
+        try:
+            self.call("POST", "/api/units/unit-dup-a/merge", {"into": "unit-dup-b"})
+            self.fail("merging back into an absorbed unit should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        try:
+            self.call("POST", "/api/units/unit-dup-a/merge", {})
+            self.fail("missing into should 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+
+    def test_22_bad_backup_rolls_back_and_says_400(self):
+        """用户可以手改备份文件：不合法要报 400 并保证原数据一条不少，不能甩 500。"""
+        r, body = self.call("GET", "/api/export", raw=True)
+        dump = json.loads(body)
+        goals_before = len(self.call("GET", "/api/goals")["data"]["goals"])
+        cards_before = self.call("GET", "/api/cards?limit=200")["data"]["total"]
+        poison = json.loads(json.dumps(dump))
+        unit_id = (poison.get("units") or [{}])[0].get("id") or "unit-x"
+        poison.setdefault("cards", []).append({
+            "id": "cd-poison", "user_id": "local", "unit_id": unit_id,
+            "front": None,                       # cards.front 是 NOT NULL
+            "back": "坏掉的一行", "state": "new", "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"})
+        try:
+            self.call("POST", "/api/import",
+                      {"data": poison, "mode": "replace", "confirm": "IMPORT"})
+            self.fail("坏备份应该报 400")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400, "数据不合法的导入不该报 500")
+            payload = json.loads(exc.read().decode())
+        self.assertEqual(payload["error"]["code"], "import_conflict")
+        self.assertIn("回滚", payload["error"]["message"])
+        self.assertEqual(len(self.call("GET", "/api/goals")["data"]["goals"]), goals_before,
+                         "导入失败把目标弄丢了")
+        self.assertEqual(self.call("GET", "/api/cards?limit=200")["data"]["total"], cards_before,
+                         "导入失败把复习卡弄丢了")
+        self.assertIsNone(self.db.one("SELECT id FROM cards WHERE id='cd-poison'"),
+                          "坏行不能已经进去了才报错")
 
     def test_07_unknown_route(self):
         try:

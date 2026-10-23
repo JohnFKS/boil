@@ -3,6 +3,8 @@ import {
   escapeHTML, escapeAttr, icon, pct, radarSVG, ringSVG, statusMeta, kindMeta,
   renderMarkdown, truncate, relativeTime, formatDateTime,
 } from "../utils.js";
+import { highlightQuotes } from "../quoteHighlight.js";
+import { aiEnabled, aiFailure, aiSuccess } from "../utils.js";
 
 function listHTML(items, ordered = false) {
   if (!items?.length) return `<p class="muted small">材料里没有给出这一部分。</p>`;
@@ -85,6 +87,21 @@ export async function render(el, ctx, params) {
 
     <div class="unit-grid">
       <div class="unit-main" data-selectable data-unit-id="${escapeAttr(u.id)}" data-source="unit">
+        ${data.merged_into ? `
+          <div class="merge-banner">
+            ${icon("compass", 14)}
+            <span>这个单元已被吸收进
+              <a href="#/unit/${escapeAttr(data.merged_into.id)}">${escapeHTML(data.merged_into.title)}</a>
+              ——内容没有删除，只是不再单独出现在地图上。</span>
+          </div>` : ""}
+        ${(data.absorbed || []).length ? `
+          <div class="merge-banner muted-banner">
+            ${icon("check", 14)}
+            <span>本单元已吸收 ${data.absorbed.length} 个重复单元：
+              ${data.absorbed.map(x => `<a href="#/unit/${escapeAttr(x.id)}">${escapeHTML(x.title)}</a>`).join("、")}
+              ${data.absorbed[0]?.merged_reason ? `（${escapeHTML(data.absorbed[0].merged_reason)}）` : ""}
+            </span>
+          </div>` : ""}
         <div class="essence-card">
           <div class="essence-label">${icon("spark", 13)} 一句话本质</div>
           ${u.angle ? `<div class="unit-angle">${icon("compass", 12)} ${escapeHTML(u.angle)}${u.source_ref?.kind === "llm" ? "" : `<span class="badge badge-muted">本地规则</span>`}</div>` : ""}
@@ -179,7 +196,11 @@ export async function render(el, ctx, params) {
         <div class="card side-card">
           <div class="side-label">速记与我的笔记</div>
           <div class="field mt-2"><label>速记（复习线索）</label><textarea class="textarea" id="note-mnemonic" style="min-height:64px" placeholder="口诀、谐音、类比、画面感…">${escapeHTML(notes.mnemonic?.content || "")}</textarea></div>
-          <button class="btn btn-ghost btn-sm mt-2" data-save-note="mnemonic">保存速记</button>
+          <div class="row wrap mt-2" style="gap:8px">
+            <button class="btn btn-ghost btn-sm" data-save-note="mnemonic">保存速记</button>
+            ${aiEnabled(ctx) ? `<button class="btn btn-ghost btn-sm" data-mnemonic-ai>${icon("wand", 13)} AI 编口诀</button>` : ""}
+          </div>
+          <div class="mnemonic-ai-result" id="mnemonic-ai" style="display:none"></div>
           <div class="field mt-3"><label>我的笔记</label><textarea class="textarea" id="note-note" style="min-height:80px" placeholder="把这一单元的边界、反例、自己的话记下来。">${escapeHTML(notes.note?.content || "")}</textarea></div>
           <button class="btn btn-ghost btn-sm mt-2" data-save-note="note">保存笔记</button>
           <div class="faint tiny mt-2">来自 mem 的速记/批注思路：速记会在复习卡上作为可选线索出现。</div>
@@ -231,7 +252,68 @@ export async function render(el, ctx, params) {
   el.querySelectorAll("[data-probe] .probe-head").forEach(head => {
     head.addEventListener("click", () => head.parentElement.classList.toggle("open"));
   });
+  el.querySelectorAll("[data-mnemonic-ai]").forEach(btn => btn.addEventListener("click", async () => {
+    const box = el.querySelector("#mnemonic-ai");
+    const ta = el.querySelector("#note-mnemonic");
+    btn.disabled = true;
+    const label = btn.innerHTML;
+    btn.innerHTML = "编写中…";
+    if (box) { box.style.display = "block"; box.innerHTML = '<p class="muted small">AI 正在按材料的本质、步骤与边界编记忆钩子…</p>'; }
+    try {
+      const res = await ctx.api.post(`/api/units/${encodeURIComponent(u.id)}/mnemonic`, {}, { timeout: 90000 });
+      aiSuccess(ctx);
+      if (box) {
+        box.innerHTML = `
+          <div class="between"><span class="badge badge-teal">AI 建议</span><span class="faint tiny">还没保存，确认后再填</span></div>
+          <ul class="digest-advice">${res.mnemonics.map(m => `<li>${escapeHTML(m)}</li>`).join("")}</ul>
+          ${res.note ? `<p class="faint tiny">${escapeHTML(res.note)}</p>` : ""}
+          <div class="row wrap mt-2" style="gap:8px">
+            <button class="btn btn-teal btn-sm" type="button" data-mnemonic-fill>填进速记</button>
+            <button class="btn btn-ghost btn-sm" type="button" data-mnemonic-hide>不用</button>
+          </div>`;
+        box.querySelectorAll("[data-mnemonic-fill]").forEach(fill => fill.addEventListener("click", () => {
+          if (ta) ta.value = res.mnemonics.join("\n");
+          box.innerHTML = '<p class="muted small">已填进速记框；点「保存速记」才会写入，复习卡才会带上这条线索。</p>';
+        }));
+        box.querySelectorAll("[data-mnemonic-hide]").forEach(hide => hide.addEventListener("click", () => {
+          box.style.display = "none";
+          box.innerHTML = "";
+        }));
+      }
+    } catch (e) {
+      aiFailure(ctx);
+      if (box) box.innerHTML = `<p class="muted small">${escapeHTML(e.message || "生成失败")} 你可以自己写速记，不影响复习。</p>`;
+      if (!aiEnabled(ctx)) btn.style.display = "none";
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = label;
+    }
+  }));
+
   ctx.cleanup(() => { try { window.speechSynthesis?.cancel(); } catch { /* noop */ } });
+
+  (async () => {
+    let data;
+    try {
+      data = await ctx.api.get(`/api/notes?unit_id=${encodeURIComponent(u.id)}`);
+    } catch { return; }
+    const notes = (data?.notes || []).filter(n => (n.quote || "").trim().length >= 4);
+    if (!notes.length) return;
+    const main = el.querySelector(".unit-main");
+    if (!main) return;
+    // 等 renderMath 落地：KaTeX 生成的节点要跳过，否则会把公式源码当普通文字标注
+    await new Promise(resolve => requestAnimationFrame(() => resolve()));
+    const marks = highlightQuotes(main, notes.map(n => ({
+      text: n.quote,
+      title: n.content ? `你的灵感：${n.content}` : "你存过的灵感",
+    })));
+    if (!marks) return;
+    const tip = document.createElement("div");
+    tip.className = "note-hl-tip";
+    tip.innerHTML = `${icon("spark", 12)} <span>已在原文里标出 ${marks} 处灵感引文（这个单元存了 ${notes.length} 条）</span>`;
+    main.insertBefore(tip, main.firstChild);
+  })();
+
   if (params.query?.get("action") === "audio") {
     setTimeout(() => openAudioModal(ctx, u), 120);
   }

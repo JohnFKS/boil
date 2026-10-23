@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -55,14 +56,86 @@ PROVIDERS = [
 
 
 class LLMError(Exception):
-    def __init__(self, message: str, detail: str = "", code: str = "llm_error"):
+    def __init__(self, message: str, detail: str = "", code: str = "llm_error",
+                 hint: str = ""):
         super().__init__(message)
         self.message = message
         self.detail = detail
         self.code = code
+        self.hint = hint
 
     def to_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "detail": self.detail}
+        return {"code": self.code, "message": self.message, "detail": self.detail,
+                "hint": self.hint}
+
+
+_HTTP_HINTS: dict[int, str] = {
+    400: "请求被网关拒绝：常见原因是 response_format/temperature 等参数不被支持，或模型名不对。",
+    401: "认证失败：检查 API Key 是否正确，以及这个服务用的是 Authorization: Bearer 还是自定义头（Dots 用 api-key 且无前缀）。",
+    403: "被拒绝访问：Key 有效但无权访问该模型，或触发了服务商策略。",
+    404: "地址或模型不存在：Base URL 通常要以 /v1 结尾；也可能是模型名拼错。",
+    408: "网关超时：把超时调大，或换更快的模型；长思考类模型建议提高超时。",
+    409: "并发冲突：稍后重试；Boil 已按指数退避重试两次。",
+    413: "请求体过大：缩短材料或降低单次编译的字符数。",
+    422: "参数校验失败：多为额外参数（extra_body）与网关不兼容，可清空高级参数再试。",
+    429: "限流：降低频率或提高配额；Boil 已按指数退避重试。",
+    500: "网关内部错误：通常是服务商抖动，稍后重试。",
+    502: "上游无响应：网关到模型的链路断了。",
+    503: "服务不可用：模型正在维护或过载。",
+    504: "网关超时：思考型模型常在长推理时触发；Boil 对上游改用流式接收来规避这类空闲超时。",
+}
+
+_NETWORK_HINTS: dict[str, str] = {
+    "dns": "域名解析失败：检查 Base URL 的域名，以及本机是否需要代理/VPN。",
+    "refused": "连接被拒绝：端口没监听或服务没起来；本地模型（Ollama 等）要先启动。",
+    "timeout": "连接或读取超时：提高设置里的超时，或换延迟更低的模型。",
+    "tls": "TLS 握手失败：证书链或代理拦截了 HTTPS，检查系统证书与代理设置。",
+    "proxy": "代理返回异常：本机代理环境变量可能把请求转到了别处。",
+    "network": "网络不通：确认能访问该地址，或在同一网络下重试。",
+}
+
+
+def _classify_exception(exc: BaseException) -> tuple[str, str]:
+    """把 urllib/socket 异常链归到可行动的分类，并给一句人话建议。"""
+    seen: list[str] = []
+    node: BaseException | None = exc
+    while node is not None and len(seen) < 6:
+        seen.append(f"{type(node).__name__}: {node}")
+        text = str(node).lower()
+        name = type(node).__name__.lower()
+        if "getaddrinfo" in text or "nameresolution" in name or "name or service not known" in text:
+            return "dns", _NETWORK_HINTS["dns"]
+        if "refused" in text:
+            return "refused", _NETWORK_HINTS["refused"]
+        if "timed out" in text or name in ("timeouterror", "sockettimeout"):
+            return "timeout", _NETWORK_HINTS["timeout"]
+        if "ssl" in name or "certificate" in text or "tls" in text:
+            return "tls", _NETWORK_HINTS["tls"]
+        if "proxy" in text or "tunnel connection" in text:
+            return "proxy", _NETWORK_HINTS["proxy"]
+        node = node.__cause__ or node.__context__
+        if node is exc:
+            break
+    return "network", _NETWORK_HINTS["network"]
+
+
+def _http_hint(status: int) -> str:
+    if status in _HTTP_HINTS:
+        return _HTTP_HINTS[status]
+    if 400 <= status < 500:
+        return "请求被拒绝：核对模型名、参数与 Key 的权限。"
+    if status >= 500:
+        return "网关侧错误：稍后重试；持续失败请换模型或看服务商状态页。"
+    return ""
+
+
+def _safe_detail(text: str) -> str:
+    """回显的服务端内容可能带 Key：把 sk-/Bearer 之类掩掉再落盘或回传。"""
+    out = re.sub(r"(sk|ak|key|token)[-_=]([A-Za-z0-9_-]{6,})",
+                 lambda m: f"{m.group(1)}-…{m.group(2)[-4:]}", str(text or ""), flags=re.I)
+    out = re.sub(r"(bearer\s+)[A-Za-z0-9._-]{8,}", lambda m: f"{m.group(1)}…{m.group(0)[-4:]}",
+                 out, flags=re.I)
+    return out
 
 
 def _env_config() -> dict[str, Any]:
@@ -117,6 +190,8 @@ def get_config() -> dict[str, Any]:
     if not isinstance(extra, dict):
         extra = {}
     cfg["extra_body"] = extra
+    cfg["cache_enabled"] = bool(cfg.get("cache_enabled", True))
+    cfg["stream_upstream"] = bool(cfg.get("stream_upstream", True))
     return cfg
 
 
@@ -155,6 +230,8 @@ def set_config(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             raise ValueError("extra_body 必须是 JSON 对象")
     out["extra_body"] = extra
+    for flag in ("cache_enabled", "stream_upstream"):
+        out[flag] = bool(payload[flag]) if flag in payload else bool(cur.get(flag, True))
     # None = 不修改；空字符串 = 显式清空 Key（回到演示模式）
     if "api_key" in payload and payload["api_key"] is not None:
         key = str(payload["api_key"]).strip()
@@ -200,12 +277,22 @@ def last_error() -> dict[str, Any] | None:
     return state
 
 
-def _note_error(message: str, detail: str = "", code: str = "llm_error") -> None:
+def _note_error(message: str, detail: str = "", code: str = "llm_error",
+                hint: str = "") -> None:
+    cfg = {}
+    try:
+        cfg = get_config()
+    except Exception:
+        cfg = {}
     write_json_atomic(config.LLM_STATE_PATH, {
         "message": message[:300],
-        "detail": detail[:1200],
+        "detail": _safe_detail(detail)[:1200],
         "code": code,
+        "hint": hint,
         "at": now_iso(),
+        "base_url": cfg.get("base_url", ""),
+        "model": cfg.get("model", ""),
+        "api_key_masked": mask(cfg.get("api_key", "")) if cfg.get("api_key") else "",
     }, mode=0o600)
 
 
@@ -236,6 +323,10 @@ def public_config() -> dict[str, Any]:
         "providers": PROVIDERS,
         "last_error": err,
         "forced_off": config.LLM_OFF,
+        "cache_enabled": bool(cfg.get("cache_enabled", True)),
+        "stream_upstream": bool(cfg.get("stream_upstream", True)),
+        "cache": cache_stats(),
+        "cache_entries": cache_size(),
     }
 
 
@@ -256,11 +347,12 @@ def _apply_extra_body(payload: dict[str, Any], cfg: dict[str, Any]) -> None:
             payload[key] = value
 
 
-def _extract_content(data: dict[str, Any]) -> str:
+def _extract_message(data: dict[str, Any]) -> tuple[str, str]:
     try:
-        msg = data["choices"][0]["message"]
+        choice = data["choices"][0]
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError("模型返回结构异常", json.dumps(data, ensure_ascii=False)[:800]) from exc
+    msg = choice.get("message") or {}
     content = msg.get("content")
     if isinstance(content, list):
         content = "".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
@@ -270,7 +362,11 @@ def _extract_content(data: dict[str, Any]) -> str:
         if reasoning:
             detail += "（只有推理内容；请换模型或关闭 reasoning）"
         raise LLMError(detail, json.dumps(data, ensure_ascii=False)[:800], "empty_content")
-    return content.strip()
+    return content.strip(), str(choice.get("finish_reason") or "")
+
+
+def _extract_content(data: dict[str, Any]) -> str:
+    return _extract_message(data)[0]
 
 
 def _should_retry(status: int) -> bool:
@@ -289,7 +385,59 @@ def _http_post_json(url: str, headers: dict[str, str], payload: dict[str, Any],
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
     except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-        raise LLMError("无法连接模型服务", f"{type(exc).__name__}: {exc}", "network") from exc
+        kind, hint = _classify_exception(exc)
+        raise LLMError("无法连接模型服务", f"{type(exc).__name__}: {exc}", kind, hint) from exc
+
+
+def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any],
+                      timeout: int) -> tuple[int, bytes]:
+    """向上游要 stream:true，再把分片拼回非流式的响应形状。
+
+    很多网关按「空闲」掐断长请求：思考型模型几十秒不吐字节就被 504 掉。
+    流式期间一直有字节到达，链路不会被掐；对调用方仍然是一次普通返回。
+    """
+    import urllib.error
+    import urllib.request
+    streamed = {**payload, "stream": True}
+    body = json.dumps(streamed, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            raw = resp.read()
+            if "event-stream" not in ctype:
+                return resp.status, raw      # 网关不认 stream，照旧返回 JSON
+            pieces: list[str] = []
+            finish = ""
+            for line in raw.decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_text)
+                except ValueError:
+                    continue
+                for choice in (chunk.get("choices") or []):
+                    if choice.get("finish_reason"):
+                        finish = str(choice["finish_reason"])
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece is None:
+                        piece = (choice.get("message") or {}).get("content")
+                    if isinstance(piece, list):
+                        piece = "".join(str(x.get("text", "")) for x in piece if isinstance(x, dict))
+                    if isinstance(piece, str):
+                        pieces.append(piece)
+            rebuilt = {"choices": [{"message": {"content": "".join(pieces)},
+                                    "finish_reason": finish}]}
+            return resp.status, json.dumps(rebuilt, ensure_ascii=False).encode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        kind, hint = _classify_exception(exc)
+        raise LLMError("无法连接模型服务", f"{type(exc).__name__}: {exc}", kind, hint) from exc
 
 
 def chat(messages: list[dict[str, Any]], model: str | None = None,
@@ -314,15 +462,16 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
     url = _base_url()
     timeout_s = int(timeout or cfg["timeout"])
     last_exc: LLMError | None = None
+    poster = _http_post_stream if cfg.get("stream_upstream", True) else _http_post_json
     for attempt in range(MAX_RETRIES + 1):
         try:
-            status, raw = _http_post_json(url, headers, payload, timeout_s)
+            status, raw = poster(url, headers, payload, timeout_s)
         except LLMError as exc:
             last_exc = exc
             if attempt < MAX_RETRIES:
                 time.sleep(0.7 * (attempt + 1))
                 continue
-            _note_error(exc.message, exc.detail, exc.code)
+            _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise
         if status == 400 and json_mode:
             detail = raw[:800].decode("utf-8", "replace")
@@ -331,17 +480,23 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
                 json_mode = False
                 continue
         if status != 200:
-            detail = raw[:1200].decode("utf-8", "replace")
-            exc = LLMError(f"模型服务返回 HTTP {status}", detail, "http_error")
+            detail = _safe_detail(raw[:1200].decode("utf-8", "replace"))
+            hint = _http_hint(status)
+            exc = LLMError(f"模型服务返回 HTTP {status}", detail, "http_error", hint)
             last_exc = exc
             if _should_retry(status) and attempt < MAX_RETRIES:
                 time.sleep(0.8 * (2 ** attempt))
                 continue
-            _note_error(exc.message, detail, exc.code)
+            _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise exc
         try:
             data = json.loads(raw.decode("utf-8"))
-            text = _extract_content(data)
+            text, finish = _extract_message(data)
+            if finish == "length" and attempt < MAX_RETRIES and payload.get("max_tokens"):
+                # 被 max_tokens 截断：加大额度重来，而不是把半截 JSON 交下去
+                current = int(payload["max_tokens"])
+                payload["max_tokens"] = min(max(current * 4, current + 800), 32000)
+                continue
             _clear_error()
             return text
         except (ValueError, LLMError) as exc:
@@ -350,7 +505,7 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
             if attempt < MAX_RETRIES:
                 time.sleep(0.5)
                 continue
-            _note_error(err.message, err.detail, err.code)
+            _note_error(err.message, err.detail, err.code, err.hint)
             raise err
     if last_exc:
         raise last_exc
@@ -393,9 +548,10 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
         conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
         if resp.status != 200:
-            detail = resp.read(1600).decode("utf-8", "replace")
-            exc = LLMError(f"模型服务返回 HTTP {resp.status}", detail, "http_error")
-            _note_error(exc.message, detail, exc.code)
+            detail = _safe_detail(resp.read(1600).decode("utf-8", "replace"))
+            exc = LLMError(f"模型服务返回 HTTP {resp.status}", detail, "http_error",
+                           _http_hint(resp.status))
+            _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise exc
         while True:
             raw_line = resp.readline()
@@ -429,14 +585,14 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
                 yield piece
         if not produced:
             exc = LLMError("模型流式返回空正文", "服务端没有返回任何 content 分片", "empty_content")
-            _note_error(exc.message, exc.detail, exc.code)
+            _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise exc
         _clear_error()
     except LLMError:
         raise
     except (http.client.HTTPException, socket.timeout, TimeoutError, OSError) as exc:
         err = LLMError("流式连接中断", f"{type(exc).__name__}: {exc}", "stream")
-        _note_error(err.message, err.detail, err.code)
+        _note_error(err.message, err.detail, err.code, err.hint)
         raise err from exc
     finally:
         try:
@@ -457,6 +613,55 @@ def test_connection() -> dict[str, Any]:
             "model": model_name(True), "reply": text[:80]}
 
 
+def _scan_json_value(text: str, start: int) -> tuple[int | None, list[str], bool]:
+    """从 start 起做括号配平，跳过字符串内的括号。
+    返回 (完整值的结束位置或 None, 结束时仍未闭合的括号栈, 是否停在字符串里)。"""
+    pairs = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in pairs:
+            stack.append(pairs[ch])
+        elif ch in "}]":
+            if stack and ch == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return i + 1, stack, in_str
+                continue
+            # 混进来的闭合符（模型写坏了结构）：就地截断，让后面的修复逻辑处理
+            return i + 1, stack, in_str
+    return None, stack, in_str
+
+
+def _complete_truncated(text: str, start: int) -> str:
+    """模型被 max_tokens 截断时，补齐引号与括号再试一次。"""
+    end, stack, in_str = _scan_json_value(text, start)
+    if end is not None:
+        return text[start:end]
+    fragment = text[start:]
+    if in_str:
+        fragment = fragment.rstrip()
+        if fragment.endswith("\\"):
+            fragment = fragment[:-1]
+        fragment += '"'
+    closing = "".join(reversed(stack))
+    if not closing and not in_str:
+        return fragment
+    return fragment + closing
+
+
 def parse_json_loose(text: str) -> Any:
     text = (text or "").strip()
     if not text:
@@ -472,25 +677,137 @@ def parse_json_loose(text: str) -> Any:
     if not starts:
         raise LLMError("模型没有返回 JSON", text[:800], "json")
     start = min(starts)
-    end = max(text.rfind("}"), text.rfind("]"))
-    if end <= start:
-        raise LLMError("模型返回的 JSON 不完整", text[:800], "json")
-    candidate = text[start:end + 1]
+    attempts: list[str] = []
+    end, _stack, _in_str = _scan_json_value(text, start)
+    if end is not None:
+        attempts.append(text[start:end])
+    attempts.append(_complete_truncated(text, start))
+    last = max(text.rfind("}"), text.rfind("]"))
+    if last > start:
+        attempts.append(text[start:last + 1])
+    seen: set[str] = set()
+    errors: list[str] = []
+    for candidate in attempts:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        for variant in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+            try:
+                return json.loads(variant)
+            except ValueError as exc:
+                errors.append(str(exc)[:120])
+    raise LLMError("模型返回的 JSON 无法解析", f"{'; '.join(errors[:3])}；{text[:800]}", "json")
+
+
+_JUNK_LITERALS = {"", "undefined", "null", "none", "nan", "nil", "n/a", "无", "未知",
+                  "没有", "...", "…", "未知内容"}
+
+
+def _reject_junk(value: Any) -> Any:
+    """模型偶尔会回一个占位字符串；把它当失败，而不是写进卡片/笔记。"""
+    if isinstance(value, str):
+        cleaned = value.strip().strip("\"'“”").lower()
+        if cleaned in _JUNK_LITERALS:
+            raise LLMError("模型只返回了占位内容", value[:200], "junk_output")
+    return value
+
+
+_cache_stats = {"calls": 0, "hits": 0, "writes": 0}
+
+
+def cache_dir():
+    return config.DATA_DIR / "llm_cache"
+
+
+def cache_key(model: str, messages: list[dict[str, Any]], temperature: float,
+              max_tokens: int | None, endpoint: str = "") -> str:
+    # endpoint 也在键里：同名模型接到另一家网关时，不该复用上一家的输出
+    blob = json.dumps({"v": 2, "endpoint": endpoint, "model": model, "messages": messages,
+                       "temperature": temperature, "max_tokens": max_tokens},
+                      ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def cache_stats() -> dict[str, int]:
+    return dict(_cache_stats)
+
+
+def cache_size() -> int:
+    directory = cache_dir()
+    if not directory.exists():
+        return 0
+    return sum(1 for p in directory.glob("*.json"))
+
+
+def clear_cache() -> int:
+    directory = cache_dir()
+    removed = 0
+    if directory.exists():
+        for path in directory.glob("*.json"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    _cache_stats["hits"] = 0
+    _cache_stats["writes"] = 0
+    return removed
+
+
+def _cache_read(key: str) -> str | None:
+    data = read_json(cache_dir() / f"{key}.json", None)
+    if isinstance(data, dict) and isinstance(data.get("text"), str):
+        return data["text"]
+    return None
+
+
+def _cache_write(key: str, text: str, model: str) -> None:
+    directory = cache_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(directory / f"{key}.json",
+                      {"key": key, "model": model, "created_at": now_iso(), "text": text})
+    _cache_stats["writes"] += 1
+
+
+def _cache_drop(key: str) -> None:
+    """坏缓存要能自愈：解析不了的条目留在盘上，同一个请求就永久失败。"""
     try:
-        return json.loads(candidate)
-    except ValueError:
-        repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
-        try:
-            return json.loads(repaired)
-        except ValueError as exc:
-            raise LLMError("模型返回的 JSON 无法解析", f"{exc}; {candidate[:800]}", "json") from exc
+        (cache_dir() / f"{key}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def chat_json(messages: list[dict[str, Any]], model: str | None = None,
               temperature: float = 0.2, max_tokens: int | None = None) -> Any:
+    """结构化调用：内容寻址缓存，同样的输入第二次零成本、零漂移。
+
+    只缓存 chat_json：它的提示词是稳定材料（编译/元信息/速记/解读），
+    流式对话带会话状态，缓存它等于伪造回答。
+    解析成功才写缓存，命中却解析不了就删条目重问——缓存不能把一次失败固化成永久失败。
+    """
+    cfg = get_config()
+    use_cache = bool(cfg.get("cache_enabled", True)) and enabled()
+    chosen_model = model or cfg["model"]
+    key = (cache_key(chosen_model, messages, temperature, max_tokens,
+                     str(cfg.get("base_url") or "")) if use_cache else "")
+    if use_cache:
+        cached = _cache_read(key)
+        if cached is not None:
+            _cache_stats["hits"] += 1
+            try:
+                return _reject_junk(parse_json_loose(cached))
+            except LLMError:
+                _cache_drop(key)          # 坏条目：删掉后当没命中，继续真实调用
+    _cache_stats["calls"] += 1
     text = chat(messages, model=model, json_mode=True, temperature=temperature,
-                max_tokens=max_tokens)
-    return parse_json_loose(text)
+               max_tokens=max_tokens)
+    parsed = _reject_junk(parse_json_loose(text))
+    if use_cache:
+        try:
+            _cache_write(key, text, chosen_model)
+        except OSError:
+            pass  # 缓存写不下去不影响本次结果
+    return parsed
 
 
 def load_prompt(name: str) -> str:

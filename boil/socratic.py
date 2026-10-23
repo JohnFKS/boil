@@ -76,6 +76,16 @@ def _probe_by_kind(probes: list[dict[str, Any]], kind: str) -> dict[str, Any] | 
     return next((p for p in probes if p.get("kind") == kind), None)
 
 
+def _last_user_message_is(db: Database, session_id: str, content: str) -> bool:
+    """重连时判断「这句话是不是已经记过了」：只看最后一条用户消息。
+
+    不能看最后一条消息——一轮答完后最后一条是教练的回答，那样 retry 永远判不出来。
+    """
+    row = db.one("SELECT content FROM messages WHERE session_id=? AND role='user' "
+                 "ORDER BY created_at DESC, id DESC LIMIT 1", (session_id,))
+    return bool(row) and row["content"] == content
+
+
 def _insert_message(db: Database, session_id: str, role: str, content: str,
                     meta: dict[str, Any] | None = None) -> dict[str, Any]:
     msg = {
@@ -104,12 +114,13 @@ def _messages(db: Database, session_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def _first_question(unit: dict[str, Any]) -> tuple[str, str]:
+def _first_question(db: Database, unit: dict[str, Any]) -> tuple[str, str]:
     """返回 (question, source)。source=live/demo，用于 UI 标注。"""
     if llm.enabled():
         system = llm.load_prompt("socratic_system.md")
         system += "\n\n# 当前知识单元\n" + _unit_context(unit)
         system += "\n\n# 当前阶段\n诊断起点（第 1 回合）。"
+        system += _persona_block(db, unit.get("goal_id"))
         try:
             text = llm.chat([
                 {"role": "system", "content": system},
@@ -130,7 +141,7 @@ def start_session(db: Database, user_id: str, goal_id: str, unit_id: str,
     if not unit or unit.get("goal_id") != goal_id:
         raise ValueError("单元不存在或不属于当前目标")
     session_id = new_id("ss")
-    first, source = _first_question(unit)
+    first, source = _first_question(db, unit)
     meta = {"stage": "diagnose", "hints": 0, "report": None, "evidence_added": False,
             "engine": source, "unit_title": unit["title"], "advice_id": advice_id}
     db.insert("sessions", {
@@ -173,11 +184,17 @@ def _unit_brief(unit: dict[str, Any]) -> dict[str, Any]:
                                      "misconceptions", "key_points", "goal_id")}
 
 
+def _persona_block(db: Database, goal_id: str | None) -> str:
+    from . import styles
+    return styles.persona_block_for(db, goal_id)
+
+
 def _build_llm_messages(db: Database, session: dict[str, Any], unit: dict[str, Any],
                         stage: str) -> list[dict[str, Any]]:
     system = llm.load_prompt("socratic_system.md")
     system += "\n\n# 当前知识单元\n" + _unit_context(unit)
     system += f"\n\n# 当前阶段\n{STAGE_LABELS.get(stage, stage)}（第 {session['turn'] + 1} 回合）。"
+    system += _persona_block(db, session.get("goal_id"))
     system += "\n\n# 提醒\n这一回合只能输出一个问题。不要给完整答案。"
     msgs = [{"role": "system", "content": system}]
     history = _messages(db, session["id"])
@@ -231,8 +248,12 @@ def _mock_reply(db: Database, session: dict[str, Any], unit: dict[str, Any],
 
 
 def stream_reply(db: Database, user_id: str, session_id: str,
-                 user_text: str) -> Generator[dict[str, Any], None, None]:
-    """yield {type: delta|status|done|error, ...}，供 SSE 直接序列化。"""
+                 user_text: str, retry: bool = False) -> Generator[dict[str, Any], None, None]:
+    """yield {type: delta|status|done|error, ...}，供 SSE 直接序列化。
+
+    retry=True 时不再重复写入用户消息：断线重连会把同一句话再发一次，
+    如果这里照单全收，会话里就会出现两条一样的回答记录，轮次也会白涨一格。
+    """
     session_row = _session_row(db, session_id)
     if not session_row:
         yield {"type": "error", "message": "会话不存在"}
@@ -256,8 +277,11 @@ def stream_reply(db: Database, user_id: str, session_id: str,
         return
     if len(user_text) > 4000:
         user_text = user_text[:4000]
-    _insert_message(db, session_id, "user", user_text)
-    turn = int(session["turn"]) + 1
+    if retry and _last_user_message_is(db, session_id, user_text):
+        turn = int(session["turn"])
+    else:
+        _insert_message(db, session_id, "user", user_text)
+        turn = int(session["turn"]) + 1
     stage = _stage_for_turn(turn)
     meta = json_loads(session.get("meta_json"), {})
     if any(w in user_text for w in ("提示", "给点提示", "hint")):

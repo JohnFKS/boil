@@ -1,6 +1,6 @@
 /* Knowledge map: layered SVG graph with pan/zoom, filters and a side inspector. */
 import {
-  escapeHTML, escapeAttr, icon, pct, statusMeta, truncate, toast,
+  escapeHTML, escapeAttr, icon, pct, statusMeta, truncate, toast, confirmDialog,
 } from "../utils.js";
 
 function layout(nodes, edges) {
@@ -133,7 +133,43 @@ function defaultSide(data) {
       <div class="rule"><span class="n">2</span><span>沿着线走：前置关系是从左到右，不要跳着啃。</span></div>
       <div class="rule"><span class="n">3</span><span>点开一个节点，直接开始预习、苏格拉底或费曼。</span></div>
     </div>
-  </div>`;
+  </div>
+  ${(data.duplicates || []).length ? `<div class="card map-side-card dup-card">
+    <div class="side-label">疑似重复 ${data.duplicates.length} 对${data.dupEngine === "semantic" ? " · 语义 + 字面" : " · 只看字面"}</div>
+    <p class="faint tiny">合并不是删除：被吸收的单元不再单独出现，内容与复习卡仍在原处可访问。分数只提候选，字面以外都要模型签字、你再点一次确认。</p>
+    ${data.duplicates.slice(0, 5).map((d, i) => dupRow(d, i)).join("")}
+    ${data.judged ? `<p class="faint tiny mt-2">其中 ${data.judged} 对分数落在中间带，已请模型判过。</p>` : ""}
+  </div>` : ""}`;
+}
+
+const DUP_BASIS = {
+  lexical: "字面近乎一致", model: "模型判定是同一件事",
+  user: "你写明理由后合并", none: "",
+};
+
+function dupSignal(d) {
+  const parts = [`字面 ${Math.round((d.lexical || 0) * 100)}%`];
+  if (d.semantic !== null && d.semantic !== undefined) {
+    parts.push(`语义 ${Math.round(d.semantic * 100)}%`);
+  }
+  return parts.join(" · ");
+}
+
+function dupRow(d, i) {
+  const allowed = d.allowed !== false;
+  const pending = !!d.pending_judgement;
+  const why = allowed
+    ? (DUP_BASIS[d.basis] || "可以合并") + (d.model_reason ? `：${d.model_reason}` : "")
+    : pending
+      ? `等模型签字：${d.decision_reason || "语义分只能提候选"}`
+      : `不能合并：${d.decision_reason || "分数不够"}`;
+  return `
+      <div class="dup-row${allowed ? "" : " blocked"}">
+        <span class="dup-titles"><strong>${escapeHTML(d.titles?.[0] || "")}</strong><span class="faint"> ≈ </span><strong>${escapeHTML(d.titles?.[1] || "")}</strong>
+          <span class="faint tiny">${escapeHTML(dupSignal(d))}</span></span>
+        <span class="dup-why faint tiny">${escapeHTML(why)}</span>
+        <button class="link-btn${allowed ? "" : " warn"}" type="button" data-merge="${escapeAttr(d.merge)}" data-keep="${escapeAttr(d.keep)}" data-row="${i}">${allowed ? "并入前者" : pending ? "判定并并入" : "坚持合并"}</button>
+      </div>`;
 }
 
 function nodeSide(n) {
@@ -156,13 +192,20 @@ function nodeSide(n) {
 }
 
 export async function render(el, ctx, params) {
-  let data;
+  let data, dup;
   try {
-    data = await ctx.api.get("/api/map");
+    // 并行：候选第一次要联网算嵌入，串行等就是把两个延迟加起来
+    [data, dup] = await Promise.all([
+      ctx.api.get("/api/map"),
+      ctx.api.get("/api/units/duplicates").catch(() => null),
+    ]);
   } catch (e) {
     if (e.status === 404) { ctx.navigate("#/onboarding", { replace: true }); return; }
     throw e;
   }
+  data.duplicates = (dup && dup.pairs) || [];
+  data.dupEngine = (dup && dup.engine) || "rules";
+  data.judged = (dup && dup.judged) || 0;
   const nodes = data.nodes || [];
   const edges = data.edges || [];
   if (!nodes.length) {
@@ -332,5 +375,78 @@ export async function render(el, ctx, params) {
   }));
   el.querySelectorAll("[data-filter]").forEach(btn => btn.addEventListener("click", () => setFilter(btn.dataset.filter)));
   wrap.addEventListener("dblclick", clearSelect);
+  el.querySelectorAll("[data-merge]").forEach(btn => btn.addEventListener("click", async (e) => {
+    const target = e.currentTarget;
+    const away = target.dataset.merge;
+    const keep = target.dataset.keep;
+    const pair = (data.duplicates || [])[Number(target.dataset.row)] || {};
+    if (!away || !keep) return;
+    if (pair.pending_judgement) {
+      // 排在判定上限之外的对：点下去先请模型判一次，同意继续再POST（服务端会带上判定）
+      const sure = await confirmDialog({
+        title: "这一对还没请模型判过",
+        message: `字面 ${Math.round((pair.lexical || 0) * 100)}%、语义 ${Math.round((pair.semantic || 0) * 100)}%。`
+          + "继续会先请模型判一次是否同一件事；模型不同意就不会改动任何数据。",
+        confirmLabel: "请模型判定", danger: true,
+      });
+      if (sure) doMerge(away, keep, { confirmed: true }, target);
+      return;
+    }
+    if (pair.allowed === false) { askOverride(pair, target); return; }   // 拒绝不等于封死：人可以署名坚持
+    if (pair.allowed !== false && pair.basis !== "lexical") {
+      // 模型对中间带的判定两次能给出相反答案，所以它批准时必须让人再点头一次
+      const sure = await confirmDialog({
+        title: "这一对靠模型签字，不是靠分数",
+        message: `${pair.model_reason ? `模型的理由：${pair.model_reason}。` : "点下去会先请模型判一次。"}`
+          + `语义 ${Math.round((pair.semantic || 0) * 100)}%、字面 ${Math.round((pair.lexical || 0) * 100)}%——`
+          + "真重复与最危险的假对只差几个点，分数分不开；合并会重连前置关系且当前不可撤销。",
+        confirmLabel: "确认合并", danger: true,
+      });
+      if (!sure) return;
+      doMerge(away, keep, { confirmed: true }, target);   // 人点过头才允许非字面合并
+      return;
+    }
+    doMerge(away, keep, {}, target);
+  }));
+
+  function askOverride(pair, btn) {
+    const box = document.createElement("div");
+    box.innerHTML = `
+      <p class="faint tiny">${escapeHTML(pair.decision_reason || "分数不够")}</p>
+      <p class="tiny mt-2">分数和模型都不认为这俩是同一件事。真要坚持，请写下理由——理由会写进这个单元的合并记录，日后看得见的就是这句话。</p>
+      <textarea class="textarea mt-2" id="merge-why" rows="2" placeholder="例如：这两条在我的材料里就是同一个概念的两种译名"></textarea>`;
+    const modal = ctx.openModal({
+      title: "坚持合并",
+      subtitle: `${pair.titles?.[0] || ""} → ${pair.titles?.[1] || ""}`,
+      body: box,
+      onOpen: () => box.querySelector("#merge-why")?.focus(),
+      actions: [
+        { label: "取消", kind: "btn-ghost" },
+        { label: "写明理由并合并", kind: "btn-danger", onClick: () => {
+            const why = (box.querySelector("#merge-why").value || "").trim();
+            if (why.length < 4) { toast("理由至少写 4 个字，不然这次合并说不清是谁的决定", "info"); return false; }
+            modal.close();
+            doMerge(pair.merge, pair.keep, { reason: why, override: true, confirmed: true }, btn);
+          } },
+      ],
+    });
+  }
+
+  async function doMerge(away, keep, extra, btn) {
+    btn.disabled = true;
+    const label = btn.innerHTML;
+    btn.innerHTML = "合并中…";
+    try {
+      const res = await ctx.api.post(`/api/units/${encodeURIComponent(away)}/merge`,
+                                     { into: keep, ...extra });
+      toast(`已把「${res.from_title}」并入「${res.into_title}」（${DUP_BASIS[res.basis] || res.basis || "?"}）；`
+            + `${res.cards_kept} 张复习卡保留。`, "success", 5200);
+      await ctx.refreshView();
+    } catch (err) {
+      toast(err.message || "合并失败", "error", 5200);
+      btn.disabled = false;
+      btn.innerHTML = label;
+    }
+  }
   ctx.cleanup(() => { /* listeners are on removed DOM nodes */ });
 }

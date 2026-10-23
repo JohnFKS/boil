@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -13,12 +14,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import advisor, backup, config, embeddings, feynman, llm, mastery, services, socratic
+from . import (advisor, backup, config, embeddings, feynman, llm, markdown_fix, mastery,
+                services, socratic, styles)
 from .compiler import compile_material
 from .db import Database, json_loads
 from .events import recent
 from .packs import PackError, unit_from_row
 from .utils import now_iso, parse_iso, truncate
+
+MAX_FIX_CHARS = 200_000
 
 STARTED = time.time()
 
@@ -54,16 +58,23 @@ class App:
             ("POST", re.compile(r"^/api/advice/feedback$"), self.advice_feedback),
             ("POST", re.compile(r"^/api/plan/rebuild$"), self.plan_rebuild),
             ("GET", re.compile(r"^/api/map$"), self.map),
+            ("GET", re.compile(r"^/api/units/duplicates$"), self.units_duplicates),
             ("GET", re.compile(r"^/api/units/([^/]+)$"), self.unit),
             ("POST", re.compile(r"^/api/units/([^/]+)/notes$"), self.unit_note),
+            ("POST", re.compile(r"^/api/units/([^/]+)/mnemonic$"), self.unit_mnemonic),
+            ("POST", re.compile(r"^/api/units/([^/]+)/merge$"), self.unit_merge),
             ("GET", re.compile(r"^/api/notes$"), self.notes_list),
             ("POST", re.compile(r"^/api/notes$"), self.notes_create),
             ("POST", re.compile(r"^/api/notes/delete$"), self.notes_delete),
             ("GET", re.compile(r"^/api/notes/export$"), self.notes_export),
+            ("POST", re.compile(r"^/api/cards/preview$"), self.cards_preview),
+            ("POST", re.compile(r"^/api/cards/confirm$"), self.cards_confirm),
+            ("POST", re.compile(r"^/api/ask$"), self.quick_ask),
             ("GET", re.compile(r"^/api/packs$"), self.packs),
             ("GET", re.compile(r"^/api/packs/([^/]+)$"), self.pack_detail),
             ("POST", re.compile(r"^/api/packs/compile$"), self.compile_pack),
             ("POST", re.compile(r"^/api/packs/suggest$"), self.pack_suggest),
+            ("POST", re.compile(r"^/api/material/fix$"), self.material_fix),
             ("POST", re.compile(r"^/api/packs/import$"), self.pack_import),
             ("POST", re.compile(r"^/api/socratic/start$"), self.socratic_start),
             ("POST", re.compile(r"^/api/socratic/stream$"), self.socratic_stream),
@@ -71,15 +82,19 @@ class App:
             ("GET", re.compile(r"^/api/socratic/([^/]+)$"), self.socratic_get),
             ("POST", re.compile(r"^/api/feynman/evaluate$"), self.feynman_evaluate),
             ("GET", re.compile(r"^/api/review$"), self.review),
+            ("GET", re.compile(r"^/api/cards$"), self.cards),
             ("POST", re.compile(r"^/api/review/([^/]+)$"), self.review_rate),
             ("GET", re.compile(r"^/api/insights$"), self.insights),
             ("POST", re.compile(r"^/api/insights/synthesize$"), self.insights_synthesize),
             ("GET", re.compile(r"^/api/settings/llm$"), self.llm_get),
             ("POST", re.compile(r"^/api/settings/llm$"), self.llm_set),
             ("POST", re.compile(r"^/api/settings/llm/test$"), self.llm_test),
+            ("POST", re.compile(r"^/api/settings/llm/cache/clear$"), self.llm_cache_clear),
             ("GET", re.compile(r"^/api/settings/embeddings$"), self.embedding_get),
             ("POST", re.compile(r"^/api/settings/embeddings$"), self.embedding_set),
             ("POST", re.compile(r"^/api/settings/embeddings/test$"), self.embedding_test),
+            ("GET", re.compile(r"^/api/styles/questions$"), self.styles_questions),
+            ("POST", re.compile(r"^/api/styles/apply$"), self.styles_apply),
             ("GET", re.compile(r"^/api/search$"), self.search),
             ("GET", re.compile(r"^/api/events$"), self.events),
             ("GET", re.compile(r"^/api/export$"), self.export),
@@ -161,6 +176,67 @@ class App:
             str(body.get("kind") or "note"), str(body.get("content") or ""),
         )
 
+    def cards_preview(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return services.cards_from_text(
+            self.db, config.DEFAULT_USER,
+            str(body.get("text") or ""),
+            str(body.get("unit_id") or "") or None,
+        )
+
+    def cards_confirm(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        cards = body.get("cards")
+        if not isinstance(cards, list):
+            raise ApiError(400, "cards 必须是数组", "bad_request")
+        return services.confirm_cards(self.db, config.DEFAULT_USER, cards,
+                                      str(body.get("unit_id") or "") or None)
+
+    def quick_ask(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.ask_about_selection(
+                self.db, config.DEFAULT_USER,
+                str(body.get("question") or ""),
+                str(body.get("context") or ""),
+                str(body.get("unit_id") or "") or None,
+            )
+        except PermissionError as exc:
+            raise ApiError(503, str(exc), "ai_not_configured") from exc
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def unit_mnemonic(self, req, match, query, body):
+        unit_id = unquote(match.group(1))
+        try:
+            return services.generate_mnemonic(self.db, config.DEFAULT_USER, unit_id)
+        except PermissionError as exc:
+            raise ApiError(503, str(exc), "ai_not_configured") from exc
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def units_duplicates(self, req, match, query, body):
+        try:
+            return services.unit_duplicates(self.db, config.DEFAULT_USER,
+                                            _q(query, "goal_id") or None)
+        except ValueError as exc:
+            raise ApiError(404, str(exc), "not_found") from exc
+
+    def unit_merge(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.merge_units(self.db, config.DEFAULT_USER, unquote(match.group(1)),
+                                        str(body.get("into") or ""),
+                                        str(body.get("reason") or ""),
+                                        override=bool(body.get("override")),
+                                        confirmed=bool(body.get("confirmed")))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
     def notes_list(self, req, match, query, body):
         return services.list_notes(
             self.db, config.DEFAULT_USER,
@@ -212,6 +288,18 @@ class App:
                                         use_embeddings=use_embeddings,
                                         documents=documents)
 
+    def material_fix(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        text = str(body.get("text") or "")
+        if len(text) > MAX_FIX_CHARS:
+            raise ApiError(400, f"待清洗文本超过 {MAX_FIX_CHARS:,} 字符", "bad_request")
+        options = body.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise ApiError(400, "options 必须是对象", "bad_request")
+        cleaned, applied = markdown_fix.fix_markdown(text, options)
+        return {"text": cleaned, "applied": applied, "changed": cleaned != text}
+
     def pack_suggest(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
@@ -248,7 +336,8 @@ class App:
         req.start_sse()
         try:
             req.send_sse("status", {"text": "正在理解你的回答…"})
-            for event in socratic.stream_reply(self.db, config.DEFAULT_USER, session_id, message):
+            for event in socratic.stream_reply(self.db, config.DEFAULT_USER, session_id, message,
+                                                retry=bool(body.get("retry"))):
                 etype = event.get("type", "message")
                 data = {k: v for k, v in event.items() if k != "type"}
                 req.send_sse(etype, data)
@@ -295,6 +384,15 @@ class App:
         unit_id = _q(query, "unit_id") or None
         return services.review_queue(self.db, config.DEFAULT_USER, limit, unit_id)
 
+    def cards(self, req, match, query, body):
+        return services.list_cards(
+            self.db, config.DEFAULT_USER,
+            q=_q(query, "q") or None,
+            unit_id=_q(query, "unit_id") or None,
+            state=_q(query, "state") or None,
+            limit=int(_q(query, "limit") or 60),
+        )
+
     def review_rate(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
@@ -308,7 +406,9 @@ class App:
             elapsed = 0
         try:
             return services.rate_card(self.db, config.DEFAULT_USER,
-                                      unquote(match.group(1)), rating, elapsed)
+                                      unquote(match.group(1)), rating, elapsed,
+                                      recall=str(body.get("recall") or ""),
+                                      mistake_tags=body.get("mistake_tags"))
         except ValueError as exc:
             raise ApiError(404, str(exc), "not_found") from exc
 
@@ -329,6 +429,10 @@ class App:
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
         llm.set_config(body)
         return llm.public_config()
+
+    def llm_cache_clear(self, req, match, query, body):
+        removed = llm.clear_cache()
+        return {"removed": removed, "cache": llm.cache_stats(), "entries": llm.cache_size()}
 
     def embedding_get(self, req, match, query, body):
         return embeddings.public_config()
@@ -358,6 +462,17 @@ class App:
         except llm.LLMError as exc:
             raise ApiError(400, exc.message, exc.code, exc.detail) from exc
 
+    def styles_questions(self, req, match, query, body):
+        return styles.questions_payload()
+
+    def styles_apply(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.save_style_test(self.db, config.DEFAULT_USER, body.get("answers"))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
     def search(self, req, match, query, body):
         return services.search(self.db, config.DEFAULT_USER, _q(query, "q"))
 
@@ -382,7 +497,12 @@ class App:
         mode = str(body.get("mode") or "merge")
         if mode == "replace" and body.get("confirm") != "IMPORT":
             raise ApiError(400, "替换导入需要 confirm=IMPORT", "bad_request")
-        return backup.import_backup(self.db, config.DEFAULT_USER, body, mode)
+        try:
+            return backup.import_backup(self.db, config.DEFAULT_USER, body, mode)
+        except sqlite3.Error as exc:
+            # 备份文件是用户可以手改的东西：不合法要说清哪里不合法，而不是甩一个 500
+            raise ApiError(400, f"备份文件与本地库不兼容：{str(exc)[:160]}（本次导入已整体回滚，"
+                                "原有数据未受影响）", "import_conflict") from exc
 
     def reset(self, req, match, query, body):
         confirm = str((body or {}).get("confirm") or "")

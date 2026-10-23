@@ -7,6 +7,43 @@ function providerChips(providers) {
   return `<div class="provider-grid">${providers.map((p, i) => `<button class="provider-chip" data-provider="${i}">${escapeHTML(p.name)}</button>`).join("")}</div>`;
 }
 
+const CODE_LABELS = {
+  dns: "域名解析失败", refused: "连接被拒绝", timeout: "超时", tls: "证书/TLS 失败",
+  proxy: "代理异常", network: "网络不通", http_error: "网关返回错误状态",
+  empty_content: "模型返回空正文", stream: "流式连接中断", json: "返回不是合法 JSON",
+  junk_output: "模型只回了占位内容", not_configured: "没有配置模型",
+};
+
+function diagHTML(cfg) {
+  const err = cfg.last_error;
+  if (!err) {
+    return `<div class="diag-ok">${icon("check", 13)} 最近一次模型调用没有留下错误记录。</div>`;
+  }
+  const rows = [
+    ["分类", CODE_LABELS[err.code] || err.code || "未知"],
+    ["时间", err.at || ""],
+    ["地址", err.base_url || cfg.base_url || ""],
+    ["模型", err.model || cfg.model || ""],
+    ["Key", err.api_key_masked || (cfg.api_key_set ? cfg.api_key_masked : "未设置")],
+  ].filter(r => r[1]);
+  const detail = String(err.detail || "").slice(0, 1200);
+  const plain = [`模型诊断`, ...rows.map(r => `${r[0]}: ${r[1]}`), `信息: ${err.message || ""}`,
+                 `建议: ${err.hint || ""}`, `返回内容: ${detail}`].join("\n");
+  return `<details class="diag-box" open>
+    <summary><span class="diag-dot"></span>上次模型调用失败：${escapeHTML(err.message || "未知错误")}</summary>
+    <div class="diag-body">
+      <dl class="diag-grid">${rows.map(r => `<dt>${escapeHTML(r[0])}</dt><dd>${escapeHTML(r[1])}</dd>`).join("")}</dl>
+      ${err.hint ? `<div class="callout ember"><strong>怎么办</strong><br>${escapeHTML(err.hint)}</div>` : ""}
+      ${detail ? `<pre class="diag-detail">${escapeHTML(detail)}</pre>` : ""}
+      <div class="row mt-2" style="gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" type="button" data-diag-copy>${icon("list", 13)} 复制诊断</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-diag-retest>${icon("zap", 13)} 立即重试连接</button>
+      </div>
+    </div>
+    <textarea class="diag-plain" id="diag-plain" readonly>${escapeHTML(plain)}</textarea>
+  </details>`;
+}
+
 export async function render(el, ctx, params) {
   const cfg = await ctx.api.get("/api/settings/llm");
   const emb = await ctx.api.get("/api/settings/embeddings");
@@ -45,7 +82,7 @@ export async function render(el, ctx, params) {
             <span>${mode === "live" ? `正在使用 <strong>${escapeHTML(cfg.model)}</strong>` : "当前使用本地确定性引擎：追问、评分、编译都能跑，但不做语义判断。"}</span>
           </div>
           ${cfg.forced_off ? `<div class="error-box">服务端设置了 BOIL_LLM_OFF=1，所有调用会强制走演示模式。</div>` : ""}
-          ${cfg.last_error ? `<div class="error-box"><strong>上次调用失败：</strong>${escapeHTML(cfg.last_error.message || "")}<br>${escapeHTML((cfg.last_error.detail || "").slice(0, 320))}</div>` : ""}
+          ${diagHTML(cfg)}
           <div class="mt-4">
             <div class="side-label">快速填充</div>
             <div class="mt-2">${providerChips(cfg.providers || [])}</div>
@@ -61,6 +98,15 @@ export async function render(el, ctx, params) {
             <div class="field"><label>最大输出 tokens（可选）</label><input class="input" id="llm-tokens" type="number" min="64" max="32000" value="${cfg.max_tokens || ""}" placeholder="留空由服务端决定"></div>
             <div class="field"><label>超时（秒）</label><input class="input" id="llm-timeout" type="number" min="10" max="600" value="${cfg.timeout || 120}"></div>
             <div class="field full"><label>高级请求参数 JSON（可选）</label><textarea class="textarea" id="llm-extra" placeholder='{}'>${escapeHTML(JSON.stringify(cfg.extra_body || {}, null, 2))}</textarea><span class="hint">会合并进请求体。Dots 可设置 <code>{"chat_template_kwargs":{"enable_thinking":true}}</code> 开启深度思考；默认预设关闭以降低延迟。</span></div>
+          </div>
+          <div class="field full mt-3 cache-row">
+            <label class="cache-toggle">
+              <input type="checkbox" id="llm-cache-enabled" ${cfg.cache_enabled !== false ? "checked" : ""}>
+              <span>结构化调用缓存</span>
+            </label>
+            <span class="hint">编译、大纲、速记、洞察解读这类结构化调用会按「模型 + 提示词 + 参数」做内容寻址缓存：同样材料重跑不再花 token，结果也不会每次漂移。流式对话不缓存。
+              当前命中 ${cfg.cache?.hits || 0} 次 · 真实调用 ${cfg.cache?.calls || 0} 次 · 缓存 ${cfg.cache_entries || 0} 条。
+              <button class="link-btn" type="button" id="clear-cache">清空缓存</button></span>
           </div>
           <div class="row mt-4" style="flex-wrap:wrap">
             <button class="btn btn-primary" id="save-llm">${icon("check", 15)} 保存连接</button>
@@ -224,6 +270,7 @@ export async function render(el, ctx, params) {
     const payload = {
       base_url: el.querySelector("#llm-base").value.trim(),
       model: el.querySelector("#llm-model").value.trim(),
+      cache_enabled: !!el.querySelector("#llm-cache-enabled")?.checked,
       deep_model: el.querySelector("#llm-deep").value.trim(),
       auth_header: el.querySelector("#llm-auth-header").value.trim() || "Authorization",
       auth_prefix: el.querySelector("#llm-auth-prefix").value,
@@ -250,6 +297,45 @@ export async function render(el, ctx, params) {
       btn.disabled = false; btn.innerHTML = `${icon("check", 15)} 保存连接`;
     }
   });
+  el.querySelector("#clear-cache")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await ctx.api.post("/api/settings/llm/cache/clear", {});
+      toast(`已清空缓存（删除 ${res.removed || 0} 条）。`, "success");
+      await render(el, ctx, params);
+    } catch (err) {
+      toast(err.message || "清空失败", "error");
+      btn.disabled = false;
+    }
+  });
+
+  el.querySelector("[data-diag-copy]")?.addEventListener("click", async (e) => {
+    const src = el.querySelector("#diag-plain");
+    if (!src) return;
+    try {
+      await navigator.clipboard.writeText(src.value);
+      toast("诊断信息已复制，可以直接贴给协作者。", "success", 2600);
+    } catch {
+      src.select();
+      toast("浏览器拒绝了剪贴板权限；已选中文本，可以手动复制。", "info", 4200);
+    }
+    e.currentTarget.disabled = false;
+  });
+
+  el.querySelector("[data-diag-retest]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.innerHTML = "重试中…";
+    try {
+      const info = await ctx.api.post("/api/settings/llm/test", {});
+      toast(`连接正常（${info.latency_ms || 0}ms）。`, "success");
+      await render(el, ctx, params);
+    } catch (err) {
+      toast(`还是失败：${err.message || "未知错误"}`, "error", 5200);
+      await render(el, ctx, params);
+    }
+  });
+
   el.querySelector("#test-llm")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
     const box = el.querySelector("#llm-result");
@@ -390,7 +476,9 @@ export async function render(el, ctx, params) {
     const res = await ctx.api.post("/api/import", {
       data, mode, confirm: mode === "replace" ? "IMPORT" : "",
     });
-    toast(`导入完成：${res.goals} 个目标 / ${res.units} 个单元 / ${res.cards} 张卡`, "success", 6500);
+    toast(`导入完成：${res.goals} 个目标 / ${res.units} 个单元 / ${res.cards} 张卡`
+      + (res.snapshot ? `；导入前的库已快照为 ${res.snapshot}` : "；快照失败，建议先手动导出"),
+      res.snapshot ? "success" : "info", 7200);
     await ctx.reloadAll();
     ctx.navigate("#/dashboard");
   }

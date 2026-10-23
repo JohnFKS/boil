@@ -1,5 +1,5 @@
 /* Onboarding: choose a pack or compile your own material, then create a goal. */
-import { escapeHTML, icon, toast } from "../utils.js";
+import { aiFailure, aiSuccess, escapeHTML, icon, toast } from "../utils.js";
 
 const LEVELS = [
   ["beginner", "刚刚起步"],
@@ -61,6 +61,8 @@ export async function render(el, ctx, params) {
   let materialPack = null;
   let busy = false;
   let files = [];
+  let compileQuality = null;
+  let compileWarnings = [];
   let draft = {
     name: ctx.state.me?.user?.name || "",
     goalTitle: "",
@@ -314,6 +316,31 @@ export async function render(el, ctx, params) {
         refreshFiles();
       });
 
+      // 粘贴清洗：网页/Word/PDF 复制来的项目符号、全角空格、\[..\] 公式会干扰切分
+      const pasteTarget = body.querySelector("#ob-text");
+      pasteTarget?.addEventListener("paste", (event) => {
+        const pasted = event.clipboardData?.getData("text/plain") || "";
+        if (!pasted.trim()) return;
+        event.preventDefault();
+        ctx.api.post("/api/material/fix", { text: pasted }).then((res) => {
+          const value = res.changed ? res.text : pasted;
+          const start = pasteTarget.selectionStart ?? pasteTarget.value.length;
+          const end = pasteTarget.selectionEnd ?? pasteTarget.value.length;
+          pasteTarget.value = pasteTarget.value.slice(0, start) + value + pasteTarget.value.slice(end);
+          pasteTarget.selectionStart = pasteTarget.selectionEnd = start + value.length;
+          pasteTarget.dispatchEvent(new Event("input", { bubbles: true }));
+          if (res.changed && res.applied?.length) {
+            toast(`已清洗粘贴内容：${res.applied.join("、")}。`, "success", 4600);
+          }
+        }).catch(() => {
+          // 清洗接口失败不能挡住粘贴本身
+          const start = pasteTarget.selectionStart ?? pasteTarget.value.length;
+          const end = pasteTarget.selectionEnd ?? pasteTarget.value.length;
+          pasteTarget.value = pasteTarget.value.slice(0, start) + pasted + pasteTarget.value.slice(end);
+          pasteTarget.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      });
+
       body.querySelector("#ob-suggest")?.addEventListener("click", async (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -338,12 +365,14 @@ export async function render(el, ctx, params) {
           fillIfEmpty("#ob-title", res.goal_title);
           const hint = body.querySelector("#ob-suggest-hint");
           if (hint) hint.textContent = res.description || "";
+          aiSuccess(ctx);
           if (res.source === "model") {
             toast("AI 已生成标题与主题，可直接修改。", "success", 4200);
           } else {
             toast("未配置模型，已按本地规则生成。", "info", 4200);
           }
         } catch (err) {
+          aiFailure(ctx);
           toast(err.message || "生成失败", "error", 5000);
         } finally {
           btn.disabled = false;
@@ -381,10 +410,12 @@ export async function render(el, ctx, params) {
           const subject = body.querySelector("#ob-subject").value.trim();
           draft = { ...draft, materialTitle, subject, text: pasted };
           const res = await ctx.api.post("/api/packs/compile", {
-            title: materialTitle, subject, text: pasted, documents, use_llm: true,
-          });
+            title: materialTitle, subject: subject, text: pasted, documents, use_llm: true,
+          }, { timeout: 600000 });   // 分批编译串好几次模型调用，90s 默认超时必先炸
           materialPack = res.pack;
-          if (res.warnings?.length) toast(res.warnings[0], "info", 5200);
+          compileQuality = res.quality || null;
+          compileWarnings = res.warnings || [];
+          if (compileWarnings.length) toast(compileWarnings[0], "warn", 7000);
           renderStep3();
           return;
         }
@@ -401,6 +432,8 @@ export async function render(el, ctx, params) {
   function renderStep3() {
     step = 3; updateDots();
     const units = materialPack?.units || [];
+    const duplicates = compileQuality?.near_duplicates || [];
+    const qualityIssues = (compileQuality?.issues || []).filter(i => i.level === "warn");
     const digest = materialPack?.digest || {};
     const outline = materialPack?.outline || [];
     const phases = materialPack?.study_plan || [];
@@ -445,6 +478,19 @@ export async function render(el, ctx, params) {
                   <span class="phase-meta">${(p.unit_titles || []).length} 个单元${p.minutes ? ` · ${p.minutes} 分钟` : ""}</span>
                 </span>
               </div>`).join("")}
+          </div>` : ""}
+        ${qualityIssues.length || duplicates.length ? `
+          <div class="preview-box mt-3">
+            <div class="between"><strong>编译质检</strong><span class="badge ${compileQuality?.engine === "model" ? "badge-teal" : "badge-muted"}">${compileQuality?.engine === "model" ? "AI 复核" : "本地规则"}</span></div>
+            ${qualityIssues.length ? `<ul class="digest-advice">${qualityIssues.map(i => `<li>[${escapeHTML(i.code)}] ${escapeHTML(i.detail || "")}</li>`).join("")}</ul>` : ""}
+            ${compileWarnings.length ? `<ul class="digest-advice qa-warnings">${compileWarnings.map(w => `<li>${escapeHTML(w)}</li>`).join("")}</ul>` : ""}
+            ${duplicates.length ? `<div class="qa-box">
+              <p class="faint tiny">发现 ${duplicates.length} 对高度相似的单元。开始学习后可以在地图页合并——合并不是删除：被吸收的单元不再单独出现在地图上，但内容仍可通过归宿访问，复习卡也照常出现。</p>
+              ${duplicates.map(d => `
+                <div class="qa-item">
+                  <span class="row" style="gap:6px;flex-wrap:wrap"><strong>${escapeHTML(d.titles?.[0] || "")}</strong><span class="faint">≈</span><strong>${escapeHTML(d.titles?.[1] || "")}</strong><span class="faint tiny">相似度 ${Math.round((d.similarity || 0) * 100)}%</span></span>
+                </div>`).join("")}
+            </div>` : ""}
           </div>` : ""}
         <details class="mt-3" open>
           <summary>全部 ${units.length} 个单元</summary>

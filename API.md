@@ -167,6 +167,38 @@ Base URL：`http://127.0.0.1:7860`
 
 `kind`：`mnemonic` / `note`。内容为空会删除该条。返回最新的 notes 字典。
 
+### `POST /api/material/fix`
+
+粘贴清洗：把网页 / Word / PDF / AI 对话里复制来的脏 Markdown 归一。纯函数、不落库。
+
+```json
+{"text": "#　提取练习\r\n• 合书复述\r\n公式 \\[x^2\\]", "options": {"bullets": true}}
+```
+
+返回 `{"text": "…", "applied": ["换行统一为 LF", "全角空格转半角", "项目符号归一为 -", "LaTeX 定界符转为 $/$$"], "changed": true}`。
+
+- 代码块与行内代码内部一律不动（只处理 `\` ` 之外的文本）。
+- `options` 可选，键见 `boil/markdown_fix.OPTION_KEYS`；未传的走默认全开。
+- 超过 200,000 字符返回 `bad_request`。清洗失败不阻断粘贴本身（前端会退回原样插入）。
+
+### `POST /api/units/{unit_id}/mnemonic`
+
+让模型给这个单元编**记忆钩子**（口诀/谐音/类比/画面/反差）。无请求体。
+
+```json
+{
+  "mnemonics": ["口诀：看懂合上写，对照补漏差", "类比：像健身，练（提取）才长肌肉（记忆）"],
+  "note": "口诀押韵步骤，类比健身强化",
+  "unit_id": "u_…",
+  "source": "model",
+  "warnings": []
+}
+```
+
+- 材料由服务端从 `units` 表读取（本质/步骤/边界/常见误解），**不接受前端传来的原文**，避免把任意文本塞进模型。
+- 未配置模型：`503 ai_not_configured`；模型没给出可用钩子：`400`。前端在未配置时不渲染这个入口。
+- 返回的结果**不会自动写库**：前端填进输入框、用户确认保存后才进入 `unit_notes`（kind=`mnemonic`）。
+
 ### `GET /api/units/{unit_id}`
 
 返回：
@@ -237,6 +269,80 @@ GET  /api/notes/export                    下载 boil-notes.md
 
 返回完整、规范化后的 Pack（含 units、probes、cards、relations、source）。
 
+### 选中内容的三个动作
+
+划词菜单（`selectionMenu.js`）在配置模型后会多出「做卡片」「问 AI」两个动作；两者都是**先预览、确认后才落库**。
+
+```
+GET  /api/cards         ?q=&unit_id=&state=&limit=  → 全量卡片清单（复习中途「提前加卡」）
+POST /api/cards/preview   {text, unit_id?}      → 预览，绝不写库
+POST /api/cards/confirm   {cards, unit_id?}     → 写入 cards，进复习队列
+POST /api/ask             {question, context, unit_id?} → 单轮回答
+```
+
+`GET /api/cards` 返回 `{"cards": [...], "total": N}`，`limit` 夹在 1–200（默认 60），`state` 只接受 `new/learning/review/relearning`。`/api/ask` 的 `context` 只取选中位置前后各约 800 字，回答会带 `source: "model"`。
+
+`/api/cards/preview` 返回：
+
+```json
+{
+  "status": "preview",
+  "cards": [{"front": "…", "back": "…"}],
+  "engine": "model",
+  "engine_note": "由模型基于选中文字提炼；确认前不会进入复习队列。",
+  "unit_id": "u_…", "unit_title": "提取练习",
+  "tool_args": {"cards": [], "unit_id": "u_…"}
+}
+```
+
+- `engine` 为 `model` 或 `rules`：没有模型、或模型失败时回退到确定性抽取（问答 → 配对 → 完形三种形状，只从原文取词），并如实标注。
+- 确认时若没带 `unit_id`，会归到当前目标的第一个单元（卡片必须挂单元，否则 FSRS 无法排程）；没有任何目标时报错。
+- 选中文字少于 8 字报错；超过 4000 字截断。
+- `/api/ask` 需要真实模型，否则 `503 ai_not_configured`；上下文由前端截取选中位置前后各约 800 字。
+
+### 搜索
+
+```
+GET /api/search?q=   单元 + 内容包
+```
+
+字面命中（标题/本质/标签包含查询串）与语义命中（bge-m3 余弦过阈值）**分级**排序：双命中 > 只字面 > 只语义，同级再按语义分。每条带 `matched_by: ["lexical","semantic"]` 与 `score`。响应含 `fusion: "tiered"` 与 `engine`（实际用了哪个向量引擎）。
+
+这里没有照搬 testlearn 的 RRF：那套是给模型检索讲义片段用的，名次融合会让「只是有点像」的结果挤掉精确命中；给人的搜索框里精确命中必须排在前面。
+
+### 单元合并（合并不是删除）
+
+```
+GET  /api/units/duplicates?goal_id=   当前目标里疑似重复的存活单元对
+POST /api/units/{unit_id}/merge        {"into": "另一单元id", "reason": "可选", "override": false, "confirmed": false}
+```
+
+候选由**两路信号**提出：字面近乎逐字（`lexical ≥ 0.82`），或云端语义进入候选带（`semantic ≥ 0.74`）。语义分只看**标题 + 一句话本质**（`quality.dup_text`）：把步骤/边界也算进去时（`embeddings.unit_text`），同一主题的单元全部挤在 0.76–0.81，真重复反而排在假候选后面，分数就废了。每对都带 `lexical` / `semantic` / `engine` / `auto` / `same` / `allowed` / `basis` / `decision_reason` / `pending_judgement`，响应还有 `checked`、`judged`、`thresholds`（含 `judge_limit`）。**没有配置嵌入服务时 `semantic` 为 `null`**，`engine` 回 `rules`——绝不拿本地哈希向量冒充语义分。
+
+裁决阶梯（`quality.merge_decision`。实测标题+本质口径：真重复 0.870，而「提取练习 / 测试即学习」这种相关但不同的能到 0.797——只差 0.07，一条线分不开，而合并会重写关系边且当前不可撤销）：
+
+1. `lexical ≥ 0.62` → 代码直接放行（`basis: "lexical"`）；
+2. 其余一律要模型签字：`same: true` 才放行（`basis: "model"`），并且**服务端要求 `confirmed: true`**——模型对同一对两次能给出相反答案，缓存关掉时更是如此。没带 `confirmed` 就报「需要你先确认」且一个字都不改库；
+3. 语义低于 0.74 或模型不同意 → 拒绝。但人可以署名坚持：`override: true` **且** `reason` ≥ 4 字才放行，`basis` 记为 `user`，`merged_reason` 存「学习者确认：<原话>」。
+
+一次 `GET /api/units/duplicates` 最多请模型判 `judge_limit`（默认 3）对，按分数从高到低；没判到的带 `pending_judgement: true`，用户点合并时才判（同一问法，命中缓存）。这样打开地图不会变成烧钱。
+
+判定问法按单元 id 定序，所以候选列表渲染过的判定会被内容寻址缓存复用——**页面上说的依据和端点实际用的依据一定是同一个答案**（实测 `calls: 1, hits: 3`）。
+- 合并后：被吸收的单元从地图节点与「下一步推荐」中消失，但 `unit_detail` 仍可访问并返回 `merged_into`（归宿）与 `absorbed`（吸收了谁，带 reason）；前置关系自动重连到归宿，自环与重复边被清掉；复习卡保留在原处继续到期。
+- 链式合并会自动指向最终归宿；会形成环或互相合并的请求被拒绝。
+
+### 学习风格测试
+
+```
+GET  /api/styles/questions   5 道情境题（不下发权重，避免暗示「正确」选项）
+POST /api/styles/apply       {"answers": [0,1,0,2,1]}
+```
+
+返回 `{"goal_id": "…", "persona": {"key","label","strategy","secondary","secondary_label","scores","answers","taken_at","source"}}`，写入 `goals.meta_json.persona`。
+
+- 苏格拉底（开局问题与每轮追问）与费曼评估的提示词会追加一段「这位学习者的带法」；没测过就完全不追加。
+- 答案数量或取值不合法返回 `bad_request`；重测直接覆盖旧人设。
+
 ### `POST /api/packs/compile`
 
 ```json
@@ -274,6 +380,10 @@ GET  /api/notes/export                    下载 boil-notes.md
 - 无模型 / `use_llm=false`：本地确定性编译器。
 - 使用 `documents` 时，Pack 的 `source.documents` 会记录文件名与字符数，`source.material_chars` 记录合并长度。
 - 编译会保存用户 Pack 到 `data/packs/`，可以直接用于 onboarding。
+- 响应里另有 `quality`：`{issues, repaired, near_duplicates, engine}`。质检先跑确定性检查（空本质、重复标题、步骤里混具体数字、缺探针类型、正反面相同的卡片、近似重复单元对），只有需要判断力的残差才交给模型；能安全修的字段会自动补上并计入 `repaired`，**补丁等于原文时跳过**，避免无意义地翻动版本与缓存键。
+- 材料超过 **6,000** 字符时自动分批（`SINGLE_CALL_LIMIT`）。这条线按实测的输出能力定，不按上下文长度定：8.6k 字的材料单次调用能出可用 JSON，10.2k 字就在尾部被截成 `"difficulty":4,":5,":":40"`，能不能修好变成掷硬币。旧写法是 24,000。
+- 分批：先用全篇骨架出大纲，再逐批只针对本批出单元，因此每一节都真的进过模型；单批失败只跳过该批并留 warning。`source.batches` 与 `source.material_chars` 会记下实际批数与原始长度。
+- 装不下预算的超长小节按「空行 → 句号 → 硬切」无损切开再把小块装回预算内，**不截断、不丢字**；单元数超过上限（单次 10 个、分批 40 个）时会在 `warnings` 里明说丢了几个，回退到单次调用而不得不截断正文时同样会给出 warning。对用户承诺「读完全部材料」，就不能静默扔内容。
 - `outline` / `study_plan` / `digest` 两条路径都会生成，形状一致；`generated_by` 标明是 `model` 还是 `rules`，前端据此显示「AI 分析」或「本地规则」。大纲顺序会作为 `planner.build_plan(ai_outline=…)` 的排序依据，但**前置依赖仍由代码拓扑排序保证**，日期算术也始终由代码完成。
 - 每个单元带 `angle`：一句话说明这个单元该怎么学。
 
@@ -485,10 +595,14 @@ data: {}
 ### `POST /api/review/{card_id}`
 
 ```json
-{"rating": 3, "elapsed_ms": 6000}
+{"rating": 3, "elapsed_ms": 6000, "recall": "提取练习就是合上书用自己的话讲出来。", "mistake_tags": ["concept", "boundary"]}
 ```
 
 `rating`：1 忘了 / 2 模糊 / 3 记得 / 4 很简单。
+
+- `recall` 可选：翻面前写的回忆草稿，非空时以 `kind="review_recall"` 写入 `attempts`（空白不写）。它不带 `probe_id`，所以不会被探测题的「N 次作答」计数吸收；来源探测题记在 `feedback_json.probe_id`。
+- `mistake_tags` 可选：错因标签，取值固定为 `concept`（概念没吃透）/ `boundary`（条件边界）/ `step`（步骤缺一环）/ `confusion`（记混）/ `carelessness`（粗心笔误）/ `blank`（完全没印象）；未知标签丢弃、去重、最多 4 个。**只有 1/2 会被记录**——答对后卡片上的旧标签会清空，避免挂着过期错因。
+- 标签清单由 `GET /api/review` 的 `mistake_tags`（`[{key,label}]`）下发，前端不自己复制一份。
 
 ```json
 {
@@ -561,6 +675,8 @@ data: {}
 - `retention`（近 30 天，按天聚合）
 - `forecast`（未来 7 天到期，不含新卡）
 - `heatmap`（56 天）
+- `memory_health`（所有已学卡此刻的平均可提取性；没有已学卡片时为 `null`，前端显示「—」）与 `learned_cards`
+- `mistakes`（`{tags: [{key,label,count}], tagged_reviews, missed_total, sample}`）：最近 200 次复习里**用户自己标过**的错因分布。口径是全局（所有目标），且只统计标了错因的那几次——洞察页的「错因分布」卡片会把这两个数直接写在下面，避免读成「全部复习都这样」。
 - `stats`（今日/本周/连续/30 天保留率）
 - `gaps`（来自苏格拉底报告）
 - `next_action`
@@ -663,6 +779,16 @@ data: {}
 
 失败：`400`，`error.code` 可能是 `not_configured` / `network` / `http_error` / `empty_content`。
 
+`POST /api/settings/llm` 另外接受两个布尔开关：`cache_enabled`（结构化调用缓存）与 `stream_upstream`（是否向上游要流式再拼回，默认开）；失败记录的 `last_error` 现在带 `hint`（可行动建议）、`base_url`、`model` 与 `api_key_masked`，且回显内容里的 Key 会被掩码后再落盘。
+
+### `POST /api/settings/llm/cache/clear`
+
+清空内容寻址缓存，返回 `{"removed": 12, "cache": {"calls":12,"hits":5,"writes":12}, "entries": 0}`。
+
+缓存只作用于 `chat_json`（编译、大纲、元信息、速记、洞察解读）：键为 `sha256(模型 + messages + 温度 + max_tokens)`，命中直接复用原始文本再解析，因此同样材料重跑**零 token、零漂移**（实测 1.15s → 0ms）。流式对话带会话状态，不缓存。缓存键含 `base_url`：同名模型换网关不会复用另一家的输出。**只有解析成功的结果才写缓存**；命中到坏条目（截断、占位串）会删掉该条目并回落到真实调用，一次失败不会被固化成永久失败。
+
+开关随 `POST /api/settings/llm` 一起保存（`cache_enabled`，默认开）；`GET /api/settings/llm` 与 `/api/health` 会回 `cache`（calls/hits/writes）与 `cache_entries`。缓存落在 `data/llm_cache/`（gitignore 内），API Key 永不进入缓存内容。
+
 ---
 
 ## 11. 搜索、事件、导出
@@ -689,6 +815,14 @@ data: {}
 下载 Anki 可导入的制表符分隔文本（`text/tab-separated-values`），列顺序为正面、背面、标签；
 文件头包含 `#separator:tab`、`#html:true`、`#tags column:3`。背面附带来源单元与口诀（若有）。
 导入方式：Anki → 文件 → 导入 → 选择 `boil-anki.txt` → 字段分隔选“制表符”。
+
+### 导入前的数据库快照
+
+`POST /api/import` 在写入前会用 SQLite 备份 API 把当前库快照到 `data/backups/pre_import_<时间戳>.db`（保留最近 10 份），响应的 `snapshot` 字段给出文件名；快照失败时导入仍会继续，但会在 `snapshot` 里为 `null`，前端提示先手动导出。用文件复制不行——WAL 模式下复制会拿到不一致的快照。
+
+请求体就是导出文档本身（也接受 `{"data": {...}}` 的包法）；`mode=replace` 还必须带 `confirm: "IMPORT"`。
+
+`mode=replace` 的清库与写入在**同一个事务**里：任何一条插入失败都整体回滚，不会留下「旧的已删、新的没进来」的空库（真实模拟里用一行 `front: null` 的卡验过：报 400、四张表计数一条不少、坏行也没进去）。备份是用户可以手改的东西，所以数据库层的合法性错误统一映射成 `400 import_conflict` 并带上「本次导入已整体回滚，原有数据未受影响」，而不是甩一个 500「服务器内部错误」。当前没有从快照恢复的端点，快照要靠文件替换手工回退。
 
 ### `POST /api/import`
 
