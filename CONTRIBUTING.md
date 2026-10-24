@@ -41,6 +41,39 @@ python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 - 不提交 `data/`、API Key、真实学生内容、第三方教辅原文。
 - 如果修改了算法/提示词，请说明影响面与回滚方式。
 
+## 版本与发布
+
+网页上的版本和更新内容只来自 `CHANGELOG.md`（`GET /api/releases` → 侧边栏徽标 / 设置页分区），
+**不**从 git log 生成。commit message 写给协作者，更新日志写给学习者：讲清多了什么能力、修了什么问题。
+
+发一个小版本（1.1.0 → 1.2.0）：
+
+```bash
+# 1. 写日志：在 CHANGELOG.md 顶部加一节，格式必须严格
+#    ## [1.2.0] - 2026-11-05
+#    一句话：这次学习者能感觉到什么变化。
+#    ### 新增 / 改进 / 修复
+#    - 每条都是完整的中文句子，说人话，别写函数名
+# 2. 改版本号：boil/config.py 里的 VERSION = "1.2.0"
+# 3. 自检：格式 + 版本一致性，任何一条红都别发
+python3 -m unittest tests.test_releases tests.test_api.ApiTest.test_27_releases_endpoint_over_http
+python3 -c "from boil import releases; print(releases.all_problems())"   # 必须是 []
+# 4. 全绿后提交并打标签
+git add CHANGELOG.md boil/config.py && git commit -m "release: 1.2.0"
+git tag -a v1.2.0 -m "Boil 1.2.0"
+```
+
+会被测试抓住的常见错误：
+
+- 只改了 `config.VERSION` 忘了写日志 → `version_problems()` 红。
+- 版本标题写成 `## 版本 1.2.0（2026年11月5日）` → 解析不出来，`unreadable_headings()` 红
+  （静默少一版比报错更糟，所以必须响）。
+- 上面新下面旧（`1.9.0` 排在 `1.10.0` 前面）→ 用数字元组比较，不是字符串比较。
+- 只有分组标题没有条目、缺日期、缺一句话摘要 → 分别会红。
+
+开发中攒着还没发的条目放在 `## [Unreleased]` 下，发版时把那一段改名成版本号并补日期；
+`[Unreleased]` 不会出现在学习者看到的版本列表里（它走 `unreleased` 字段，只在页面标成"下一版正在攒"）。
+
 ## 报告问题
 
 请提供：复现步骤、期望行为、实际行为、运行模式（demo/live）、浏览器/系统版本。

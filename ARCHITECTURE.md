@@ -104,6 +104,8 @@ boil/
 - `goal_packs`：目标当前安装的版本。
 - `packs.manifest_json`：完整快照，便于回滚/审计。
 - 安装使用事务：所有单元、探针、卡片、关系在同一事务中；失败整包拒绝。
+- 与**产品版本**是两回事：`config.VERSION` + `CHANGELOG.md` 管"这个应用是哪一版、改了什么"（见 4.9），
+  `pack.version` 管"这壶水的内容是哪一版"。前者给用户看，后者给安装与幂等逻辑用。
 
 ## 4. 数据流
 
@@ -276,6 +278,33 @@ compile_material(_batched)
 - 装不下预算的小节由 `_chunk_section` 无损切开（空行 → 句号 → 硬切，再把小块装回预算内），**没有任何字符被丢弃**；单元数超过上限（单次 10、分批 40）会写进 `warnings` 而不是静默吞掉。内容是「模型读完了全部材料」这句承诺的兑现处，截断必须吭声。
 - 风格测试在 `boil/styles.py`：5 题 × 3–4 选项，选项带 persona 权重；`questions_payload()` 故意不返回权重。人设写进 `goals.meta_json.persona`，`styles.persona_block_for(db, goal_id)` 渲染成提示词片段注入苏格拉底与费曼（放这里是因为这两个模块都不能 import services——会成环）。
 
+### 4.9 版本与更新日志（用户可见）
+
+- **唯一事实源是 `CHANGELOG.md`**：`boil/releases.py` 把它解析成结构化 release（版本 / 日期 / 一句话摘要 / 分组条目），`GET /api/releases` 原样给出，前端渲染成侧边栏徽标 + 浮层 + 设置页分区。不解析 `git log`：commit message 是写给协作者的（"feat: keep quotes that cross a formula readable"），学习者要的是"跨公式的引文不再错位"；而且 Docker 镜像里没有 `.git`。
+- **构建号另说**：`build_identity()` 直接读 `.git/HEAD` → `refs/heads/<branch>`，回退 `packed-refs`，不启动 git 进程；`.git` 是 worktree 指针文件时按仓库根解析相对路径，ref 里含 `..` 或以 `/` 开头就不跟（不拿仓库外的文件当版本号）。没有 `.git` 时 `build=""`，前端不显示构建号 —— **宁可空着，不编一个**。
+- **坏数据不许拖垮启动**：文件缺失或整篇解析不出来时 `load()` 返回 `[]`，页面显示"没有读到更新日志"而不是白屏或 500。
+- **两类自检分开**：`changelog_problems()` 只管日志本身（缺日期、没条目、空分组、重复、顺序倒退、`## 版本 1.1.0（2026年10月24日）` 这种解析不出的标题）；`version_problems()` 只管 `config.VERSION` 是否等于最新条目。分开的理由很实际：混在一起就没法用示例文本测格式规则。`all_problems()` 给 CI 用。
+- **顺序比较用数字**：`version_key("1.10.0")=(1,10,0)` 而不是字符串比较，否则 `1.10.0 < 1.9.0` 会误判发版顺序。
+- **已读状态在浏览器**：`localStorage.boil_seen_release` 记下用户看过哪个版本；版本变了侧边栏亮小圆点，看完更新内容（浮层或设置页摊开）才消失。服务端不存这个状态 —— 它是"这台设备上的这个人读到哪儿"，不是学习数据。
+
+
+### 4.10 校准：模型说"你想得起来"，你到底想得起来吗
+
+`services.calibration()` 回答一个此前无法回答的问题：FSRS 每次复习前给出的可提取性预测（`review_logs.retention_before`，
+从建库起就在写）到底准不准。
+
+- **口径先于计算**：只取 `state_before='review'` 且 `retention_before>0` 的样本。新卡与学习步骤里内容还在眼前，
+  预测要么没做、要么无意义，混进来的结果是"看起来非常准"——这是最容易自欺的地方。
+- **两个数看不同的事**：`bias = 平均预测 − 实际答对率`（正数＝偏乐观＝间隔排太长）说方向，
+  `brier` 说每一次的误差大小。只有 bias 会被"高估与低估互相抵消"骗过去，所以两个都要给。
+- **样本不足就不下结论**：`CALIBRATION_MIN = 20`；不够时 `verdict` 说"再攒 N 次"，前端不画条形图。
+  分桶里样本 < 3 的 `gap` 直接给 `None`，两次样本不报差异。
+- **它和"30 天保留率"不是一回事**：后者（`stats.retention_30d`）的分母只有"来复习的卡"，而复习是故意排在
+  R≈0.9 的时刻发生的，天生偏高，衡量的是"复习得怎么样"。校准衡量的是"这个预测可不可信"，
+  是①跨月留存实测 与 ②策略对照 的前提：预测不可信，前两者的数字也没法解释。
+
+"""
+
 ## 5. 火候、PN 与 Advisor
 
 ### 5.1 T（温度）
@@ -402,6 +431,10 @@ score = old * (1 - alpha) + evidence * alpha
 - SSE：`api.stream` 使用 fetch ReadableStream，解析事件；路由切换时 abort。
 - 图表：手写 SVG（雷达/折线/柱状/热力/环形），无图表库。
 - 所有用户内容转义；链接协议白名单；不渲染任意 HTML。
+- `static/js/releases.js`：版本徽标与更新内容浮层。数据只在启动时取一次（`/api/releases`，
+  取不到就静默降级成 `me.version`，版本信息读不到不该挡住页面启动）；渲染器只有一份
+  （`releaseHTML`），浮层和设置页共用，避免两处文案漂移。滚动上限加在自己的 `.rel-scroll` 上，
+  不加在 `.modal-body` 上——后者会波及所有宽模态。
 
 ## 10. 错误与安全纪律
 
@@ -438,7 +471,14 @@ score = old * (1 - alpha) + evidence * alpha
 - HTTP：REST、SSE、静态资源、错误码、包导入/编译。
 - LLM：本地假端点的普通/流式/JSON/失败可见。
 - live 服务：假端点返回符合 schema 的报告/评分/内容包。
+- 版本：`tests/test_releases.py` 覆盖解析（含换行续写、`### ` 前无分组的裸条目）、
+  `unreadable_headings`（写坏的版本标题不能静默消失）、`version_key` 的数字顺序、
+  `.git` 各种形态（分支 / detached / packed-refs / worktree 指针 / 缺失 / 坏 HEAD / 越权 ref），
+  以及**真实 CHANGELOG**：每条 release 必须有日期、摘要、≥3 条目，且 `config.VERSION` 必须是最新那条。
 - 浏览器：所有页面渲染 + 交互 + JS 异常/console error/请求失败收集。触摸端的划词浮条用 `Input.dispatchTouchEvent` + 移动视口验证（浮条必须出现在屏幕内，且拖选过程中不许抢跑）。浮层必须用 CDP 真实鼠标事件走一遍（`real_click`）：`element.click()` 不派发 mousedown，「点外部关闭」这类 document 级逻辑用合成点击永远测不到——划词面板曾被自己的 hideAll 抢关，29 张截图全绿也发现不了。
+- 用户旅程：`tools/human_journey.py` 走一条连贯的"新用户的一天"（粘贴材料 → AI 生成信息 → 编译 →
+  单元 → 划词存灵感 → 复习+撤销 → 番茄钟 → 版本浮层 → 搜索 → 洞察 → 灵感库 → 导出落盘 → 手机尺寸），
+  断言的是**用户看得见的文字**而不是 DOM 存在；停顿、滚动、hover、拖拽都按人的节奏来。
 - 备份：导出 → 合并导入 → 目标/单元/卡片/火候记录/速记一致；替换导入中途插入失败要整体回滚，不许留下被清空的库。
 - 合并/撤销：`merge` 改边 → `unmerge` 后边回到原指向、单元回到地图；链被移动过时撤销必须被拒绝而不是猜。
 - Notes：速记保存 → 复习队列带出 mnemonic。

@@ -706,6 +706,58 @@ class ApiTest(unittest.TestCase):
         listed = self.call("GET", "/api/notes")["data"]["notes"]
         self.assertTrue(any(n.get("anchor", {}).get("occurrence") == 0 for n in listed))
 
+    def test_27_releases_endpoint_over_http(self):
+        data = self.call("GET", "/api/releases")["data"]
+        self.assertEqual(data["version"], config.VERSION)
+        self.assertEqual(data["changelog_issues"], [])
+        self.assertEqual(data["releases"][0]["version"], config.VERSION)
+        first = data["releases"][0]
+        self.assertRegex(first["date"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertTrue(first["summary"].strip())
+        self.assertTrue(any(g["items"] for g in first["groups"]))
+        self.assertIsInstance(data["unreleased"], list)
+        health = self.call("GET", "/api/health")["data"]
+        self.assertEqual(health["version"], config.VERSION)
+        self.assertIn("build", health)
+        # 更新内容里不该出现任何密钥形态的字符串
+        blob = json.dumps(data)
+        for secret in ("sk-", "ak_", "api_key"):
+            self.assertNotIn(secret, blob)
+
+    def test_28_insights_carries_calibration(self):
+        """洞察页要能回答「模型说你想得起来，你到底想得起来吗」。"""
+        from datetime import datetime, timedelta, timezone
+        cards = self.call("GET", "/api/cards?limit=40")["data"]["cards"]
+        self.assertGreaterEqual(len(cards), 20, "测试库里该有够用的卡")
+        seeded = []
+        base = datetime.now(timezone.utc)
+        for i, card in enumerate(cards[:25]):
+            log_id = f"rl-calib-{i}"
+            seeded.append(log_id)
+            self.db.insert("review_logs", {
+                "id": log_id, "card_id": card["id"], "user_id": "local",
+                "rating": 3 if i % 2 else 1,      # 一半答对一半答错
+                "reviewed_at": (base - timedelta(minutes=i)).isoformat(timespec="seconds"),
+                "retention_before": 0.9, "state_before": "review", "state_after": "review",
+            })
+        try:
+            data = self.call("GET", "/api/insights")["data"]
+        finally:
+            for log_id in seeded:
+                self.db.execute("DELETE FROM review_logs WHERE id=?", (log_id,))
+        for key in ("memory_health", "memory_health_settled", "settled_cards"):
+            self.assertIn(key, data)          # 健康度必须带着「放凉一天」的口径一起出门
+        self.assertIsInstance(data["settled_cards"], int)
+        cal = data["calibration"]
+        self.assertGreaterEqual(cal["samples"], len(seeded))   # 种进去的都该被算上
+        self.assertTrue(cal["enough"])
+        self.assertEqual(len(cal["buckets"]), 5)
+        self.assertEqual(sum(b["samples"] for b in cal["buckets"]), cal["samples"])
+        self.assertGreater(cal["predicted"], 0.8)
+        self.assertGreater(cal["bias"], 0.2)            # 预测 0.9、实际一半 → 明显乐观
+        self.assertIn("偏乐观", cal["verdict"])
+        self.assertEqual(cal["requested_retention"], 0.9)
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")

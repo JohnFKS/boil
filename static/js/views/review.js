@@ -59,15 +59,17 @@ export async function render(el, ctx, params) {
         <p>不是重读，是提取。先想，再翻面；按真实记忆程度评分。</p>
       </div>
       <div class="row wrap">
-        <span class="badge badge-ember">${queue.due_total || 0} 张到期</span>
-        <span class="badge badge-muted">${queue.new_total || 0} 张新卡</span>
+        ${(queue.due_total || 0)
+          ? `<span class="badge badge-ember">${queue.due_total} 张到期</span>`
+          : `<span class="badge badge-muted">今天没有到期的复习</span>`}
+        ${(queue.new_total || 0) ? `<span class="badge badge-teal">先来 ${queue.new_total} 张新卡</span>` : ""}
         <span class="badge badge-teal">${stats.reviews_today || 0} 今日已复习</span>
       </div>
     </div>
     <div class="review-layout">
       <div class="review-main" id="review-main">
         <div class="review-head">
-          <div class="row" style="gap:10px"><span class="side-label">本轮到卡</span><span class="badge badge-muted" id="review-progress-label">0 / ${total}</span></div>
+          <div class="row" style="gap:10px"><span class="side-label">本轮进度</span><span class="badge badge-muted" id="review-progress-label">0 / ${total}</span></div>
           <div class="review-progress"><i id="review-progress-bar" style="width:0%"></i></div>
           <a class="btn btn-ghost btn-sm" href="#/settings">调整节奏</a>
         </div>
@@ -383,6 +385,8 @@ export async function render(el, ctx, params) {
       const hint = document.getElementById("mistake-hint");
       if (mrow) { mrow.classList.add("nudge"); mrow.scrollIntoView({ block: "nearest" }); }
       if (hint) hint.textContent = "选一个错因再评分，帮系统知道该补哪一步；不想标就再点一次评分。";
+      // 只抖一下（0.32s，且减少动效时根本没有）会让新人以为「点了没反应」，所以再说一句
+      toast("先选一个错因，或者再点一次评分直接跳过", "info", 3600);
       return;
     }
     busy = true;

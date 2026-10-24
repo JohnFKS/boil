@@ -2,6 +2,7 @@
 import {
   escapeHTML, escapeAttr, icon, toast, openModal, confirmDialog, formatMinutes,
 } from "../utils.js";
+import { isUnseen, markSeen, openReleaseModal, releaseHTML, versionLabel } from "../releases.js";
 
 function providerChips(providers) {
   return `<div class="provider-grid">${providers.map((p, i) => `<button class="provider-chip" data-provider="${i}">${escapeHTML(p.name)}</button>`).join("")}</div>`;
@@ -51,6 +52,14 @@ export async function render(el, ctx, params) {
   const goal = goals.active_goal;
   const health = await ctx.api.get("/api/health");
   const mode = cfg.enabled ? "live" : "demo";
+  if (!ctx.state.releases) {
+    try {
+      ctx.state.releases = await ctx.api.get("/api/releases", { timeout: 8000 });
+    } catch {
+      ctx.state.releases = null;  // 读不到更新日志不该让设置页打不开
+    }
+  }
+  const info = ctx.state.releases;
 
   el.innerHTML = `
     <div class="page-head">
@@ -60,7 +69,7 @@ export async function render(el, ctx, params) {
       </div>
       <div class="row wrap">
         <span class="badge ${mode === "live" ? "badge-teal" : "badge-gold"}">${mode === "live" ? "真实模型已连接" : "演示模式"}</span>
-        <span class="badge badge-muted">v${escapeHTML(health.version || "1.0.0")}</span>
+        <button class="badge badge-muted release-head" type="button" id="release-head">${escapeHTML(versionLabel(info, health))} · 更新内容</button>
       </div>
     </div>
     <nav class="settings-jump" aria-label="设置分区">
@@ -69,6 +78,7 @@ export async function render(el, ctx, params) {
       <button class="jump-chip" data-jump="settings-embeddings">语义检索</button>
       <button class="jump-chip" data-jump="settings-goal">学习契约</button>
       <button class="jump-chip" data-jump="settings-data">数据与备份</button>
+      <button class="jump-chip" data-jump="settings-releases">版本与更新</button>
     </nav>
     <div class="settings-grid">
       <div class="settings-main">
@@ -171,6 +181,12 @@ export async function render(el, ctx, params) {
           <div class="faint tiny mt-2">JSON 导出包含目标、单元、卡片、复习日志、对话、解释、火候记录与速记，不包含 API Key。导入支持合并或替换；替换不可撤销。</div>
           <div class="faint tiny mt-2">Anki 导出为制表符分隔文本：Anki → 文件 → 导入 → 选择 boil-anki.txt，字段含正面、背面与标签。</div>
         </div>
+
+        <div class="card settings-card" id="settings-releases">
+          <h3>版本与更新</h3>
+          <div class="sub">这一版到底改了什么，写在仓库的 CHANGELOG.md 里；网页直接读那份文件，只讲多了什么能力和修了什么问题。</div>
+          ${info ? releaseHTML(info) : `<div class="callout gold mt-3">服务端没读到更新日志，只能确认版本是 ${escapeHTML(versionLabel(null, health))}。</div>`}
+        </div>
       </div>
 
       <aside class="settings-side">
@@ -184,7 +200,7 @@ export async function render(el, ctx, params) {
           <div class="divider"></div>
           <div class="facet-row"><span class="muted">模式</span><span>${mode === "live" ? "真实模型" : "本地演示"}</span><span></span></div>
           <div class="facet-row"><span class="muted">数据目录</span><span class="mono" style="font-size:10px">${escapeHTML(health.data_dir || "")}</span><span></span></div>
-          <div class="facet-row"><span class="muted">版本</span><span>Boil ${escapeHTML(health.version || "")}</span><span></span></div>
+          <div class="facet-row"><span class="muted">版本</span><span>${escapeHTML(versionLabel(info, health))}${info && info.build ? ` · ${escapeHTML(info.build)}` : ""}</span><span></span></div>
         </div>
         <div class="card settings-card">
           <div class="side-label">快捷键</div>
@@ -528,6 +544,9 @@ export async function render(el, ctx, params) {
       toast(e.message || "操作失败", "error");
     }
   });
+
+  el.querySelector("#release-head")?.addEventListener("click", () => openReleaseModal(ctx));
+  if (info && isUnseen(info)) markSeen(info);  // 更新内容已经在这页摊开了
 
   el.querySelector("#reset-data")?.addEventListener("click", async () => {
     const ok = await confirmDialog({

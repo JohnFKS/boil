@@ -36,7 +36,8 @@ Base URL：`http://127.0.0.1:7860`
 ```json
 {
   "app": "Boil",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "build": "fdaa941",
   "status": "ok",
   "mode": "demo",
   "llm": { "mode": "demo", "enabled": false },
@@ -46,6 +47,45 @@ Base URL：`http://127.0.0.1:7860`
   "time": "2026-10-21T05:00:00Z"
 }
 ```
+
+`build` 是当前检出的短 commit 号，直接读 `.git/HEAD`（不启动 git 进程）。
+容器和发布包里没有 `.git`，此时 `build` 为空字符串 —— 前端就不显示构建号，而不是编一个。
+
+### `GET /api/releases`
+
+版本与更新内容的唯一来源是仓库根目录的 `CHANGELOG.md`，服务端解析后原样给出，前端不解析 git 历史。
+
+```json
+{
+  "app": "Boil",
+  "version": "1.1.0",
+  "released_at": "2026-10-24",
+  "summary": "一句话：AI 替学习者做的判断，现在都能看依据、能撤销；灵感随手可记；手机上也能用。",
+  "build": "fdaa941",
+  "ref": "refs/heads/main",
+  "source_checkout": true,
+  "schema_version": 8,
+  "changelog_source": "CHANGELOG.md",
+  "releases": [
+    {
+      "version": "1.1.0",
+      "date": "2026-10-24",
+      "summary": "一句话：……",
+      "unreleased": false,
+      "groups": [{"title": "新增", "items": ["划词即灵感：……"]}],
+      "items": ["划词即灵感：……"]
+    }
+  ],
+  "unreleased": [],
+  "changelog_issues": []
+}
+```
+
+- `changelog_issues` 非空说明日志写坏了（版本号格式、缺日期、缺条目、顺序倒退，或 `config.VERSION`
+  与最新条目不一致）。页面会显示一行提示而不是空白 —— **文件缺失或格式坏掉都不会让服务起不来**，
+  最坏情况是 `releases: []`。
+- `unreleased` 是 `## [Unreleased]` 下攒着还没发布的条目，供自己托管的人看下一版在做什么。
+- 这个接口不返回任何密钥；`tests/test_api.py::test_27_releases_endpoint_over_http` 会扫一遍响应体确认没有 `sk-` / `ak_`。
 
 ### `GET /api/me`
 
@@ -713,8 +753,18 @@ data: {}
 - `forecast`（未来 7 天到期，不含新卡）
 - `heatmap`（56 天）
 - `memory_health`（所有已学卡此刻的平均可提取性；没有已学卡片时为 `null`，前端显示「—」）与 `learned_cards`
+- `memory_health_settled` + `settled_cards`：把**今天刚复习过的卡剔掉**之后再算一次平均可提取性；一张都没有时 `memory_health_settled=null`。
+  存在的理由：`memory_health` 在"当天复习完"这个时刻必然接近 100%，单独看它会让新人误以为状态很好。放凉一天的那个数更接近"睡一觉还剩多少"。
 - `mistakes`（`{tags: [{key,label,count}], tagged_reviews, missed_total, sample}`）：最近 200 次复习里**用户自己标过**的错因分布。口径是全局（所有目标），且只统计标了错因的那几次——洞察页的「错因分布」卡片会把这两个数直接写在下面，避免读成「全部复习都这样」。
-- `stats`（今日/本周/连续/30 天保留率）
+- `calibration`（模型校准）：`{samples, enough, min_samples, buckets: [{label, samples, predicted, actual, gap}], predicted, actual, bias, brier, verdict, requested_retention}`。
+  把每次复习**前**模型给出的可提取性预测和**后**的实际结果分桶对齐。口径：只统计 `state_before='review'`
+  且 `retention_before>0` 的复习 —— 新卡和学习步骤里内容还在眼前，预测没有意义，混进来会让曲线虚高。
+  `bias = 平均预测 − 实际答对率`（正数＝模型偏乐观，说明间隔排太长）；`brier` 是均方误差（0 最准，0.25 ≈ 瞎猜）。
+  样本 < 20 时 `enough=false`，`verdict` 直接说"再攒几次才谈得上准不准"，前端也不画条形图。
+  这是本项目对"学习效果"给出的**第一份实测数据**：在此之前所有保留率都是 FSRS 公式自己算的。
+- `stats`（今日/本周/连续/复习答对率；字段名仍是 `retention_30d`，界面标签已改成「复习答对率」并带上 `reviews_30d` 样本数）。注意它的口径是**近 30 天复习里评到「记得/很简单」的比例**，
+  分母只有"来复习的卡"且复习本来就安排在 R≈0.9 的时刻，天生偏高；它衡量的是"复习得怎么样"，不是"没复习还记不记得"。
+  想知道后者看 `calibration`。
 - `gaps`（来自苏格拉底报告）
 - `next_action`
 - `recent_sessions`

@@ -83,9 +83,17 @@ function chatHTML(data) {
           </div>
         </div>
         <div class="card">
-          <div class="side-label">这个单元的本质</div>
-          <div class="side-value">${escapeHTML(unit?.essence || "")}</div>
-          ${unit?.key_points?.length ? `<div class="divider"></div><div class="side-label">评分关键点</div><div class="keypoint-list">${unit.key_points.slice(0, 6).map(k => `<div class="keypoint">${escapeHTML(k)}</div>`).join("")}</div>` : ""}
+          <details class="spoiler"${s.turn ? " open" : ""} id="spoiler-essence">
+            <summary class="spoiler-head">
+              ${icon("shield", 12)}
+              <span class="spoiler-title">这个单元的本质与评分关键点</span>
+              <span class="spoiler-note">${s.turn ? "收起" : "先答一次再看"}</span>
+            </summary>
+            <div class="side-label mt-2">这个单元的本质</div>
+            <div class="side-value">${escapeHTML(unit?.essence || "")}</div>
+            ${unit?.key_points?.length ? `<div class="divider"></div><div class="side-label">评分关键点</div><div class="keypoint-list">${unit.key_points.slice(0, 6).map(k => `<div class="keypoint">${escapeHTML(k)}</div>`).join("")}</div>` : ""}
+            ${s.turn ? "" : `<p class="faint tiny mt-2">这里就是待会儿评分依据。第一答之前先看它，等于自己把开卷当成闭卷 —— 答完会自动展开。</p>`}
+          </details>
         </div>
         <div class="card">
           <div class="side-label">边界提醒</div>
@@ -233,6 +241,16 @@ function bindChat(el, ctx, data, sid) {
     };
   };
 
+  function revealSpoiler() {
+    const box = document.getElementById("spoiler-essence");
+    if (!box || box.open) return;
+    box.open = true;
+    const note = box.querySelector(".spoiler-note");
+    if (note) note.textContent = "收起";
+    const hint = box.querySelector("p.faint");
+    if (hint) hint.remove();
+  }
+
   async function send(text) {
     if (streaming || finished) return;
     const msg = (text ?? input.value).trim();
@@ -241,6 +259,7 @@ function bindChat(el, ctx, data, sid) {
     input.style.height = "auto";
     setBusy(true);
     appendUser(msg);
+    revealSpoiler();   // 已经答过一次了，评分依据就该给他看：藏太久会变成偷看
     await runTurn(msg, 0);
   }
 

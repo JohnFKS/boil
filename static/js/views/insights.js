@@ -38,6 +38,8 @@ export async function render(el, ctx, params) {
   const sessions = data.recent_sessions || [];
   const gaps = data.gaps || [];
   const mistakes = data.mistakes || {};
+  const cal = data.calibration || {};
+  const calBuckets = (cal.buckets || []).filter(b => b.samples > 0);
   const mistakeTags = mistakes.tags || [];
   const mistakeMax = Math.max(1, ...mistakeTags.map(t => Number(t.count) || 0));
 
@@ -56,12 +58,16 @@ export async function render(el, ctx, params) {
 
     <div class="stats-grid">
       <div class="stat"><span class="stat-icon">${icon("brain", 18)}</span><div><div class="stat-value">${pct(m.average || 0)}</div><div class="stat-label">平均掌握度</div></div></div>
-      <div class="stat"><span class="stat-icon teal">${icon("review", 18)}</span><div><div class="stat-value">${pct(stats.retention_30d || 0)}</div><div class="stat-label">30 天保留率</div></div></div>
+      <div class="stat"><span class="stat-icon teal">${icon("review", 18)}</span><div><div class="stat-value">${(stats.reviews_30d || 0) ? pct(stats.retention_30d || 0) : "—"}</div><div class="stat-label">复习答对率</div><div class="stat-sub">${(stats.reviews_30d || 0) ? `近 30 天 ${stats.reviews_30d} 次复习` : "近 30 天没有复习记录"}</div></div></div>
       <div class="stat"><span class="stat-icon gold">${icon("flame", 18)}</span><div><div class="stat-value">${Math.round(data.average_heat || 0)}°</div><div class="stat-label">平均火候</div></div></div>
       <div class="stat"><span class="stat-icon violet">${icon("flame", 18)}</span><div><div class="stat-value">${stats.streak || 0} 天</div><div class="stat-label">连续学习</div></div></div>
-      <div class="stat"><span class="stat-icon teal">${icon("brain", 18)}</span><div><div class="stat-value">${data.memory_health === null || data.memory_health === undefined ? "—" : pct(data.memory_health)}</div><div class="stat-label">记忆健康度</div></div></div>
+      <div class="stat"><span class="stat-icon teal">${icon("brain", 18)}</span><div><div class="stat-value">${data.memory_health === null || data.memory_health === undefined ? "—" : pct(data.memory_health)}</div><div class="stat-label">记忆健康度</div><div class="stat-sub">放凉一天算：${data.memory_health_settled === null || data.memory_health_settled === undefined ? "还没有够一天的卡" : pct(data.memory_health_settled)}</div></div></div>
     </div>
-    <p class="faint tiny mt-2">记忆健康度 = 所有已学卡片此刻平均还能提取多少（按 FSRS 的遗忘曲线算）。它和上面的「30 天保留率」不是一回事：那个看的是过去复习答对的比例，这个看的是现在的状态。目标同样停在 85–90%，掉到 80% 以下就该先补复习。</p>
+    <p class="faint tiny mt-2">这两个数都容易把人哄开心，所以把口径写清楚：
+      <strong>记忆健康度</strong>是"所有已学卡片此刻平均还能提取多少"（FSRS 遗忘曲线算出来的），刚复习完的卡几乎必然是 100%，
+      所以下面另给一个<strong>剔掉今天复习过的卡</strong>的数 —— 那个更接近"睡一觉还剩多少"。
+      <strong>复习答对率</strong>是"近 30 天你按下的评分里有几成是记得／很简单"，分母只有来复习的卡，而且复习本来就排在快忘之前，天生偏高。
+      两个都不是"你学会了没有"。那个问题看平均掌握度、费曼讲解分，以及下面的「模型说得准不准」。</p>
 
     <div class="card card-pad mt-4" id="insight-ai-card" data-selectable data-source="insights">
       <div class="section-head">
@@ -89,6 +95,28 @@ export async function render(el, ctx, params) {
         <div class="section-head"><div><div class="section-title">保留率趋势</div><div class="section-sub">每次复习前的可提取概率</div></div><span class="badge badge-teal">近 30 天</span></div>
         ${lineChartSVG(retentionPoints, { width: 440, height: 210, color: "var(--teal)" })}
         <p class="faint tiny mt-2">保留率不是越高越好；目标是 85–90% 附近，保留一点“合意困难”更有利于长期记忆。</p>
+      </div>
+      <div class="card chart-card" id="insight-calibration">
+        <div class="section-head"><div><div class="section-title">模型说得准不准</div><div class="section-sub">复习前它预测「你还想得起来的概率」，复习后拿实际结果对一遍</div></div><span class="badge ${cal.enough ? "badge-teal" : "badge-muted"}">${cal.samples || 0} 次样本</span></div>
+        ${calBuckets.length ? `
+          <div class="calib-legend">
+            <span><span class="calib-key predicted"></span>模型预测</span>
+            <span><span class="calib-key actual"></span>实际答对</span>
+          </div>
+          <div class="calib-rows">
+            ${calBuckets.map(b => `
+              <div class="calib-row">
+                <span class="calib-label">预测 ${escapeHTML(b.label)}</span>
+                <span class="calib-track">
+                  <span class="calib-bar predicted" style="width:${Math.round((b.predicted || 0) * 100)}%"></span>
+                  <span class="calib-bar actual" style="width:${Math.round((b.actual || 0) * 100)}%"></span>
+                </span>
+                <span class="calib-num">${pct(b.predicted || 0)} → ${pct(b.actual || 0)}<small>${b.samples} 次</small></span>
+              </div>`).join("")}
+          </div>`
+          : `<div class="empty" style="padding:22px"><div class="empty-icon">${icon("target", 20)}</div><p>还没有可比样本。复习几张到期卡，这里就会出现「模型以为你想得起来 vs 你实际想起来了」的对照。</p></div>`}
+        <div class="callout ${cal.enough ? (Math.abs(cal.bias || 0) <= 0.12 ? "teal" : "gold") : ""} mt-2">${escapeHTML(cal.verdict || "")}</div>
+        ${cal.enough ? `<p class="faint tiny mt-2">平均预测 ${pct(cal.predicted || 0)}，实际答对 ${pct(cal.actual || 0)}；Brier ${cal.brier}（越小越准，0.25 相当于瞎猜）。只统计「复习中」的卡 —— 新卡和学习步骤里内容还在眼前，预测没有意义。当前目标保留率 ${Math.round((cal.requested_retention || 0.9) * 100)}%。</p>` : ""}
       </div>
       <div class="card chart-card">
         <div class="section-head"><div><div class="section-title">错因分布</div><div class="section-sub">答得不好时你自己标的「哪里没对上」</div></div><span class="badge badge-muted">近 ${mistakes.sample || 0} 次复习</span></div>

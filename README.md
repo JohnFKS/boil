@@ -8,7 +8,8 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-184%20passing-38d6bd?style=flat-square)](#测试)
+[![Version](https://img.shields.io/badge/Boil-v1.1.0-ff7a45?style=flat-square)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-217%20passing-38d6bd?style=flat-square)](#测试)
 [![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
@@ -259,6 +260,10 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Note highlight](screenshots/unit-note-highlight.png) | ![Mnemonic AI](screenshots/unit-mnemonic-ai.png) |
 
+| 版本与更新内容（浮层） | 设置页的完整时间线 |
+|---|---|
+| ![Release notes](screenshots/journey-15-release-modal.png) | ![Releases in settings](screenshots/journey-16-settings.png) |
+
 ### 数学公式
 
 ![Math formula](screenshots/math-formula.png)
@@ -408,7 +413,8 @@ Pack 规范、校验规则、版本与幂等语义见 [PACK_SPEC.md](PACK_SPEC.m
 完整列表见 [API.md](API.md)。几个入口：
 
 ```bash
-curl http://127.0.0.1:7860/api/health
+curl http://127.0.0.1:7860/api/health      # 版本 + 构建号 + 当前模式
+curl http://127.0.0.1:7860/api/releases     # 版本与更新内容（来自 CHANGELOG.md）
 curl http://127.0.0.1:7860/api/dashboard
 curl -X POST http://127.0.0.1:7860/api/onboarding \
   -H 'Content-Type: application/json' \
@@ -448,7 +454,7 @@ python3 -m boil.mcp_server
 ## 测试
 
 ```bash
-# 184 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格测试（stdlib unittest）
+# 217 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格 / 版本日志测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -473,15 +479,58 @@ python3 -m unittest discover -s tests -v
 - GitHub Actions：Python 3.10/3.12 测试 + 前端模块语法检查
 - 远端 Embedding 批量、缓存、失败冷却、降级与错误可见
 - 数学包公式内容与 KaTeX 资源检查
+- 版本与更新日志：解析、坏标题不许静默消失、`.git` 各种形态、`config.VERSION` 必须等于日志最新一条
+- 模型校准：分桶口径（只算复习态）、bias/brier 算术、样本不足拒绝下结论、新卡与 0 预测不参与
 
 浏览器验收（需要 Chromium，且服务已在 7861 运行）：
 
 ```bash
 BOIL_DATA_DIR=/tmp/boil-e2e BOIL_PORT=7861 python3 run.py
-python3 tools/browser_check.py
+BOIL_DATA_DIR=/tmp/boil-e2e python3 tools/browser_check.py
 ```
 
+> `BOIL_DATA_DIR` 必须和被测服务一致。两个脚本会直接往 SQLite 里种临时数据（跨公式探针、
+> 回忆记录、重复候选），路径不一致时数据写进了另一个库，断言就会指着"单元不存在"报错——
+> 而这个坑第一次踩到时，29 张截图全绿、错误清单里全是假故障。
+
 它会收集 JS 异常、console error、请求失败，并为所有页面生成 `screenshots/*.png`。
+
+真人节奏的用户旅程（`tools/human_journey.py`）：从一个空的 `data/` 出发，粘贴材料 → AI 生成信息 →
+编译 → 单元 → 划词存灵感 → 复习并撤销 → 番茄钟 → **点开版本徽标读更新内容** → 搜索 → 洞察 →
+灵感库 → 导出落盘 → 换到 390×844 再走一遍。断言的是屏幕上读得到的文字，不是 DOM 里有没有某个节点；
+每步随机停顿、真的滚动、鼠标先 hover 再按下。
+
+```bash
+BOIL_DATA_DIR=/tmp/boil-journey BOIL_PORT=7862 python3 run.py
+BOIL_APP=http://127.0.0.1:7862 python3 tools/human_journey.py
+```
+
+学习安排的推演（`tools/effectiveness_sim.py`，用项目自己的 FSRS 跑，**不是真人实测**）：
+
+```bash
+python3 tools/effectiveness_sim.py --cards 400 --days 90
+```
+
+400 张卡 90 天：「到期才复习」用 3,694 次复习把 99% 的卡稳在 R≥0.9，「每天全量翻一遍」要 32,148 次 ——
+少做 8.7 倍的功，R 只低 0.05。脚本还会打印执行率 60% 的那一组（拖延会怎样），并在结尾写清它**不能**证明什么：
+用 FSRS 的公式验证 FSRS 的假设是循环论证。
+
+所以洞察页多了一张**「模型说得准不准」**：把每次复习**前**模型预测的「你现在想得起来的概率」和复习**后**的实际结果分桶对齐，给出平均偏差（bias）与 Brier 误差。这是本项目第一份属于自己的实测数据 —— 样本不够 20 次时它会直接说"再攒几次才谈得上准不准"，而不是画一张假图。
+
+![Calibration](screenshots/calibration-card.png)
+
+（截图是演示数据：为了拍到填满的样子，我往那台机器的库里塞了 44 条合成复习记录，拍完就删了。你自己的库里要攒够 20 次真实复习才会出现条形图。）
+
+---
+
+## 版本与更新日志
+
+学习者能在网页里看到自己用的是哪一版、这一版改了什么：侧边栏的 `v1.1.0 · fdaa941` 徽标点开是完整时间线，
+设置页有「版本与更新」分区，`GET /api/releases` 是同一个数据源。
+
+- 唯一事实源是仓库根目录的 [CHANGELOG.md](CHANGELOG.md)（不是 git log —— commit message 写给协作者，更新日志写给学习者）。
+- 版本号规则见 [CONTRIBUTING.md](CONTRIBUTING.md) 的「版本与发布」；改了 `VERSION` 忘了写日志会有测试拦着。
+- 日志坏了不会让服务起不来：最坏情况页面显示"没有读到更新日志"，并把问题列成一行提示。
 
 ---
 

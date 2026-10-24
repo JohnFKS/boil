@@ -144,12 +144,14 @@ class CDP:
                     pass
 
 
-def api(path: str, payload: dict | None = None):
+def api(path: str, payload: dict | None = None, timeout: float = 120.0):
+    """种数据用的同步调用。120 秒不是随手写的：live 模式下 socratic/start 会真的等模型出第一问，
+    慢端点上实测超过 30 秒，用 30 秒做超时会让整个体检在启动阶段就崩掉。"""
     data = json.dumps(payload or {}).encode() if payload is not None else None
     req = urllib.request.Request(APP + path, data=data,
                                  headers={"Content-Type": "application/json"} if data else {},
                                  method="POST" if data is not None else "GET")
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
@@ -159,17 +161,17 @@ def main():
     pack = api("/api/packs")["data"]
     goal = api("/api/dashboard")["data"]
     unit_id = goal["next_units"][0]["id"]
-    session = api("/api/socratic/start", {"unit_id": unit_id})["data"]["session"]
-    chat_sid = session["id"]
+    chat_sid = None
     done_sid = None
     try:
+        chat_sid = api("/api/socratic/start", {"unit_id": unit_id})["data"]["session"]["id"]
         # one exchange through the streaming endpoint, then finish
         req = urllib.request.Request(
             APP + "/api/socratic/stream",
             data=json.dumps({"session_id": chat_sid,
                              "message": "学习是模仿加练习，最终形成可以提取的记忆；输出和复习能让回路更稳。"}).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:
             r.read()
         done = api("/api/socratic/finish", {"session_id": chat_sid})["data"]
         done_sid = done["session"]["id"]
@@ -444,9 +446,25 @@ def main():
         evaluate("document.querySelector('.modal-head [data-close]')?.click()")
         time.sleep(0.3)
 
-        goto(f"#/socratic/{chat_sid}")
-        wait_for(".chat-panel", "苏格拉底")
-        shot("socratic.png")
+        if chat_sid:
+            goto(f"#/socratic/{chat_sid}")
+            wait_for(".chat-panel", "苏格拉底")
+            # 评分依据在第一答之前必须收着：getBoundingClientRect / innerText 对折叠的 <details>
+            # 仍然报尺寸和文字（Chrome 用 content-visibility 隐藏），只有命中测试能说明真相。
+            spoiler = evaluate(
+                "(()=>{const d=document.getElementById('spoiler-essence');"
+                "if(!d)return {present:false};"
+                "const k=d.querySelector('.keypoint');let painted=false;"
+                "if(k){const r=k.getBoundingClientRect();"
+                "const el=document.elementFromPoint(r.x+4,r.y+r.height/2);painted=!!(el&&k.contains(el));}"
+                "return {present:true,open:d.open,painted}})()")
+            if not spoiler or spoiler.get("open") or spoiler.get("painted"):
+                errors.append(f"苏格拉底页在第一次回答前就剧透了评分依据: {spoiler}")
+            else:
+                print(f"  spoiler guard: 折叠且未绘制 {spoiler}")
+            shot("socratic.png")
+        else:
+            errors.append("苏格拉底会话没种出来（模型端点没响应），跳过对话页截图")
 
         if done_sid:
             goto(f"#/socratic/{done_sid}")

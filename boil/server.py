@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import (advisor, backup, config, embeddings, feynman, llm, markdown_fix, mastery,
-                services, socratic, styles)
+                releases, services, socratic, styles)
 from .compiler import compile_material
 from .db import Database, json_loads
 from .events import recent
@@ -50,6 +50,7 @@ class App:
         services.ensure_user(self.db)
         self.routes = [
             ("GET", re.compile(r"^/api/health$"), self.health),
+            ("GET", re.compile(r"^/api/releases$"), self.release_notes),
             ("GET", re.compile(r"^/api/me$"), self.me),
             ("GET", re.compile(r"^/api/goals$"), self.goals),
             ("POST", re.compile(r"^/api/onboarding$"), self.onboarding),
@@ -109,9 +110,13 @@ class App:
         ]
 
     # ---------------- route handlers ----------------
+    def release_notes(self, req, match, query, body):
+        return releases.payload()
+
     def health(self, req, match, query, body):
         return {
             "app": config.APP_NAME, "version": config.VERSION,
+            "build": releases.build_identity()["commit"],
             "status": "ok", "mode": llm.mode(),
             "llm": llm.public_config(),
             "packs": len(services.all_available_packs()),

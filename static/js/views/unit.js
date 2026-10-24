@@ -323,17 +323,24 @@ export async function render(el, ctx, params) {
     }
   }));
 
-  ctx.cleanup(() => { try { window.speechSynthesis?.cancel(); } catch { /* noop */ } });
+  ctx.cleanup(() => {
+    try { window.speechSynthesis?.cancel(); } catch { /* noop */ }
+    document.removeEventListener("boil:note-saved", onNoteSaved);
+  });
 
-  (async () => {
+  async function paintHighlights() {
+    const main = el.querySelector(".unit-main");
+    if (!main) return;
     let data;
     try {
       data = await ctx.api.get(`/api/notes?unit_id=${encodeURIComponent(u.id)}`);
     } catch { return; }
     const notes = (data?.notes || []).filter(n => (n.quote || "").trim().length >= 4);
+    // 重画之前先把上一次的标记还原，否则旧 <mark> 里的文字会被跳过、亮不出第二遍
+    main.querySelectorAll("mark.note-hl").forEach(m => m.replaceWith(document.createTextNode(m.textContent)));
+    main.normalize();
+    main.querySelector(".note-hl-tip")?.remove();
     if (!notes.length) return;
-    const main = el.querySelector(".unit-main");
-    if (!main) return;
     // 等 renderMath 落地：KaTeX 生成的节点要跳过，否则会把公式源码当普通文字标注
     await new Promise(resolve => requestAnimationFrame(() => resolve()));
     const hl = highlightQuotes(main, notes.map(n => ({
@@ -347,7 +354,13 @@ export async function render(el, ctx, params) {
     tip.className = "note-hl-tip";
     tip.innerHTML = `${icon("spark", 12)} <span>已标出 ${hl.marks} 段原文（来自 ${hl.quotes} 条灵感；跨公式的引文会被公式拆成几段）</span>`;
     main.insertBefore(tip, main.firstChild);
-  })();
+  }
+
+  function onNoteSaved() { paintHighlights(); }
+
+  paintHighlights();
+  // 存完灵感当场就该看到原文亮起来，而不是等下一次进页面
+  document.addEventListener("boil:note-saved", onNoteSaved);
 
   if (params.query?.get("action") === "audio") {
     setTimeout(() => openAudioModal(ctx, u), 120);

@@ -1430,6 +1430,135 @@ class ServiceTest(TempCase):
         self.assertGreaterEqual(out["counts"]["units"], 2)
 
 
+class MemoryHealthHonestyTest(TempCase):
+    """「记忆健康度 100%」可以在人什么都没记住的当天刷出来 —— 所以必须同时给放凉一天的口径。"""
+
+    def _cards(self, n=2):
+        self.onboard()
+        rows = self.db.query("SELECT id FROM cards ORDER BY id LIMIT ?", (n,))
+        return [r["id"] for r in rows]
+
+    def _set_card(self, card_id, stability, reviewed_hours_ago):
+        when = (datetime.now(timezone.utc) - timedelta(hours=reviewed_hours_ago)).isoformat(timespec="seconds")
+        self.db.execute("UPDATE cards SET state='review', stability=?, last_review=? WHERE id=?",
+                        (stability, when, card_id))
+
+    def test_fresh_reviews_inflate_the_headline_number(self):
+        ids = self._cards(2)
+        self._set_card(ids[0], 2.0, 0.1)      # 刚刚复习过
+        self._set_card(ids[1], 2.0, 24 * 5)   # 五天前复习过
+        data = services.insights(self.db, "local")
+        self.assertIsNotNone(data["memory_health"])
+        self.assertEqual(data["settled_cards"], 1)
+        self.assertIsNotNone(data["memory_health_settled"])
+        self.assertGreater(data["memory_health"], data["memory_health_settled"])
+
+    def test_settled_is_none_when_nothing_has_settled(self):
+        ids = self._cards(2)
+        self._set_card(ids[0], 2.0, 1)
+        self._set_card(ids[1], 3.0, 2)
+        data = services.insights(self.db, "local")
+        self.assertEqual(data["settled_cards"], 0)
+        self.assertIsNone(data["memory_health_settled"])
+        self.assertGreater(data["memory_health"], 0.9)   #  headline 数字照样好看，所以才要写清口径
+
+
+class CalibrationTest(TempCase):
+    """模型预测的「你想得起来的概率」对得上实际结果吗 —— 这是项目第一份真数据。"""
+
+    def logs(self, entries):
+        from datetime import datetime, timedelta, timezone
+        base = datetime.now(timezone.utc)
+        for i, (predicted, rating, state) in enumerate(entries):
+            self.db.insert("review_logs", {
+                "id": f"rl{i}", "card_id": f"card{i}", "user_id": "local", "rating": rating,
+                "reviewed_at": (base - timedelta(days=i)).isoformat(timespec="seconds"),
+                "retention_before": predicted, "state_before": state, "state_after": "review",
+            })
+
+    def test_empty_database_says_so(self):
+        out = services.calibration(self.db, "local")
+        self.assertEqual(out["samples"], 0)
+        self.assertFalse(out["enough"])
+        self.assertIsNone(out["bias"])
+        self.assertIn("还没有可比的复习", out["verdict"])
+
+    def test_small_sample_refuses_to_conclude(self):
+        self.logs([(0.9, 3, "review")] * 5)
+        out = services.calibration(self.db, "local")
+        self.assertEqual(out["samples"], 5)
+        self.assertFalse(out["enough"])
+        self.assertIn("再攒 15 次", out["verdict"])
+
+    def test_new_and_learning_cards_never_count(self):
+        """新卡内容还在眼前，模型没做预测；混进来会让曲线虚高、看起来特别准。"""
+        self.logs([(0.95, 1, "new")] * 30 + [(0.95, 1, "learning")] * 30)
+        out = services.calibration(self.db, "local")
+        self.assertEqual(out["samples"], 0)
+
+    def test_optimistic_model_is_called_out(self):
+        self.logs([(0.95, 1, "review")] * 12 + [(0.95, 3, "review")] * 3 + [(0.65, 3, "review")] * 10)
+        out = services.calibration(self.db, "local")
+        self.assertTrue(out["enough"])
+        self.assertGreater(out["bias"], 0.12)
+        self.assertIn("偏乐观", out["verdict"])
+        top = [b for b in out["buckets"] if b["label"] == "90–100%"][0]
+        self.assertEqual(top["samples"], 15)
+        self.assertEqual(top["predicted"], 0.95)
+        self.assertLess(top["actual"], 0.3)
+
+    def test_conservative_model_is_called_out(self):
+        self.logs([(0.6, 3, "review")] * 20)
+        out = services.calibration(self.db, "local")
+        self.assertLess(out["bias"], -0.12)
+        self.assertIn("偏保守", out["verdict"])
+
+    def test_well_calibrated_reads_as_trustworthy(self):
+        self.logs([(0.9, 3, "review")] * 10 + [(0.9, 1, "review")] * 0 + [(0.7, 3, "review")] * 5
+                  + [(0.7, 1, "review")] * 5)
+        out = services.calibration(self.db, "local")
+        self.assertLessEqual(abs(out["bias"]), 0.12)
+        self.assertIn("对得上", out["verdict"])
+
+    def test_bucket_edges(self):
+        self.logs([(0.6, 3, "review"), (1.0, 3, "review"), (0.05, 1, "review")] * 8)
+        out = services.calibration(self.db, "local")
+        by_label = {b["label"]: b for b in out["buckets"]}
+        self.assertEqual(by_label["60–70%"]["samples"], 8)     # 0.6 归上界含
+        self.assertEqual(by_label["90–100%"]["samples"], 8)    # 1.0 落在最后一桶
+        self.assertEqual(by_label["0–60%"]["samples"], 8)
+
+    def test_zero_prediction_is_not_a_prediction(self):
+        """retention_before=0 是「没做预测」而不是「预测你肯定忘」，不能进统计。"""
+        self.logs([(0.0, 1, "review")] * 30)
+        out = services.calibration(self.db, "local")
+        self.assertEqual(out["samples"], 0)
+        self.assertEqual(sum(b["samples"] for b in out["buckets"]), 0)
+
+    def test_brier_is_the_mean_squared_prediction_error(self):
+        # 预测 0.9 却答对（误差 0.1）、预测 0.4 却答错（误差 0.4）→ (0.01 + 0.16) / 2
+        self.logs([(0.9, 3, "review")] * 10 + [(0.4, 1, "review")] * 10)
+        out = services.calibration(self.db, "local")
+        self.assertEqual(out["brier"], 0.085)
+        # 平均预测 0.65 vs 实际答对 0.50 → 偏差 0.15。两个数看的是不同的事：
+        # bias 说「整体偏乐观还是偏保守」，brier 说「每一次预测差多少」。
+        self.assertEqual(out["predicted"], 0.65)
+        self.assertEqual(out["actual"], 0.5)
+        self.assertEqual(out["bias"], 0.15)
+
+    def test_brier_of_coin_flip_predictions(self):
+        self.logs([(0.5, 3, "review")] * 10 + [(0.5, 1, "review")] * 10)
+        self.assertEqual(services.calibration(self.db, "local")["brier"], 0.25)
+
+    def test_gap_only_reported_for_buckets_with_enough_data(self):
+        self.logs([(0.9, 3, "review")] * 20 + [(0.65, 3, "review"), (0.65, 1, "review")])
+        out = services.calibration(self.db, "local")
+        small = [b for b in out["buckets"] if b["label"] == "60–70%"][0]
+        self.assertEqual(small["samples"], 2)
+        self.assertIsNone(small["gap"])         # 两次样本不说差异
+        self.assertEqual(services.calibration(self.db, "local")["requested_retention"], 0.9)
+
+
 class ValidationTest(unittest.TestCase):
     def test_bad_pack(self):
         self.assertTrue(validate_pack({"id": "x"}))

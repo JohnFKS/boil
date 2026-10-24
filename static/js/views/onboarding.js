@@ -355,7 +355,7 @@ export async function render(el, ctx, params) {
         try {
           const res = await ctx.api.post("/api/packs/suggest", {
             text: pasted, documents: files.map(f => ({ name: f.name, text: f.text })),
-          });
+          }, { timeout: 180000 });   // 慢端点上这个调用会超过 90s 默认值：服务端还在算，前端先报超时
           const fillIfEmpty = (selector, value) => {
             const field = body.querySelector(selector);
             if (field && value && !field.value.trim()) field.value = value;
@@ -366,8 +366,12 @@ export async function render(el, ctx, params) {
           const hint = body.querySelector("#ob-suggest-hint");
           if (hint) hint.textContent = res.description || "";
           aiSuccess(ctx);
+          const given = [res.title && "标题", res.subject && "学科", res.goal_title && "目标名"].filter(Boolean).join("、");
           if (res.source === "model") {
-            toast("AI 已生成标题与主题，可直接修改。", "success", 4200);
+            // 只说真的填进去的东西：模型偶尔不返回学科，这时不能声称「生成了主题」
+            toast(given ? `AI 已生成${given}，可直接修改。${res.subject ? "" : "学科没判断出来，可以自己补一句。"}`
+                        : "模型这次没给出可用的元信息，字段保持原样。",
+                  given ? "success" : "info", 4600);
           } else {
             toast("未配置模型，已按本地规则生成。", "info", 4200);
           }

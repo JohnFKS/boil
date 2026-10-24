@@ -17,6 +17,7 @@ import * as notesView from "./views/notes.js";
 import * as settingsView from "./views/settings.js";
 import { initSelectionMenu } from "./selectionMenu.js";
 import { initFocus } from "./focus.js";
+import { isUnseen, loadReleases, openReleaseModal, versionLabel } from "./releases.js";
 
 const THEME_KEY = "boil_theme";
 const state = {
@@ -28,6 +29,7 @@ const state = {
   params: {},
   loading: true,
   aiFails: 0,
+  releases: null,
 };
 
 let cleanupFn = null;
@@ -79,6 +81,7 @@ function navigate(hash, { replace = false } = {}) {
 
 async function loadCore() {
   state.me = await api.get("/api/me", { timeout: 15000 });
+  if (!state.releases) state.releases = await loadReleases(api);
   if (state.me?.has_goal || state.me?.goals?.length) {
     state.dashboard = await api.get("/api/dashboard", { timeout: 15000 });
   } else {
@@ -172,6 +175,7 @@ function sidebarHTML() {
           </a>`).join("")}
       </nav>
       <div class="sidebar-foot">
+        ${releaseChipHTML()}
         <div class="mode-pill ${mode === "live" ? "" : "demo"}">
           <span class="mode-dot"></span>
           <span>${mode === "live" ? "真实模型已连接" : "演示模式 · 本地引擎"}</span>
@@ -184,6 +188,20 @@ function sidebarHTML() {
       </div>
     </aside>
     <div class="sidebar-backdrop" id="sidebar-backdrop"></div>`;
+}
+
+function releaseChipHTML() {
+  const info = state.releases;
+  const unseen = isUnseen(info);
+  return `
+    <button class="release-chip" type="button" id="release-chip"
+      title="${unseen ? "这一版更新了内容，点开看" : "查看版本与更新内容"}">
+      ${icon("spark", 12)}
+      <span>${escapeHTML(versionLabel(info, state.me))}</span>
+      ${info && info.build ? `<span class="release-build">${escapeHTML(info.build)}</span>` : ""}
+      ${unseen ? `<span class="release-dot" id="release-dot"></span>` : ""}
+      <span class="release-hint">更新内容</span>
+    </button>`;
 }
 
 function shellHTML() {
@@ -239,6 +257,7 @@ function bindShell() {
     qs("#theme-btn").innerHTML = icon(state.theme === "light" ? "moon" : "sun", 17);
   });
   qs("#search-btn")?.addEventListener("click", openSearch);
+  qs("#release-chip")?.addEventListener("click", () => openReleaseModal(ctx));
   document.addEventListener("keydown", globalKeyHandler);
 }
 

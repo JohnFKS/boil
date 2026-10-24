@@ -1452,6 +1452,71 @@ def attach_mistake_tags(target: dict[str, Any], source: dict[str, Any]) -> dict[
 # ---------------------------------------------------------------------------
 # 洞察
 # ---------------------------------------------------------------------------
+CALIBRATION_BUCKETS = ((0.0, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0))
+CALIBRATION_MIN = 20          # 少于这个样本量谈「准不准」是自欺欺人
+
+
+def calibration(db: Database, user_id: str, limit: int = 3000) -> dict[str, Any]:
+    """模型预测「此刻你还想得起来吗」和实际想得起来吗，对得上吗。
+
+    只统计 `state_before='review'` 且 `retention_before>0` 的复习：新卡和学习步里模型
+    压根没做预测（内容还在眼前），混进来会让曲线虚高，看起来非常准。
+    这是本项目对「学习效果」能给出的第一份真数据 —— 在此之前，所有保留率都是公式自己说的。
+    """
+    rows = db.query(
+        "SELECT rating, retention_before FROM review_logs "
+        "WHERE user_id=? AND state_before='review' AND retention_before>0 "
+        "ORDER BY reviewed_at DESC LIMIT ?", (user_id, limit))
+    total = len(rows)
+    buckets = []
+    for index, (low, high) in enumerate(CALIBRATION_BUCKETS):
+        last = index == len(CALIBRATION_BUCKETS) - 1
+        picked = [r for r in rows
+                  if float(r["retention_before"]) >= low
+                  and (float(r["retention_before"]) < high or (last and float(r["retention_before"]) <= 1.0))]
+        n = len(picked)
+        predicted = sum(float(r["retention_before"]) for r in picked) / n if n else None
+        actual = (sum(1 for r in picked if int(r["rating"]) >= 3) / n) if n else None
+        buckets.append({
+            "label": f"{int(low * 100)}–{int(high * 100)}%",
+            "samples": n,
+            "predicted": round4(predicted) if n else None,
+            "actual": round4(actual) if n else None,
+            "gap": round4(actual - predicted) if n >= 3 else None,
+        })
+    if not total:
+        mean_predicted = mean_actual = bias = brier = None
+    else:
+        mean_predicted = sum(float(r["retention_before"]) for r in rows) / total
+        mean_actual = sum(1 for r in rows if int(r["rating"]) >= 3) / total
+        bias = mean_predicted - mean_actual        # 正数＝模型偏乐观
+        brier = sum((float(r["retention_before"]) - (1 if int(r["rating"]) >= 3 else 0)) ** 2
+                    for r in rows) / total
+    enough = total >= CALIBRATION_MIN
+    if not total:
+        verdict = "还没有可比的复习：每次复习前模型都会预测「你想得起来的概率」，答完就有了一条样本。"
+    elif not enough:
+        verdict = f"再攒 {CALIBRATION_MIN - total} 次复习才谈得上准不准（现在 {total} 次，波动太大）。"
+    elif bias > 0.12:
+        verdict = "模型偏乐观：它以为你想得起来，实际想不起来 —— 间隔排得太长了，该把目标保留率调高或别拖复习。"
+    elif bias < -0.12:
+        verdict = "模型偏保守：你以为会忘的其实还记得 —— 可以把间隔拉长，少复习几次。"
+    else:
+        verdict = "预测和实际基本对得上：这套间隔对你的记忆曲线是可信的。"
+    return {
+        "samples": total,
+        "enough": enough,
+        "min_samples": CALIBRATION_MIN,
+        "buckets": buckets,
+        "predicted": round4(mean_predicted) if total else None,
+        "actual": round4(mean_actual) if total else None,
+        "bias": round4(bias) if total else None,
+        "brier": round4(brier) if total else None,
+        "verdict": verdict,
+        "requested_retention": round4(scheduler.request_retention),
+    }
+
+
 def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str, Any]:
     goal = active_goal(db, user_id, goal_id)
     if not goal:
@@ -1526,6 +1591,15 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
         scheduler.retrievability(float(c["stability"] or 0), _elapsed_days(c))
         for c in learned
     ) / len(learned)) if learned else None
+    # 刚复习完的卡 R 必然接近 1，于是「记忆健康度 100%」可以在人啥都没记住的当天刷出来。
+    # 再给一个把当天复习过的卡剔掉的口径：它不漂亮，但更接近"放一晚上还剩多少"。
+    day_ago = now() - timedelta(days=1)
+    settled = [c for c in learned
+               if c["last_review"] and parse_iso(str(c["last_review"])) < day_ago]
+    memory_health_settled = round4(sum(
+        scheduler.retrievability(float(c["stability"] or 0), _elapsed_days(c))
+        for c in settled
+    ) / len(settled)) if settled else None
     # 错因分布：最近 200 次复习里主动标记的错因，按标签聚合并带上样本量
     tag_rows = db.query("SELECT mistake_tags_json FROM review_logs WHERE user_id=? "
                         "ORDER BY reviewed_at DESC LIMIT 200", (user_id,))
@@ -1558,6 +1632,9 @@ def insights(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
         "plan_progress": progress,
         "average_heat": round4(sum(s["heat"] for s in statuses.values()) / len(statuses)) if statuses else 0.0,
         "memory_health": memory_health,
+        "memory_health_settled": memory_health_settled,
+        "settled_cards": len(settled),
+        "calibration": calibration(db, user_id),
         "learned_cards": len(learned),
         "records": heat.history(db, user_id, limit=10),
         "retention": retention,
