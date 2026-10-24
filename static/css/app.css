@@ -1148,7 +1148,7 @@ ul, ol { margin: 0; padding: 0; }
 .modal-head p { margin-top: 4px; color: var(--muted); font-size: 11.5px; }
 .modal-body { padding: 18px 22px; }
 .modal-foot { padding: 0 22px 22px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-#toasts { position: fixed; right: 20px; bottom: 22px; z-index: 200; display: grid; gap: 8px; width: min(360px, calc(100vw - 40px)); }
+#toasts { position: fixed; right: 20px; bottom: 92px; z-index: 200; display: grid; gap: 8px; width: min(360px, calc(100vw - 40px)); }
 .toast {
   display: flex; align-items: flex-start; gap: 9px;
   padding: 12px 14px;
@@ -1686,3 +1686,94 @@ button.release-head:hover { border-color: var(--line-strong); color: var(--text)
 .spoiler-title { font-weight: 700; color: var(--text-2); letter-spacing: .01em; }
 .spoiler-note { margin-left: auto; color: var(--faint); font-size: 10px; white-space: nowrap; }
 .spoiler:not([open]) .spoiler-note { color: var(--gold); }
+
+
+/* ============================================================
+   全局 agent 悬浮球
+   ============================================================ */
+.agent-layer { position: fixed; right: 20px; bottom: 20px; z-index: 40; display: grid; justify-items: end; gap: 12px; }
+.agent-orb {
+  position: relative; width: 54px; height: 54px; border-radius: 50%;
+  border: 1px solid rgba(255,122,69,0.42); cursor: pointer;
+  background: radial-gradient(circle at 32% 28%, #23303f, #101720 70%);
+  color: var(--ember-2); display: grid; place-items: center;
+  box-shadow: 0 12px 34px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04) inset;
+  transition: transform .2s var(--ease), box-shadow .2s var(--ease);
+}
+.agent-orb:hover { transform: translateY(-2px) scale(1.04); }
+.agent-orb.active { transform: scale(.94); }
+.agent-orb-core { display: grid; place-items: center; position: relative; z-index: 1; }
+.agent-orb-pulse {
+  position: absolute; inset: -6px; border-radius: 50%;
+  border: 1px solid rgba(255,122,69,0.32); animation: orbPulse 2.8s ease-out infinite;
+}
+@keyframes orbPulse {
+  0% { transform: scale(.86); opacity: .8; }
+  70% { transform: scale(1.12); opacity: 0; }
+  100% { transform: scale(1.12); opacity: 0; }
+}
+[data-theme="light"] .agent-orb { background: radial-gradient(circle at 32% 28%, #fff, #f0e6d6 75%); }
+
+.agent-panel {
+  width: min(430px, calc(100vw - 32px)); max-height: min(72vh, 660px);
+  display: grid; grid-template-rows: auto minmax(0,1fr) auto auto auto;
+  background: var(--panel-solid); border: 1px solid var(--line-strong); border-radius: 18px;
+  box-shadow: var(--shadow); overflow: hidden; z-index: 44;
+}
+.agent-panel[hidden] { display: none; }
+.agent-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.agent-title { display: flex; align-items: center; gap: 7px; font-weight: 700; font-size: 13px; }
+.agent-title .icon { color: var(--ember); }
+.agent-engine { margin-left: auto; }
+.agent-log { padding: 14px; overflow-y: auto; display: grid; gap: 12px; align-content: start; }
+.agent-msg { display: grid; gap: 8px; }
+.agent-msg.user { justify-items: end; }
+.agent-msg.user .agent-bubble { background: var(--ember-soft); border-color: rgba(255,122,69,0.28); }
+.agent-bubble {
+  max-width: 92%; padding: 10px 12px; border-radius: 14px; border: 1px solid var(--line);
+  background: var(--panel-2); font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; word-break: break-word;
+}
+.agent-hello { display: grid; gap: 9px; text-align: center; padding: 18px 10px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.agent-hello-mark { color: var(--ember); opacity: .8; }
+
+.agent-actions { display: grid; gap: 8px; }
+.agent-action { border: 1px solid var(--line); border-radius: 13px; padding: 10px 11px; background: rgba(255,255,255,0.02); }
+.agent-action.ok { border-color: rgba(56,214,189,0.4); background: var(--teal-soft); }
+.agent-action.fail { border-color: rgba(255,100,115,0.42); background: var(--danger-soft); }
+.agent-action.skipped { opacity: .6; }
+.agent-action-head { display: flex; align-items: center; gap: 8px; font-size: 12px; flex-wrap: wrap; }
+.agent-risk { font-size: 9px; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--line-strong); color: var(--muted); flex: none; }
+.agent-risk.write { color: var(--gold); border-color: rgba(242,193,78,0.35); }
+.agent-risk.danger { color: var(--danger); border-color: rgba(255,100,115,0.4); }
+.agent-path { display: block; margin-top: 5px; font-family: var(--font-mono); font-size: 10px; color: var(--faint); word-break: break-all; }
+.agent-why { margin: 5px 0 0; font-size: 11.5px; color: var(--text-2); line-height: 1.6; }
+.agent-action-foot { display: flex; align-items: center; gap: 8px; margin-top: 9px; flex-wrap: wrap; }
+.agent-result { font-size: 11px; color: var(--muted); min-width: 0; }
+.agent-result.ok { color: var(--teal); }
+.agent-result.fail { color: var(--danger); }
+.agent-confirm { margin-top: 8px; }
+.agent-confirm .input { font-family: var(--font-mono); letter-spacing: .12em; }
+.agent-rejected { display: flex; gap: 7px; align-items: flex-start; font-size: 11px; color: var(--faint); border: 1px dashed var(--line-strong); border-radius: 11px; padding: 8px 10px; }
+.agent-rejected .icon { color: var(--gold); flex: none; margin-top: 1px; }
+.agent-cites { margin-top: 8px; font-size: 11px; }
+.agent-cites > summary { cursor: pointer; color: var(--faint); list-style: none; }
+.agent-cites > summary::-webkit-details-marker { display: none; }
+.agent-cite { margin-top: 5px; padding: 6px 8px; border-left: 2px solid var(--teal); background: rgba(255,255,255,0.025); font-size: 11px; color: var(--muted); }
+.agent-continues { margin: 0; font-size: 10.5px; color: var(--faint); }
+
+.agent-quick { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px; }
+.agent-chip { border: 1px solid var(--line-strong); background: transparent; color: var(--muted); font-size: 11px; padding: 5px 9px; border-radius: 999px; cursor: pointer; }
+.agent-chip:hover { color: var(--text); border-color: var(--ember); }
+.agent-foot { display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px; border-top: 1px solid var(--line); }
+.agent-foot textarea {
+  flex: 1; min-height: 38px; max-height: 120px; resize: none;
+  background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 12px;
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 9px 11px; line-height: 1.6;
+}
+.agent-foot textarea:focus { outline: none; border-color: var(--ember); }
+.agent-note { margin: 0; padding: 0 12px 10px; font-size: 10px; color: var(--faint); line-height: 1.6; }
+@media (max-width: 720px) {
+  .agent-layer { right: 12px; bottom: 78px; }
+  #toasts { bottom: 148px; }
+  .agent-panel { max-height: min(66vh, 520px); }
+}

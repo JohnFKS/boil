@@ -18,6 +18,7 @@ import * as settingsView from "./views/settings.js";
 import { initSelectionMenu } from "./selectionMenu.js";
 import { initFocus } from "./focus.js";
 import { isUnseen, loadReleases, openReleaseModal, versionLabel } from "./releases.js";
+import { initAgentOrb } from "./agentOrb.js";
 
 const THEME_KEY = "boil_theme";
 const state = {
@@ -363,7 +364,7 @@ function setPageTitle(eyebrow, title) {
   }
 }
 
-async function openSearch() {
+async function openSearch(initialQuery = "") {
   const wrap = document.createElement("div");
   wrap.innerHTML = `
     <div class="search-box">${icon("search", 18)}<input id="global-search" placeholder="搜索知识单元、内容包…" autocomplete="off"><span class="kbd">ESC</span></div>
@@ -381,6 +382,7 @@ async function openSearch() {
   const results = wrap.querySelector("#search-results");
   input.focus();
   modal.modal.querySelector(".modal-head h3").style.display = "none";
+  if (initialQuery) { input.value = initialQuery; search(initialQuery); }
   const go = (href) => { modal.close(); navigate(href); };
   wrap.addEventListener("click", (e) => {
     const item = e.target.closest("[data-href]");
@@ -481,6 +483,7 @@ async function boot() {
   clearTimeout(watchdog);
   initSelectionMenu(ctx);
   initFocus(ctx);
+  initAgentOrb(ctx);            // 悬浮球活在路由之外：切页不该把它拆掉
   try {
     await renderRoute();
     window.__boilBootReady?.();

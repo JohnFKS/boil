@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import (advisor, backup, config, embeddings, feynman, llm, markdown_fix, mastery,
-                releases, services, socratic, styles)
+from . import (advisor, agent, backup, config, embeddings, events, feynman, llm,
+                markdown_fix, mastery, releases, services, socratic, styles)
 from .compiler import compile_material
 from .db import Database, json_loads
 from .events import recent
@@ -51,6 +51,8 @@ class App:
         self.routes = [
             ("GET", re.compile(r"^/api/health$"), self.health),
             ("GET", re.compile(r"^/api/releases$"), self.release_notes),
+            ("GET", re.compile(r"^/api/agent/capabilities$"), self.agent_capabilities),
+            ("POST", re.compile(r"^/api/agent/plan$"), self.agent_plan),
             ("GET", re.compile(r"^/api/me$"), self.me),
             ("GET", re.compile(r"^/api/goals$"), self.goals),
             ("POST", re.compile(r"^/api/onboarding$"), self.onboarding),
@@ -110,6 +112,32 @@ class App:
         ]
 
     # ---------------- route handlers ----------------
+    def agent_capabilities(self, req, match, query, body):
+        return {"capabilities": agent.capabilities(), "max_actions": agent.MAX_ACTIONS,
+                "max_turns": agent.MAX_TURNS, "engine": llm.mode()}
+
+    def agent_plan(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        question = str(body.get("question") or "")
+        history = body.get("history") if isinstance(body.get("history"), list) else []
+        observations = body.get("observations") if isinstance(body.get("observations"), list) else []
+        try:
+            turn = max(1, min(int(body.get("turn") or 1), agent.MAX_TURNS))
+        except (TypeError, ValueError):
+            turn = 1
+        try:
+            out = agent.plan(self.db, config.DEFAULT_USER, question,
+                             history=history, observations=observations, turn=turn)
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+        events.emit(self.db, "agent.turn", {
+            "question": question[:200], "engine": out["engine"], "turn": out["turn"],
+            "proposed": [a["id"] for a in out["actions"]],
+            "rejected": [r.get("id") for r in out["rejected"]],
+        }, config.DEFAULT_USER)
+        return out
+
     def release_notes(self, req, match, query, body):
         return releases.payload()
 

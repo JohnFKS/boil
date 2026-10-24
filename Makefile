@@ -3,8 +3,10 @@
 run:
 	python3 run.py
 
+# BOIL_DATA_DIR 指到临时目录：测试里任何忘记改 config 路径的写法都只会写进临时目录，
+# 不会碰到本机 data/llm.json（真实密钥就存在那里）。
 test:
-	python3 -m unittest discover -s tests -v
+	BOIL_DATA_DIR=$$(mktemp -d) python3 -m unittest discover -s tests -v
 
 check:
 	python3 -m compileall -q boil tests tools run.py

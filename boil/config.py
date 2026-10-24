@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_NAME = "Boil"
 APP_CN = "烧水"
 DEFAULT_USER = "local"

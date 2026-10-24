@@ -106,10 +106,32 @@ function collect(root) {
   return { nodes, text };
 }
 
+const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * 找引文的位置。先按原样找；找不到再容忍空白差异。
+ *
+ * 浏览器复制跨块的文字时会在中间塞换行（选中两个 `<li>` 得到 "甲\n乙"），
+ * 而这里的坐标轴是把文本节点直接拼起来的，两块之间什么都没有 —— 于是原样匹配永远落空，
+ * 用户存了灵感却再也看不到高亮。把空白换成 `\s*` 两种情况都能命中。
+ */
+function locate(text, needle, from = 0) {
+  const at = text.indexOf(needle, from);
+  if (at >= 0) return { start: at, length: needle.length };
+  const parts = needle.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return { start: -1, length: 0 };
+  const re = new RegExp(parts.map(escapeRe).join("\\s*"), "g");
+  re.lastIndex = from;
+  const match = re.exec(text);
+  return match ? { start: match.index, length: match[0].length } : { start: -1, length: 0 };
+}
+
 function nthIndex(text, needle, n) {
-  let at = text.indexOf(needle);
-  for (let i = 0; i < n && at >= 0; i += 1) at = text.indexOf(needle, at + 1);
-  return at;
+  let found = locate(text, needle, 0);
+  for (let i = 0; i < n && found.start >= 0; i += 1) {
+    found = locate(text, needle, found.start + Math.max(1, found.length));
+  }
+  return found.start;
 }
 
 function findMatches(text, quotes, limit) {
@@ -120,23 +142,25 @@ function findMatches(text, quotes, limit) {
     if (needle.trim().length < 4) continue;
     if (anchored) {
       // 有锚点就只认那一处：同一段文字出现多次时不会把整页都点亮
-      let hit = needle;
       let at = nthIndex(text, needle, Math.max(0, Number(q.occurrence) || 0));
+      let length = at >= 0 ? locate(text, needle, at).length : 0;
       if (at < 0) {
-        hit = (q.text || "").trim();        // 材料改过：退回引文原文
-        at = text.indexOf(hit);
+        const hit = (q.text || "").trim();        // 材料改过：退回引文原文
+        const back = locate(text, hit, 0);
+        at = back.start;
+        length = back.length;
       }
-      if (at >= 0 && hit.trim().length >= 4) {
-        found.push({ start: at, end: at + hit.length, title: q.title || "", qi });
+      if (at >= 0 && length && needle.trim().length >= 4) {
+        found.push({ start: at, end: at + length, title: q.title || "", qi });
       }
       continue;
     }
     let from = 0;
     for (let guard = 0; guard < 40; guard += 1) {
-      const at = text.indexOf(needle, from);
-      if (at < 0) break;
-      found.push({ start: at, end: at + needle.length, title: q.title || "", qi });
-      from = at + needle.length;
+      const hit = locate(text, needle, from);
+      if (hit.start < 0) break;
+      found.push({ start: hit.start, end: hit.start + hit.length, title: q.title || "", qi });
+      from = hit.start + Math.max(1, hit.length);
     }
   }
   found.sort((a, b) => a.start - b.start);

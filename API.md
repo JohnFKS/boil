@@ -29,6 +29,57 @@ Base URL：`http://127.0.0.1:7860`
 
 ---
 
+## 0. 全局助手（agent）
+
+### `GET /api/agent/capabilities`
+
+```json
+{
+  "capabilities": [{"id": "view.map", "risk": "read", "desc": "读知识地图：单元与前置关系",
+                    "kind": "api", "args": {}}],
+  "max_actions": 6,
+  "max_turns": 4,
+  "engine": "live"
+}
+```
+
+28 项能力，`risk` 分 `read` / `write` / `danger`。这份清单同时是**安全边界**：模型只能从中挑选，
+不在清单里的 `id` 一律被服务端丢弃并回给前端说明原因。清单里没有 `settings/llm`、`settings/embeddings`
+的任何写操作 —— 助手碰不到密钥。
+
+### `POST /api/agent/plan`
+
+```json
+{ "question": "记忆健康度是怎么算的", "turn": 1,
+  "history": [{"role": "user", "content": "..."}],
+  "observations": [{"id": "view.map", "ok": true, "summary": "8 个单元 · 9 条关系"}] }
+```
+
+返回：
+
+```json
+{
+  "reply": "给学习者看的话",
+  "actions": [{"id": "view.map", "kind": "api", "method": "GET", "path": "/api/map",
+               "path_args": [], "args": {}, "risk": "read", "desc": "读知识地图",
+               "why": "看看结构"}],
+  "rejected": [{"id": "settings.write", "ok": false, "reason": "这个动作不在能力清单里，我不会执行它"}],
+  "citations": ["API.md · `GET /api/insights?goal_id=...`"],
+  "engine": "model",
+  "turn": 1,
+  "can_continue": true,
+  "snapshot": {"version": "1.2.0", "mode": "live", "counts": {}, "memory_health": 0.9},
+  "docs_consulted": [{"source": "API.md", "section": "..."}]
+}
+```
+
+- **服务端只提议，不执行**：`actions` 是给人看的建议，真正发请求的是前端，且每个都要点「执行」。
+- `risk=danger` 的动作额外带 `requires_typed_confirm: true`，前端在那之前把按钮锁着。
+- `observations` 是上一轮动作的执行结果，用来推进下一轮（最多 `max_turns` 轮）。
+- 模型不可用或调用失败时 `engine=rules`，走关键词规则 + 文档检索，**不假装是模型回答的**。
+- `citations` 只允许出现在本次检索到的文档里；编出来的出处会被剔除并出现在 `rejected`。
+- 每次提问写一条 `agent.turn` 事件（问了什么、提议了什么、拒了什么），可在 `/api/events` 里审计。
+
 ## 1. 健康与用户
 
 ### `GET /api/health`

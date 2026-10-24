@@ -470,6 +470,7 @@ export function openModal({ title = "", subtitle = "", body = "", actions = [], 
 /** 浮层（划词菜单、灵感气泡、划词面板、模态框）打开时，页面级快捷键要让路。 */
 export function overlayOpen() {
   if (document.querySelector(".modal-backdrop")) return true;
+  if (document.querySelector(".agent-panel:not([hidden])")) return true;   // 助手面板开着时别抢键盘
   return [...document.querySelectorAll(".selection-menu, .note-popover, .sel-panel")]
     .some(x => x.style.display !== "none");
 }

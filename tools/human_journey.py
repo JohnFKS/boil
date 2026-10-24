@@ -263,8 +263,8 @@ class Bot:
             self.call("Input.insertText", {"text": text})   # 中文只能按「粘贴」模拟，逐字符键入是 IME 的事
         else:
             for ch in text:
+                # keyDown 带 text 就已经插入了字符；再补一个 char 事件会变成 "RREESSEETT"
                 self.call("Input.dispatchKeyEvent", {"type": "keyDown", "text": ch, "key": ch})
-                self.call("Input.dispatchKeyEvent", {"type": "char", "text": ch})
                 self.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": ch})
                 time.sleep(random.uniform(0.03, 0.09))
         self.think(0.2, 0.5)
@@ -274,9 +274,8 @@ class Bot:
         vk = {"Escape": 27, "Enter": 13, "k": 75, " ": 32}.get(k, 0)
         base = {"key": k, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
                 "modifiers": modifiers}
-        self.call("Input.dispatchKeyEvent", dict(base, type="keyDown"))
-        if k != "Escape":
-            self.call("Input.dispatchKeyEvent", dict(base, type="char", text=k))
+        text = k if len(k) == 1 else ("\r" if k == "Enter" else None)
+        self.call("Input.dispatchKeyEvent", dict(base, type="keyDown", **({"text": text} if text else {})))
         self.call("Input.dispatchKeyEvent", dict(base, type="keyUp"))
         self.think(0.2, 0.4)
 
@@ -333,7 +332,10 @@ class Bot:
     _TEXTMAP_JS = """(() => {
       // 把容器里的可见文字拼成一条坐标轴，再把偏移映射回 (文本节点, 节点内偏移)。
       // 不能只挑「一个足够长的文本节点」：markdown 会把一句话拆进 <strong>、<code> 好几个节点里。
-      const host = document.querySelector(%s);
+      // 在所有匹配里挑「文字最多的那一个」：第一个 .unit-section 可能只有一句类比
+      const matches = [...document.querySelectorAll(%s)];
+      const host = matches.sort((a, b) => (b.textContent || "").trim().length
+        - (a.textContent || "").trim().length)[0];
       if (!host) return null;
       const texts = [];
       const walk = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
@@ -344,6 +346,7 @@ class Bot:
         total += node.textContent.length;
       }
       if (total < 80) return null;
+      window.__agentDragHost = host;
       const nth = (i) => {
         const w = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
         let k = 0, n;
@@ -387,7 +390,7 @@ class Bot:
             raise Fail(f"{selector} 里凑不出可拖选的文字（可见文本不足或映射失败）")
         plan = json.loads(raw)
         box = json.loads(self.evaluate(
-            "(()=>{const e=document.querySelector(%s);"
+            "(()=>{const e=window.__agentDragHost||document.querySelector(%s);"
             "const r=e.getBoundingClientRect();return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height})})()"
             % json.dumps(selector)) or "null") or {"x": 0, "y": 0, "w": 4000, "h": 4000}
 
@@ -511,6 +514,9 @@ def main():
     # ---------------------------------------------------------------- 1 初见
     def s01_open():
         bot.goto(APP + "/", wait_for=".step-dots", timeout=40)
+        # 数一数 /api/reset 被调了几次：危险闸门的证据不能靠"看起来没反应"
+        bot.evaluate("window.__resetHits=0;const f=window.fetch;"
+                     "window.fetch=(u,...a)=>{if(String(u).includes('/api/reset'))window.__resetHits++;return f(u,...a)};")
         text = bot.body()
         for needle in ("你想先烧开哪一壶水", "把知识", "用我的材料创建"):
             if needle not in text:
@@ -879,6 +885,57 @@ def main():
 
     step("导出数据真的落到磁盘", s20_export)
 
+    def s20b_agent_orb():
+        if not bot.visible(".agent-orb"):
+            raise Fail("右下角没有悬浮球")
+        bot.click(".agent-orb")
+        if not bot.wait_visible(".agent-panel", 8):
+            raise Fail("点了悬浮球，助手面板没打开")
+        bot.type("#agent-input", "记忆健康度是怎么算的，它可靠吗", paste=True)
+        bot.key("Enter")
+        # 占位消息「正在想…」也是 assistant 消息：要等的是带引擎标签的那一条
+        if not bot.wait("#agent-log .agent-msg.assistant [data-agent-engine]", 200):
+            raise Fail("等了 200 秒助手没给出回答")
+        answer = bot.evaluate(
+            "(()=>{const m=[...document.querySelectorAll('.agent-msg.assistant')].pop();"
+            "return JSON.stringify({text:m.innerText.slice(0,300),"
+            "engine:(m.querySelector('[data-agent-engine]')||{}).innerText||'',"
+            "cites:[...m.querySelectorAll('.agent-cite')].map(x=>x.innerText)})})()")
+        info = json.loads(answer)
+        if "记忆健康度" not in info["text"] or info["text"].startswith("正在想"):
+            raise Fail(f"助手没在回答这个问题：{info['text'][:80]}")
+        # 危险动作闸门：模型每次回答不一样，所以这一步用注入的计划结果来验界面自己的规矩
+        bot.evaluate("""window.__boilAgent.propose({reply:'要清空吗', engine:'model', actions:[
+            {id:'data.reset', ok:true, kind:'api', risk:'danger', method:'POST', path:'/api/reset',
+             path_args:[], args:{}, desc:'清空本机全部学习数据（不可撤销）', why:'旅程测试'}]})""")
+        time.sleep(0.5)
+        gate = bot.evaluate("""(()=>{const cards=[...document.querySelectorAll('.agent-action')];
+            const c=cards[cards.length-1];
+            return JSON.stringify({risk:c.querySelector('.agent-risk').innerText,
+                disabled:c.querySelector('[data-run]').disabled,
+                hasField:!!c.querySelector('[data-confirm-for]')})})()""")
+        g = json.loads(gate)
+        if g["risk"] != "危险" or not g["disabled"] or not g["hasField"]:
+            raise Fail(f"危险动作没有被锁住：{g}")
+        # 先照着按钮点一下：锁着的按钮不该发出任何请求
+        bot.click(".agent-action:last-of-type [data-run]")
+        time.sleep(1.2)
+        fired = bot.evaluate("window.__resetHits || 0")
+        if fired:
+            raise Fail(f"没输确认词，却已经发出了 {fired} 次 /api/reset 请求")
+        bot.click(".agent-panel [data-confirm-for]")
+        bot.type(".agent-panel [data-confirm-for]", "RESET")
+        unlocked = bot.evaluate("""(()=>{const cards=[...document.querySelectorAll('.agent-action')];
+            return cards[cards.length-1].querySelector('[data-run]').disabled})()""")
+        if unlocked:
+            raise Fail("输入确认词之后按钮仍然锁着")
+        bot.shot("20b-agent-orb")
+        return (f"面板能问能答（{info['engine'] or '无标签'}"
+                f"{'·' + info['cites'][0][:26] if info['cites'] else '·无引用'}）；"
+                f"清空数据这类动作默认锁死、不输确认词一次都没发出请求（reset 请求 {fired} 次）")
+
+    step("悬浮球助手：问答、动作卡片与危险闸门", s20b_agent_orb)
+
     def s21_phone():
         bot.call("Emulation.setDeviceMetricsOverride",
                  {"width": 390, "height": 844, "deviceScaleFactor": 2, "mobile": True})
@@ -891,11 +948,18 @@ def main():
         chip = bot.text_of("#release-chip")
         if expected_version and f"v{expected_version}" not in chip:
             raise Fail(f"抽屉里的版本徽标不对：{chip!r}")
-        # 点抽屉外的遮罩收起来（坐标必须落在 390×844 内）
-        bot.call("Input.dispatchTouchEvent", {
-            "type": "touchStart", "touchPoints": [{"x": 360, "y": 700}]})
-        bot.call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-        time.sleep(0.7)
+        bot.evaluate("window.__boilAgent?.close()")   # 助手面板占满窄屏，不关掉点到的会是它
+        # 点遮罩收抽屉：坐标要落在遮罩上而不是抽屉自己身上（390 宽时抽屉几乎占满屏）
+        spot = bot.evaluate(
+            "(()=>{const b=document.querySelector('#sidebar-backdrop');if(!b)return null;"
+            "const r=b.getBoundingClientRect();return JSON.stringify([r.width-18,120])})()")
+        if spot:
+            x, y = json.loads(spot)
+            bot.call("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+            bot.call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        else:
+            bot.key("Escape")
+        time.sleep(0.8)
         if bot.evaluate("!!document.querySelector('#sidebar.open')"):
             raise Fail("点遮罩没有收起抽屉")
         bot.goto(APP + "/#/review", wait_for="#review-card-slot", timeout=25)

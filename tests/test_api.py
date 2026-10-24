@@ -758,6 +758,42 @@ class ApiTest(unittest.TestCase):
         self.assertIn("偏乐观", cal["verdict"])
         self.assertEqual(cal["requested_retention"], 0.9)
 
+    def test_29_agent_endpoints(self):
+        caps = self.call("GET", "/api/agent/capabilities")["data"]
+        self.assertGreaterEqual(len(caps["capabilities"]), 25)
+        self.assertEqual(caps["max_turns"], 4)
+        ids = {c["id"] for c in caps["capabilities"]}
+        self.assertIn("view.map", ids)
+        self.assertIn("data.reset", ids)
+        blob = json.dumps(caps)
+        self.assertNotIn("settings/llm", blob)          # 助手不许碰密钥
+        self.assertNotIn("sk-", blob)
+
+        out = self.call("POST", "/api/agent/plan", {"question": "你能做什么"})["data"]
+        self.assertTrue(out["reply"])
+        self.assertIn(out["engine"], ("model", "rules"))
+        self.assertIsInstance(out["actions"], list)
+        self.assertEqual(out["turn"], 1)
+        events = self.call("GET", "/api/events?limit=5")["data"]["events"]
+        self.assertEqual(events[0]["type"], "agent.turn")
+
+        try:
+            self.call("POST", "/api/agent/plan", {"question": "   "})
+            self.fail("空问题该被拒绝")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 400)
+        body = json.dumps(self.call("POST", "/api/agent/plan", {"question": "打开地图"})["data"])
+        self.assertNotIn("sk-", body)
+        self.assertNotIn("ak_", body)
+
+    def test_30_agent_never_executes_danger_itself(self):
+        """服务端只产出提议：危险动作必须带着"要人亲手确认"的标记回来。"""
+        from boil import agent as agent_module
+        action = agent_module.validate_action({"id": "data.reset", "args": {"confirm": "RESET"}})
+        self.assertTrue(action["ok"])
+        self.assertTrue(action["requires_typed_confirm"])
+        self.assertEqual(action["risk"], "danger")
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")

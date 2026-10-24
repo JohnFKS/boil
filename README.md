@@ -8,8 +8,8 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-0b5f53?style=flat-square&logo=python&logoColor=white)](#)
 [![Dependencies](https://img.shields.io/badge/runtime%20deps-zero-ff7a45?style=flat-square)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-f2c14e?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/Boil-v1.1.0-ff7a45?style=flat-square)](CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-217%20passing-38d6bd?style=flat-square)](#测试)
+[![Version](https://img.shields.io/badge/Boil-v1.2.0-ff7a45?style=flat-square)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-263%20passing-38d6bd?style=flat-square)](#测试)
 [![CI](https://github.com/JohnFKS/boil/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnFKS/boil/actions/workflows/ci.yml)
 
 ![Boil Dashboard](screenshots/dashboard.png)
@@ -260,6 +260,10 @@ Boil v2 的核心不是功能菜单，而是**强度阶梯 + 推荐器**。学�
 |---|---|
 | ![Note highlight](screenshots/unit-note-highlight.png) | ![Mnemonic AI](screenshots/unit-mnemonic-ai.png) |
 
+| 全局助手悬浮球 | 危险动作要亲手解锁 |
+|---|---|
+| ![Agent orb](screenshots/agent-orb.png) | ![Agent danger gate](screenshots/agent-danger-gate.png) |
+
 | 版本与更新内容（浮层） | 设置页的完整时间线 |
 |---|---|
 | ![Release notes](screenshots/journey-15-release-modal.png) | ![Releases in settings](screenshots/journey-16-settings.png) |
@@ -413,6 +417,7 @@ Pack 规范、校验规则、版本与幂等语义见 [PACK_SPEC.md](PACK_SPEC.m
 完整列表见 [API.md](API.md)。几个入口：
 
 ```bash
+curl http://127.0.0.1:7860/api/agent/capabilities   # 助手能做什么（白名单即安全边界）
 curl http://127.0.0.1:7860/api/health      # 版本 + 构建号 + 当前模式
 curl http://127.0.0.1:7860/api/releases     # 版本与更新内容（来自 CHANGELOG.md）
 curl http://127.0.0.1:7860/api/dashboard
@@ -454,7 +459,7 @@ python3 -m boil.mcp_server
 ## 测试
 
 ```bash
-# 217 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格 / 版本日志测试（stdlib unittest）
+# 263 项单元 / 集成 / HTTP / SSE / LLM 网关 / MCP / 质检 / 风格 / 版本日志 / agent 测试（stdlib unittest）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -520,6 +525,23 @@ python3 tools/effectiveness_sim.py --cards 400 --days 90
 ![Calibration](screenshots/calibration-card.png)
 
 （截图是演示数据：为了拍到填满的样子，我往那台机器的库里塞了 44 条合成复习记录，拍完就删了。你自己的库里要攒够 20 次真实复习才会出现条形图。）
+
+---
+
+## 全局助手（悬浮球）
+
+任何页面右下角都有一个球。它不是聊天挂件，而是**这个系统自己的操作台 + 说明书**：
+
+- **问系统本身的事**：「记忆健康度是怎么算的」「合并单元会不会丢内容」「怎么导出 Anki」。答案检索仓库里的
+  文档（README/API/ARCHITECTURE/CHANGELOG…）并标出出处；出处编不出来 —— 不在检索结果里的引用会被剔除并说明。
+- **让它带你操作**：28 项能力全在服务端白名单里（读数据、跳转、评分、开番茄钟、存灵感、重排路径、导出）。
+  模型**编不出**清单外的动作：越界的会被丢弃，界面上写明"这个动作我不认识，没排进去"。
+- **它只提议，你才执行**：每个动作是一张卡片，写着 `GET /api/map` 和"为什么"，要你点「执行」才发生。
+  `清空数据` 这类危险动作的按钮默认锁死，必须亲手输入确认词才解锁；不输就一次请求都不会发出。
+- **没配模型也能用**：退化成按关键词理解的本地规则，回答里明确标着「本地规则」，不假装是模型说的。
+- 每次提问都写进事件日志（`agent.turn`），事后可审计"我到底批准了什么"。
+
+安全边界与取舍写在 [SECURITY.md](SECURITY.md) 与 ARCHITECTURE §4.12。
 
 ---
 

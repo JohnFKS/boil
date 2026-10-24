@@ -139,8 +139,17 @@ class ProblemsTest(unittest.TestCase):
     def test_sample_logs_are_not_measured_against_config_version(self):
         """格式自检和版本自检是两件事：示例日志不该因为版本号被判红。"""
         self.assertEqual(releases.changelog_problems(text=SAMPLE, releases=releases.parse(SAMPLE)), [])
-        self.assertTrue(any("config.VERSION" in p
-                            for p in releases.version_problems(releases=releases.parse(SAMPLE))))
+        real = config.VERSION
+        try:
+            # 示例里最新是 1.2.0：只有当 config.VERSION 不是它时才该报不一致，
+            # 否则这条测试会随着项目发版悄悄变成假绿。
+            config.VERSION = "8.8.8"
+            self.assertTrue(any("config.VERSION" in p
+                                for p in releases.version_problems(releases=releases.parse(SAMPLE))))
+            config.VERSION = "1.2.0"
+            self.assertEqual(releases.version_problems(releases=releases.parse(SAMPLE)), [])
+        finally:
+            config.VERSION = real
 
     def test_bumping_version_without_changelog_is_caught(self):
         """改了 config.VERSION 忘了写日志 —— 这条最容易忘，必须红。"""
@@ -181,9 +190,12 @@ class ShippedChangelogTest(unittest.TestCase):
                     self.assertGreaterEqual(len(item), 8, f"{entry['version']} 有条目太短，没说清改了啥")
                     self.assertFalse(item.startswith(("**", "- ")), "条目不该混进 markdown 噪声")
 
-    def test_current_release_announces_the_changelog_itself(self):
-        items = " ".join(self.entries[0]["items"])
-        self.assertIn("版本", items)
+    def test_the_release_that_added_versioning_says_so(self):
+        """「版本与更新日志」这个能力必须在历史里能被找到 —— 但不固定在最新一条上。"""
+        blob = " ".join(" ".join(r["items"]) for r in self.entries)
+        self.assertIn("更新日志", blob)
+        introduced = [r["version"] for r in self.entries if "更新日志" in " ".join(r["items"])]
+        self.assertTrue(introduced)
 
 
 class BuildIdentityTest(unittest.TestCase):

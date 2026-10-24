@@ -36,4 +36,5 @@ jobs:
             node --input-type=module --check < "$f"
           done
       - name: Unit and integration tests
-        run: python -m unittest discover -s tests -v
+        # 临时数据目录：防止某个测试把假密钥/假配置写进仓库的 data/
+        run: BOIL_DATA_DIR=$(mktemp -d) python -m unittest discover -s tests -v

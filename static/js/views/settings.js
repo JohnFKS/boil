@@ -232,11 +232,15 @@ export async function render(el, ctx, params) {
     .map(btn => document.getElementById(btn.dataset.jump))
     .filter(Boolean);
   if (el._settingsCleanup) el._settingsCleanup();
+  let pinnedJump = null;
+  let pinnedUntil = 0;
   const updateJump = () => {
     if (!el.isConnected) {
       window.removeEventListener("scroll", updateJump);
       return;
     }
+    // 点了「数据与备份」就该亮着它：平滑滚动途中滚动侦测会把它抢成最后一节
+    if (pinnedJump && Date.now() < pinnedUntil) return;
     const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 12;
     let current = jumpTargets[0];
     if (atBottom) {
@@ -252,6 +256,8 @@ export async function render(el, ctx, params) {
   jumpButtons.forEach(btn => btn.addEventListener("click", () => {
     document.getElementById(btn.dataset.jump)?.scrollIntoView({ behavior: "smooth", block: "start" });
     jumpButtons.forEach(b => b.classList.toggle("active", b === btn));
+    pinnedJump = btn;
+    pinnedUntil = Date.now() + 1600;
   }));
   window.addEventListener("scroll", updateJump, { passive: true });
   el._settingsCleanup = () => window.removeEventListener("scroll", updateJump);
