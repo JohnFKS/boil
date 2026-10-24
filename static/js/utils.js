@@ -202,13 +202,14 @@ export function renderMarkdown(text) {
     inline.push(`<code>${code}</code>`);
     return `\u0000INLINE${i}\u0000`;
   });
-  // headings
+  // headings：正文里的 `#` 是"这篇材料内部"的层级，页面标题已经由外壳的 h1 提供了，
+  // 所以整体下移两级 —— 否则一个视图里会出现两个 h1，读屏的"按标题跳转"就废了。
   src = src.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>')
-    .replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>')
-    .replace(/^####\s+(.+)$/gm, '<h4>$1</h4>')
-    .replace(/^###\s+(.+)$/gm, '<h3>$1</h3>')
-    .replace(/^##\s+(.+)$/gm, '<h2>$1</h2>')
-    .replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+    .replace(/^#####\s+(.+)$/gm, '<h6>$1</h6>')
+    .replace(/^####\s+(.+)$/gm, '<h5>$1</h5>')
+    .replace(/^###\s+(.+)$/gm, '<h4>$1</h4>')
+    .replace(/^##\s+(.+)$/gm, '<h3>$1</h3>')
+    .replace(/^#\s+(.+)$/gm, '<h3>$1</h3>');
   // blockquote
   src = src.replace(/^&gt;\s?(.*)$/gm, '<blockquote>$1</blockquote>');
   // bold/italic
@@ -417,6 +418,7 @@ export function toast(message, type = "info", timeout = 3600) {
 
 export function openModal({ title = "", subtitle = "", body = "", actions = [], wide = false, closable = true, onOpen = null } = {}) {
   const root = document.getElementById("modal-root");
+  const opener = document.activeElement;
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   const modal = document.createElement("div");
@@ -434,13 +436,33 @@ export function openModal({ title = "", subtitle = "", body = "", actions = [], 
   if (body instanceof Node) bodyEl.appendChild(body);
   else bodyEl.innerHTML = body;
   const foot = modal.querySelector(".modal-foot");
+  const FOCUSABLE = "a[href],button:not([disabled]),input:not([type=hidden]):not([disabled]),"
+    + "select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
+  const items = () => [...modal.querySelectorAll(FOCUSABLE)]
+    .filter((el) => el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   const close = () => {
+    if (backdrop.dataset.closing) return;
+    backdrop.dataset.closing = "1";
     backdrop.style.opacity = "0";
     modal.style.transform = "translateY(8px) scale(.99)";
     setTimeout(() => backdrop.remove(), 160);
     document.removeEventListener("keydown", onKey);
+    if (opener && opener.isConnected) opener.focus();   // 键盘用户不该被丢回页面顶端
   };
-  const onKey = (e) => { if (e.key === "Escape" && closable) close(); };
+  const onKey = (e) => {
+    if (e.key === "Escape" && closable) { close(); return; }
+    if (e.key !== "Tab") return;
+    // 焦点陷阱：弹窗开着时 Tab 不该跑到背景内容上 —— 背景还在页面上，读屏和键盘用户
+    // 会掉进一个看不见也出不来的地方。
+    const stops = items();
+    if (!stops.length) { e.preventDefault(); modal.focus(); return; }
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    const active = document.activeElement;
+    if (!modal.contains(active)) { e.preventDefault(); first.focus(); return; }
+    if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
+  };
   actions.forEach((a) => {
     const btn = document.createElement("button");
     btn.className = `btn ${a.kind || "btn-ghost"}`;
@@ -463,6 +485,10 @@ export function openModal({ title = "", subtitle = "", body = "", actions = [], 
   modal.querySelector("[data-close]")?.addEventListener("click", close);
   document.addEventListener("keydown", onKey);
   root.appendChild(backdrop);
+  modal.tabIndex = -1;
+  // 先把焦点放进弹窗，再把 onOpen 的机会留给它自己（搜索框就是这么抢到焦点的）
+  const stops = items();
+  if (stops.length && !modal.contains(document.activeElement)) stops[0].focus();
   setTimeout(() => onOpen?.({ close, modal, body: bodyEl }), 0);
   return { close, modal, body: bodyEl, root: backdrop };
 }

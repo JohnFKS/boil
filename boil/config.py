@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 APP_NAME = "Boil"
 APP_CN = "烧水"
 DEFAULT_USER = "local"
@@ -29,6 +29,7 @@ LLM_OFF = os.environ.get("BOIL_LLM_OFF", "") == "1"
 DEMO_USER_NAME = os.environ.get("BOIL_USER_NAME", "学习者")
 
 MAX_BODY_BYTES = 12 * 1024 * 1024
+HTTP_BACKLOG = int(os.environ.get("BOIL_BACKLOG", "128"))
 
 
 def ensure_dirs() -> None:

@@ -160,7 +160,16 @@ def main():
     # Seed a socratic chat + a completed report via API
     pack = api("/api/packs")["data"]
     goal = api("/api/dashboard")["data"]
+    if not goal.get("has_goal"):
+        # 全新的 data 目录：先开一门课，体检不该要求"上次跑过"
+        goal = api("/api/onboarding", {
+            "name": "体检用户", "pack_id": "boil.xueshen.learning", "goal_title": "学习力",
+            "daily_minutes": 40, "deadline": "2026-12-31"})["data"]
+        goal = api("/api/dashboard")["data"]
     unit_id = goal["next_units"][0]["id"]
+    # 有几个检查项按模式分叉：离线（demo）本来就不该出现 AI 入口，不能当成缺陷报出来
+    llm_mode = (api("/api/health")["data"].get("llm") or {}).get("mode", "demo")
+    print("  llm mode:", llm_mode)
     chat_sid = None
     done_sid = None
     try:
@@ -623,8 +632,17 @@ def main():
         else:
             print(f"  mistake tags: rows={mist.get('rows')} empty={mist.get('empty')}")
         shot("insights.png")
-        if not evaluate("!!document.querySelector('#insight-ai-btn')"):
-            errors.append("insights AI 解读入口不存在")
+        insight_ai = evaluate(
+            "(()=>{const b=document.querySelector('#insight-ai-body');"
+            "return {btn:!!document.querySelector('#insight-ai-btn'),"
+            "body:(b?b.textContent:'').trim()}})()")
+        if llm_mode == "live":
+            if not insight_ai or not insight_ai.get("btn"):
+                errors.append("insights AI 解读入口不存在")
+        elif insight_ai and insight_ai.get("btn"):
+            errors.append("没配模型却给了 AI 解读入口（点了必然失败）")
+        elif insight_ai and "模型" not in insight_ai.get("body", ""):
+            errors.append(f"离线时洞察页没有解释为什么没有 AI 解读: {insight_ai}")
         shot("insights-full.png", full=True)
 
         # 划词菜单 + 灵感库
@@ -655,38 +673,42 @@ def main():
         live = bool(ai_items and ai_items.get("mode") == "live")
         if live and not real_click('[data-sel="cards"]'):
             errors.append("划词菜单里的「做成复习卡」真鼠标点不到")
-        elif not live:
-            evaluate("document.querySelector('[data-sel=\"cards\"]')?.click()")
-        time.sleep(4.5)
-        preview = evaluate(
-            "(()=>{const p=document.querySelector('#sel-panel-cards');"
-            "if(!p) return {shown:false};"
-            "return {shown:getComputedStyle(p).display!=='none',"
-            "cards:p.querySelectorAll('.card-preview').length,"
-            "engine:!!p.querySelector('.badge'),"
-            "confirm:!!p.querySelector('[data-cards-confirm]')}})()")
-        if not preview or not preview.get("shown") or not preview.get("confirm"):
-            errors.append(f"卡片预览面板没有打开: {preview}")
-        elif preview.get("cards", 0) < 1:
-            errors.append(f"卡片预览没有内容: {preview}")
+        if not live:
+            # 离线时这两个入口本来就该收起去；给出来才是缺陷（点了必然失败）
+            if ai_items and (ai_items.get("cards") or ai_items.get("ask")):
+                errors.append(f"没配模型却给了做卡片/问 AI 的入口: {ai_items}")
         else:
-            print(f"  cards preview: {preview.get('cards')} 张, engine badge={preview.get('engine')}")
-        # 回归：面板内部的真实按下不能把它拆掉（document 级 hideAll 曾抢在 click 前清空 DOM，
-        # 于是「确认存入」永远点不动，而合成 click() 完全测不到这一层）
-        if not real_click("#sel-panel-cards .panel-body"):
-            errors.append("卡片面板内部无法用真鼠标点中")
-        else:
-            time.sleep(0.5)
-            survived = evaluate(
+            time.sleep(4.5)
+            preview = evaluate(
                 "(()=>{const p=document.querySelector('#sel-panel-cards');"
                 "if(!p) return {shown:false};"
                 "return {shown:getComputedStyle(p).display!=='none',"
-                "cards:p.querySelectorAll('.card-preview').length}})()")
-            if not survived or not survived.get("shown") or survived.get("cards", 0) < 1:
-                errors.append(f"点面板内部把它关掉了: {survived}")
-        if not real_click("#sel-panel-cards [data-panel-cancel]"):
-            evaluate("document.querySelector('#sel-panel-cards [data-panel-cancel]')?.click()")
-        time.sleep(0.4)
+                "cards:p.querySelectorAll('.card-preview').length,"
+                "engine:!!p.querySelector('.badge'),"
+                "confirm:!!p.querySelector('[data-cards-confirm]')}})()")
+            if not preview or not preview.get("shown") or not preview.get("confirm"):
+                errors.append(f"卡片预览面板没有打开: {preview}")
+            elif preview.get("cards", 0) < 1:
+                errors.append(f"卡片预览没有内容: {preview}")
+            else:
+                print(f"  cards preview: {preview.get('cards')} 张, engine badge={preview.get('engine')}")
+            # 回归：面板内部的真实按下不能把它拆掉（document 级 hideAll 曾抢在 click 前清空 DOM，
+            # 于是「确认存入」永远点不动，而合成 click() 完全测不到这一层）
+            if not real_click("#sel-panel-cards .panel-body"):
+                errors.append("卡片面板内部无法用真鼠标点中")
+            else:
+                time.sleep(0.5)
+                survived = evaluate(
+                    "(()=>{const p=document.querySelector('#sel-panel-cards');"
+                    "if(!p) return {shown:false};"
+                    "return {shown:getComputedStyle(p).display!=='none',"
+                    "cards:p.querySelectorAll('.card-preview').length}})()")
+                if not survived or not survived.get("shown") or survived.get("cards", 0) < 1:
+                    errors.append(f"点面板内部把它关掉了: {survived}")
+            # 取消按钮也必须真鼠标点得动：留一个合成 click() 兜底就是把这类 bug 藏回去
+            if not real_click("#sel-panel-cards [data-panel-cancel]"):
+                errors.append("卡片面板的取消按钮真鼠标点不到")
+            time.sleep(0.4)
         # F14：追问面板要能用真鼠标打开并输入文字（不提问，省一次模型调用）
         if live:
             evaluate("(()=>{const el=document.querySelector('.essence-text');"

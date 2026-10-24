@@ -162,17 +162,33 @@ def _normalize_auth_prefix(header: str, prefix: Any) -> str:
     return value
 
 
+def _text(value: Any, default: str = "") -> str:
+    """data/llm.json 是用户可以手改的文件：类型不对就当没写，别让用户的一次打字错误把 AI 层整个打崩。"""
+    return value.strip() if isinstance(value, str) else default
+
+
+def _number(value: Any, default: Any, cast) -> Any:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_config() -> dict[str, Any]:
     base = _env_config()
     stored = read_json(config.LLM_CONFIG_PATH, {}) or {}
+    if not isinstance(stored, dict):
+        stored = {}
     cfg = {**base, **{k: v for k, v in stored.items() if v is not None}}
-    cfg["base_url"] = (cfg.get("base_url") or DEFAULT_BASE).rstrip("/")
-    cfg["model"] = cfg.get("model") or DEFAULT_MODEL
-    cfg["deep_model"] = cfg.get("deep_model") or cfg["model"]
-    cfg["api_key"] = cfg.get("api_key") or ""
-    cfg["temperature"] = float(cfg.get("temperature") or 0.5)
-    cfg["timeout"] = int(cfg.get("timeout") or READ_IDLE)
-    cfg["max_tokens"] = cfg.get("max_tokens") or None
+    cfg["base_url"] = (_text(cfg.get("base_url")) or DEFAULT_BASE).rstrip("/")
+    cfg["model"] = _text(cfg.get("model")) or DEFAULT_MODEL
+    cfg["deep_model"] = _text(cfg.get("deep_model")) or cfg["model"]
+    cfg["api_key"] = _text(cfg.get("api_key"))
+    cfg["temperature"] = _number(cfg.get("temperature"), 0.5, float)
+    cfg["timeout"] = _number(cfg.get("timeout"), READ_IDLE, int)
+    cfg["max_tokens"] = _number(cfg.get("max_tokens"), None, int)
     header = str(cfg.get("auth_header") or DEFAULT_AUTH_HEADER).strip() or DEFAULT_AUTH_HEADER
     if not re.fullmatch(r"[A-Za-z0-9-]+", header):
         header = DEFAULT_AUTH_HEADER

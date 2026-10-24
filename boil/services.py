@@ -35,13 +35,12 @@ def ensure_user(db: Database, name: str = "") -> dict[str, Any]:
             user = db.one("SELECT * FROM users WHERE id=?", (config.DEFAULT_USER,))
         return user
     ts = now_iso()
-    db.insert("users", {
-        "id": config.DEFAULT_USER,
-        "name": (name or config.DEMO_USER_NAME).strip()[:40],
-        "email": None,
-        "created_at": ts,
-        "updated_at": ts,
-    })
+    # 并发重置会同时走到"用户不存在"这条路上：ON CONFLICT DO NOTHING，
+    # 别把第二个请求变成 500（用户看到的是"重置失败"，其实已经重置好了）。
+    db.execute(
+        "INSERT INTO users (id, name, email, created_at, updated_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(id) DO NOTHING",
+        (config.DEFAULT_USER, (name or config.DEMO_USER_NAME).strip()[:40], None, ts, ts))
     return db.one("SELECT * FROM users WHERE id=?", (config.DEFAULT_USER,))
 
 
@@ -1256,6 +1255,18 @@ def normalize_mistake_tags(raw: Any) -> list[str]:
 def rate_card(db: Database, user_id: str, card_id: str, rating: int,
               elapsed_ms: int = 0, recall: str = "",
               mistake_tags: Any = None) -> dict[str, Any]:
+    """评分 = 读卡片 → FSRS 计算 → 写回，整个链条必须在一个写事务里。
+
+    裸着跑会出现两种真会发生的坏情况：连点两下时两个线程都从"复习前"的状态算，
+    后写的把先写的覆盖掉（reps 少记一半）；中途异常则留下"日志有、卡片没动"的半截复习。
+    """
+    with db.transaction():
+        return _rate_card(db, user_id, card_id, rating, elapsed_ms, recall, mistake_tags)
+
+
+def _rate_card(db: Database, user_id: str, card_id: str, rating: int,
+               elapsed_ms: int = 0, recall: str = "",
+               mistake_tags: Any = None) -> dict[str, Any]:
     card = db.one("SELECT * FROM cards WHERE id=? AND user_id=?", (card_id, user_id))
     if not card:
         raise ValueError("卡片不存在")
@@ -1375,31 +1386,33 @@ def undo_review(db: Database, user_id: str, op_id: str) -> dict[str, Any]:
     op_id = str(op_id or "").strip()
     if not op_id:
         raise ValueError("缺少撤销凭据")
-    ev = db.one("SELECT * FROM events WHERE id=? AND type='review.rated' AND user_id=?",
-                (op_id, user_id))
-    if not ev:
-        raise ValueError("找不到这次评分的记录")
-    payload = json_loads(ev["payload_json"], {}) or {}
-    undo = payload.get("undo") or {}
-    if not undo.get("log_id") or not undo.get("card"):
-        raise ValueError("这次评分来自旧版本，没有留下可回滚的快照")
-    log = db.one("SELECT * FROM review_logs WHERE id=?", (undo["log_id"],))
-    card = db.one("SELECT * FROM cards WHERE id=? AND user_id=?",
-                  (payload.get("card_id"), user_id))
-    if not log or not card:
-        raise ValueError("这次评分或卡片已经不在了")
-    # 用 rowid 而不是 reviewed_at：时间戳只到秒，同一秒里的两次复习会分不出先后
-    later = db.scalar(
-        "SELECT COUNT(*) FROM review_logs l JOIN cards c ON c.id=l.card_id "
-        "WHERE c.unit_id=? AND c.user_id=? AND l.rowid > "
-        "(SELECT rowid FROM review_logs WHERE id=?)",
-        (payload.get("unit_id"), user_id, log["id"]), 0) or 0
-    if later:
-        raise ValueError(f"这个单元在那之后又复习了 {later} 次；"
-                         "撤掉这一条会把后面的掌握度一起抹掉，所以不允许")
-    snap = undo["card"]
-    ts = now_iso()
+    # 检查"这是不是最近一次评分"和回滚必须在同一个写事务里：
+    # 分开写的话，中间插进来一次评分，撤销就会把那次评分一起抹掉（卡片计数从此对不上日志）。
     with db.transaction():
+        ev = db.one("SELECT * FROM events WHERE id=? AND type='review.rated' AND user_id=?",
+                    (op_id, user_id))
+        if not ev:
+            raise ValueError("找不到这次评分的记录")
+        payload = json_loads(ev["payload_json"], {}) or {}
+        undo = payload.get("undo") or {}
+        if not undo.get("log_id") or not undo.get("card"):
+            raise ValueError("这次评分来自旧版本，没有留下可回滚的快照")
+        log = db.one("SELECT * FROM review_logs WHERE id=?", (undo["log_id"],))
+        card = db.one("SELECT * FROM cards WHERE id=? AND user_id=?",
+                      (payload.get("card_id"), user_id))
+        if not log or not card:
+            raise ValueError("这次评分或卡片已经不在了")
+        # 用 rowid 而不是 reviewed_at：时间戳只到秒，同一秒里的两次复习会分不出先后
+        later = db.scalar(
+            "SELECT COUNT(*) FROM review_logs l JOIN cards c ON c.id=l.card_id "
+            "WHERE c.unit_id=? AND c.user_id=? AND l.rowid > "
+            "(SELECT rowid FROM review_logs WHERE id=?)",
+            (payload.get("unit_id"), user_id, log["id"]), 0) or 0
+        if later:
+            raise ValueError(f"这个单元在那之后又复习了 {later} 次；"
+                             "撤掉这一条会把后面的掌握度一起抹掉，所以不允许")
+        snap = undo["card"]
+        ts = now_iso()
         db.execute(
             "UPDATE cards SET state=?, step=?, stability=?, difficulty=?, due_at=?, "
             "last_review=?, reps=?, lapses=?, mistake_tags_json=?, updated_at=? WHERE id=?",

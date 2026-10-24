@@ -596,6 +596,10 @@ def _q(query: dict[str, list[str]], key: str) -> str:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Boil/1.0"
+    # 连接超时：否则"声明了 Content-Length 却不发 body"的客户端会永久占一个线程
+    timeout = 30
+    # 响应头是一条条 write 出去的，Nagle + 延迟确认会把它们串成 ~40ms 的往返等待
+    disable_nagle_algorithm = True
     app: App
 
     # ---------------- HTTP ----------------
@@ -631,7 +635,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"ok": False, "error": {
                     "code": "unauthorized", "message": "需要访问令牌（BOIL_TOKEN）"}})
                 return
-            body = self._read_json() if method == "POST" else {}
+            # 读请求体必须在错误处理里：畸形 JSON 要是逃出去，线程直接死掉，
+            # 浏览器只会看到"网络错误"，用户不知道该改什么。
+            try:
+                body = self._read_json() if method == "POST" else {}
+            except ApiError as exc:
+                self._send_api_error(exc)
+                return
+            except OSError:      # 请求体没发完就断线 / 超时
+                return
             for m, pattern, handler in self.app.routes:
                 match = pattern.match(path)
                 if match and m == method:
@@ -640,8 +652,7 @@ class Handler(BaseHTTPRequestHandler):
                         if result is not None:
                             self.send_json(200, {"ok": True, "data": result})
                     except ApiError as exc:
-                        self.send_json(exc.status, {"ok": False, "error": {
-                            "code": exc.code, "message": exc.message, "detail": exc.detail}})
+                        self._send_api_error(exc)
                     except PackError as exc:
                         self.send_json(400, {"ok": False, "error": {
                             "code": "pack_error", "message": str(exc),
@@ -679,20 +690,39 @@ class Handler(BaseHTTPRequestHandler):
             token = self.headers.get("X-Boil-Token", "").strip()
         return token == config.TOKEN
 
+    def _send_api_error(self, exc: "ApiError"):
+        self.send_json(exc.status, {"ok": False, "error": {
+            "code": exc.code, "message": exc.message, "detail": exc.detail}})
+
     def _read_json(self) -> Any:
+        # Content-Length 是客户端自报的，不能信：负数、非数字、分块传输都可能把
+        # 后续字节留在 rfile 里被当成"下一个请求"（请求走私的经典形状）。
+        # 凡是拒绝掉 body 的分支都顺手断链，不再在同一条连接上继续解析。
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise ApiError(411, "需要 Content-Length", "bad_request")
+        declared = (self.headers.get("Content-Length") or "").strip()
         try:
-            length = int(self.headers.get("Content-Length") or 0)
+            length = int(declared or 0)
         except ValueError:
-            length = 0
+            length = -1
+        if length < 0:
+            self.close_connection = True
+            raise ApiError(400, "Content-Length 不合法", "bad_request")
         if length > config.MAX_BODY_BYTES:
+            self.close_connection = True
             raise ApiError(413, "请求体过大", "too_large")
-        if length <= 0:
+        if length == 0:
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             raise ApiError(400, "请求体不是合法 JSON", "bad_json", str(exc)[:200]) from exc
+        # 每个 handler 都把 body 当映射用；null/数组/字符串进到这儿就是 500
+        if not isinstance(data, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return data
 
     def end_headers(self):
         # 统一安全头，覆盖 API、SSE、静态资源与错误页。
@@ -765,11 +795,18 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("", "/"):
             path = "/index.html"
         safe = path.lstrip("/")
-        target = (config.STATIC_DIR / safe).resolve()
+        # 含 \x00 之类的垃圾路径会在 resolve/stat 上抛 ValueError：不接住就是线程崩掉、
+        # 连接被掐断，用户在浏览器里只看到"无法访问"，比 400 难查得多。
         try:
-            target.relative_to(config.STATIC_DIR.resolve())
+            static_root = config.STATIC_DIR.resolve()
+            target = (config.STATIC_DIR / safe).resolve()
+        except (ValueError, OSError):
+            self.send_error(400)      # 含 \x00 的东西根本不是一个路径
+            return
+        try:
+            target.relative_to(static_root)
         except ValueError:
-            self.send_error(403)
+            self.send_error(403)      # 确实在往外爬
             return
         if not target.is_file():
             # 带扩展名的资源缺失必须 404，不能回退成 HTML（否则模块会 MIME 报错）。
@@ -822,13 +859,20 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[http] {self.address_string()} {fmt % args}", file=sys.stderr)
 
 
+class Server(ThreadingHTTPServer):
+    """request_queue_size 默认是 5：一次页面加载并发的请求就能把 accept 队列打满，
+    客户端看到的是 connection reset，而不是"慢一点"。"""
+
+    daemon_threads = True
+    request_queue_size = config.HTTP_BACKLOG
+
+
 def run(host: str | None = None, port: int | None = None, db: Database | None = None) -> None:
     host = host or config.HOST
     port = port or config.PORT
     app = App(db)
     Handler.app = app
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
+    server = Server((host, port), Handler)
     mode = "真实模型" if llm.enabled() else "演示模式（本地确定性引擎）"
     print("")
     print("  ██████  ██████  ██ ██")

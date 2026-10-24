@@ -104,10 +104,10 @@ export async function render(el, ctx, params) {
   function openCompiler() {
     const body = document.createElement("div");
     body.innerHTML = `<div class="form-grid">
-      <div class="field full"><label>材料标题</label><input class="input" id="cp-title" placeholder="例如：第 3 章 导数与微分"></div>
-      <div class="field"><label>学科 / 主题</label><input class="input" id="cp-subject" placeholder="例如：高等数学"></div>
-      <div class="field"><label>目标名称</label><input class="input" id="cp-goal" placeholder="默认使用材料标题"></div>
-      <div class="field full"><label>材料内容</label><textarea class="textarea tall" id="cp-text" placeholder="粘贴讲义、笔记或教材片段。至少 60 个字符。"></textarea><span class="hint">演示模式在本地切分、出题；配置模型后会做更细的结构抽取。不会上传到第三方，除非你配置了模型端点。</span></div>
+      <div class="field full"><label for="cp-title">材料标题</label><input class="input" id="cp-title" placeholder="例如：第 3 章 导数与微分"></div>
+      <div class="field"><label for="cp-subject">学科 / 主题</label><input class="input" id="cp-subject" placeholder="例如：高等数学"></div>
+      <div class="field"><label for="cp-goal">目标名称</label><input class="input" id="cp-goal" placeholder="默认使用材料标题"></div>
+      <div class="field full"><label for="cp-text">材料内容</label><textarea class="textarea tall" id="cp-text" placeholder="粘贴讲义、笔记或教材片段。至少 60 个字符。"></textarea><span class="hint">演示模式在本地切分、出题；配置模型后会做更细的结构抽取。不会上传到第三方，除非你配置了模型端点。</span></div>
     </div>
     <div id="cp-error"></div>`;
     const modal = openModal({
@@ -146,7 +146,7 @@ export async function render(el, ctx, params) {
 
   function openImporter() {
     const body = document.createElement("div");
-    body.innerHTML = `<div class="field"><label>Pack JSON</label><textarea class="textarea tall" id="imp-json" placeholder='{"schema_version":"1.0","id":"...","name":"...","version":"1.0.0","units":[...]}'></textarea><span class="hint">导入前会做完整校验；失败的包不会被安装。</span></div><div id="imp-error"></div>`;
+    body.innerHTML = `<div class="field"><label for="imp-json">Pack JSON</label><textarea class="textarea tall" id="imp-json" placeholder='{"schema_version":"1.0","id":"...","name":"...","version":"1.0.0","units":[...]}'></textarea><span class="hint">导入前会做完整校验；失败的包不会被安装。</span></div><div id="imp-error"></div>`;
     const modal = openModal({
       title: "导入 Learning Pack", subtitle: "JSON → 校验 → 预览 → 安装", body, wide: true,
       actions: [

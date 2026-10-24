@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -325,6 +326,26 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+WRITE_RETRY = 5
+WRITE_RETRY_SECONDS = 0.05
+
+
+def _retryable(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _retry_write(fn, *args):
+    """跨进程写冲突（MCP 服务、两个 boil 实例共用一个库）时重试几次再报错。"""
+    for attempt in range(WRITE_RETRY):
+        try:
+            return fn(*args)
+        except sqlite3.OperationalError as exc:
+            if not _retryable(exc) or attempt == WRITE_RETRY - 1:
+                raise
+            time.sleep(WRITE_RETRY_SECONDS * (attempt + 1))
+
+
 class Database:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or config.DB_PATH)
@@ -383,11 +404,11 @@ class Database:
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._write_lock:
-            return self.conn.execute(sql, tuple(params))
+            return _retry_write(self.conn.execute, sql, tuple(params))
 
     def executemany(self, sql: str, rows: Iterable[Iterable[Any]]) -> None:
         with self._write_lock:
-            self.conn.executemany(sql, [tuple(r) for r in rows])
+            _retry_write(self.conn.executemany, sql, [tuple(r) for r in rows])
 
     def insert(self, table: str, data: dict[str, Any]) -> None:
         cols = list(data.keys())
@@ -420,14 +441,29 @@ class _Transaction:
         self.db = db
 
     def __enter__(self):
-        self.db.conn.execute("BEGIN IMMEDIATE")
-        return self.db
+        # 事务必须和单条写共用这把锁：RLock 只在同一线程内可重入，
+        # 否则"线程 A 在事务里读改写、线程 B 直接 execute 写"就是 WAL 下的经典 BUSY 死锁，
+        # 用户那边表现为连点两下评分，第二下 500。
+        self.db._write_lock.acquire()
+        for attempt in range(WRITE_RETRY):
+            try:
+                self.db.conn.execute("BEGIN IMMEDIATE")
+                return self.db
+            except sqlite3.OperationalError as exc:
+                if not _retryable(exc) or attempt == WRITE_RETRY - 1:
+                    self.db._write_lock.release()
+                    raise
+                time.sleep(WRITE_RETRY_SECONDS * (attempt + 1))
+        raise sqlite3.OperationalError("无法开始写事务")
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.db.conn.execute("COMMIT")
-        else:
-            self.db.conn.execute("ROLLBACK")
+        try:
+            if exc_type is None:
+                self.db.conn.execute("COMMIT")
+            else:
+                self.db.conn.execute("ROLLBACK")
+        finally:
+            self.db._write_lock.release()
         return False
 
 

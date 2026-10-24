@@ -39,15 +39,12 @@ def recent(db: Database, user_id: str = "local", limit: int = 30,
 def touch_study_day(db: Database, user_id: str, minutes: int = 0,
                     sessions: int = 0, reviews: int = 0) -> None:
     day = today_str()
-    row = db.one("SELECT * FROM study_days WHERE user_id=? AND day=?", (user_id, day))
-    if row:
-        db.execute(
-            "UPDATE study_days SET minutes=minutes+?, sessions=sessions+?, reviews=reviews+? "
-            "WHERE user_id=? AND day=?",
-            (max(0, minutes), max(0, sessions), max(0, reviews), user_id, day),
-        )
-    else:
-        db.insert("study_days", {
-            "user_id": user_id, "day": day, "minutes": max(0, minutes),
-            "sessions": max(0, sessions), "reviews": max(0, reviews),
-        })
+    # 一条 upsert 写完：先查后插的写法在并发评分时会双双走进"不存在"分支，
+    # 第二次评分直接撞 UNIQUE(user_id, day) 变成 500 —— 用户看到的是一次失败的"已保存"。
+    db.execute(
+        "INSERT INTO study_days (user_id, day, minutes, sessions, reviews) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(user_id, day) DO UPDATE SET "
+        "minutes=minutes+excluded.minutes, sessions=sessions+excluded.sessions, "
+        "reviews=reviews+excluded.reviews",
+        (user_id, day, max(0, minutes), max(0, sessions), max(0, reviews)),
+    )

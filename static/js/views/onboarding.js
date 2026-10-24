@@ -184,15 +184,15 @@ export async function render(el, ctx, params) {
         <h2>${mode === "material" ? "把材料交给编译器" : "设定你的学习契约"}</h2>
         <p class="sub">${mode === "material" ? "先编译成可学习的单元，再决定目标与节奏。" : "目标、截止日期与每天可投入的时间，会决定路径的密度。"}</p>
         <div class="form-grid mt-4">
-          <div class="field"><label>你的称呼</label><input class="input" id="ob-name" value="${escapeHTML(draft.name)}" placeholder="学习者"></div>
-          <div class="field"><label>目标名称</label><input class="input" id="ob-title" value="${escapeHTML(draft.goalTitle || title)}" placeholder="例如：掌握线性代数期末"></div>
+          <div class="field"><label for="ob-name">你的称呼</label><input class="input" id="ob-name" value="${escapeHTML(draft.name)}" placeholder="学习者"></div>
+          <div class="field"><label for="ob-title">目标名称</label><input class="input" id="ob-title" value="${escapeHTML(draft.goalTitle || title)}" placeholder="例如：掌握线性代数期末"></div>
           ${mode === "material" ? `
             <div class="field full">
-              <label>材料标题 <button class="btn btn-ghost btn-sm" id="ob-suggest" type="button">${icon("wand", 13)} AI 生成信息</button></label>
+              <label for="ob-material-title">材料标题 <button class="btn btn-ghost btn-sm" id="ob-suggest" type="button">${icon("wand", 13)} AI 生成信息</button></label>
               <input class="input" id="ob-material-title" value="${escapeHTML(materialPack?.name || draft.materialTitle)}" placeholder="例如：第 3 章 导数与微分">
               <span class="hint" id="ob-suggest-hint"></span>
             </div>
-            <div class="field"><label>学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
+            <div class="field"><label for="ob-subject">学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
             <div class="field full">
               <label>材料文件（可多选）</label>
               <div class="file-drop" id="ob-drop" role="button" tabindex="0" aria-label="选择 Markdown、JSON 或 TXT 材料文件">
@@ -204,10 +204,10 @@ export async function render(el, ctx, params) {
               <div class="file-list" id="ob-file-list">${fileListHTML()}</div>
               <span class="hint">JSON 会按键值结构铺平成可读文本；文件与下方粘贴文本合计不超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符。</span>
             </div>
-            <div class="field full"><label>材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="也可以把补充讲义、笔记或教材片段粘贴到这里。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
+            <div class="field full"><label for="ob-text">材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="也可以把补充讲义、笔记或教材片段粘贴到这里。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
           ` : ""}
-          <div class="field"><label>截止日期</label><input class="input" type="date" id="ob-deadline" value="${escapeHTML(draft.deadline)}"></div>
-          <div class="field"><label>每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
+          <div class="field"><label for="ob-deadline">截止日期</label><input class="input" type="date" id="ob-deadline" value="${escapeHTML(draft.deadline)}"></div>
+          <div class="field"><label for="ob-minutes">每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
           <div class="field full"><label>当前基础</label><div class="choice-row">${LEVELS.map(([v, l]) => `<button class="choice ${v === draft.level ? "active" : ""}" data-level="${v}">${l}</button>`).join("")}</div></div>
         </div>
         <div class="preview-box" id="ob-preview">
@@ -373,7 +373,9 @@ export async function render(el, ctx, params) {
                         : "模型这次没给出可用的元信息，字段保持原样。",
                   given ? "success" : "info", 4600);
           } else {
-            toast("未配置模型，已按本地规则生成。", "info", 4200);
+            // 本地规则同样只报真的填进去的字段：学科没给出来就要说没给出来
+            toast(`未配置模型，已按本地规则生成${given ? "了" + given : "，但这次没有可用字段"}。${res.subject ? "" : "学科没判断出来，可以自己补一句。"}`,
+                  "info", 4600);
           }
         } catch (err) {
           aiFailure(ctx);

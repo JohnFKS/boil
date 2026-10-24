@@ -209,13 +209,13 @@ export async function render(el, ctx, params) {
 
         <div class="card side-card">
           <div class="side-label">速记与我的笔记</div>
-          <div class="field mt-2"><label>速记（复习线索）</label><textarea class="textarea" id="note-mnemonic" style="min-height:64px" placeholder="口诀、谐音、类比、画面感…">${escapeHTML(notes.mnemonic?.content || "")}</textarea></div>
+          <div class="field mt-2"><label for="note-mnemonic">速记（复习线索）</label><textarea class="textarea" id="note-mnemonic" style="min-height:64px" placeholder="口诀、谐音、类比、画面感…">${escapeHTML(notes.mnemonic?.content || "")}</textarea></div>
           <div class="row wrap mt-2" style="gap:8px">
             <button class="btn btn-ghost btn-sm" data-save-note="mnemonic">保存速记</button>
             ${aiEnabled(ctx) ? `<button class="btn btn-ghost btn-sm" data-mnemonic-ai>${icon("wand", 13)} AI 编口诀</button>` : ""}
           </div>
           <div class="mnemonic-ai-result" id="mnemonic-ai" style="display:none"></div>
-          <div class="field mt-3"><label>我的笔记</label><textarea class="textarea" id="note-note" style="min-height:80px" placeholder="把这一单元的边界、反例、自己的话记下来。">${escapeHTML(notes.note?.content || "")}</textarea></div>
+          <div class="field mt-3"><label for="note-note">我的笔记</label><textarea class="textarea" id="note-note" style="min-height:80px" placeholder="把这一单元的边界、反例、自己的话记下来。">${escapeHTML(notes.note?.content || "")}</textarea></div>
           <button class="btn btn-ghost btn-sm mt-2" data-save-note="note">保存笔记</button>
           <div class="faint tiny mt-2">来自 mem 的速记/批注思路：速记会在复习卡上作为可选线索出现。</div>
         </div>

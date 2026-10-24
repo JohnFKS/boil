@@ -77,8 +77,8 @@ export async function render(el, ctx, params) {
     </div>
 
     <div class="notes-toolbar">
-      <input class="input" id="notes-search" type="search" placeholder="搜索引用或想法…" value="${escapeHTML(keyword)}">
-      <select class="select" id="notes-unit">
+      <input class="input" id="notes-search" type="search" aria-label="搜索灵感笔记" placeholder="搜索引用或想法…" value="${escapeHTML(keyword)}">
+      <select class="select" id="notes-unit" aria-label="按单元筛选笔记">
         <option value="">全部单元</option>
         ${unitOptions.map(u => `<option value="${escapeAttr(u.id)}" ${u.id === unitFilter ? "selected" : ""}>${escapeHTML(u.title)}</option>`).join("")}
       </select>

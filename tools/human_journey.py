@@ -196,6 +196,9 @@ class Bot:
         平滑滚动期间 getBoundingClientRect 拿到的是动画起点的坐标，
         随后的点击就会落在别的元素上（老 harness 靠 emulate reduced-motion 绕过了这点，
         真人不会关动画，所以这里按真人来测）。
+
+        命中判定只接受「目标本身或它的后代」。把祖先也算命中会放行一类假命中：弹窗入场动画
+        期间坐标还没落定，点下去其实打在遮罩上 —— 于是弹窗被关掉，后面每一步都报"被 modal-backdrop 盖住"。
         """
         raw = self.evaluate(
             "(()=>{const e=document.querySelector(%s);if(!e)return null;"
@@ -205,7 +208,7 @@ class Bot:
             "const hit=document.elementFromPoint(x,y);"
             "return JSON.stringify({x:x,y:y,w:r.width,h:r.height,"
             "top:r.top,bottom:r.bottom,left:r.left,right:r.right,vw:window.innerWidth,"
-            "vh:window.innerHeight,hit:!!(hit&&(hit===e||e.contains(hit)||hit.contains(e))),"
+            "vh:window.innerHeight,hit:!!(hit&&(hit===e||e.contains(hit))),"
             "blocker:hit?(hit.tagName+'#'+hit.id+'.'+(hit.className||'').toString().slice(0,28)):null})})()"
             % (json.dumps(selector), "true" if scroll else "false"))
         return json.loads(raw) if raw else None
@@ -270,8 +273,11 @@ class Bot:
         self.think(0.2, 0.5)
 
     def key(self, k, modifiers=0):
-        code = {"Escape": "Escape", "Enter": "Enter", "k": "KeyK", " ": "Space"}.get(k, k)
-        vk = {"Escape": 27, "Enter": 13, "k": 75, " ": 32}.get(k, 0)
+        code = {"Escape": "Escape", "Enter": "Enter", "k": "KeyK", " ": "Space",
+                "Tab": "Tab"}.get(k, k)
+        # windowsVirtualKeyCode 不能省：Tab 只带 key/code 时，Chromium 不会真的移动焦点，
+        # 键盘可达性测试就会"只走到 4 个控件"然后得出错误的结论。
+        vk = {"Escape": 27, "Enter": 13, "k": 75, " ": 32, "Tab": 9}.get(k, 0)
         base = {"key": k, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
                 "modifiers": modifiers}
         text = k if len(k) == 1 else ("\r" if k == "Enter" else None)
@@ -385,6 +391,12 @@ class Bot:
         从 0 开始拖会跨到两个块里，高亮器只能标出一段，测不出正常路径。
         """
         js = self._TEXTMAP_JS % (json.dumps(selector), start, start, want)
+        # 先把目标块的顶边拉到可见：拖选点必须留在视口里，否则下面全乱
+        self.evaluate(
+            "(()=>{const e=document.querySelector(%s);if(!e)return false;"
+            "e.scrollIntoView({block:'start',behavior:'instant'});window.scrollBy(0,-80);return true})()"
+            % json.dumps(selector))
+        time.sleep(0.35)
         raw = self.evaluate(js)
         if not raw:
             raise Fail(f"{selector} 里凑不出可拖选的文字（可见文本不足或映射失败）")
@@ -393,10 +405,16 @@ class Bot:
             "(()=>{const e=window.__agentDragHost||document.querySelector(%s);"
             "const r=e.getBoundingClientRect();return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height})})()"
             % json.dumps(selector)) or "null") or {"x": 0, "y": 0, "w": 4000, "h": 4000}
+        vw = self.evaluate("window.innerWidth") or 1400
+        vh = self.evaluate("window.innerHeight") or 900
 
         def clamp(pt):
-            return [min(max(pt[0], box["x"] + 3), box["x"] + box["w"] - 6),
-                    min(max(pt[1], box["y"] + 3), box["y"] + box["h"] - 3)]
+            # 拖拽点要留在视口内（底部再留 24px）：指针贴到视口下沿会让 Chromium 进入
+            # "按住拖动自动滚动"，实测选区从 26 字一路自动长成 780 字，而滚动本身又会
+            # 立刻收起划词浮条 —— 于是看起来像产品的划词坏了。
+            lo_x, hi_x = max(box["x"], 0) + 4, min(box["x"] + box["w"], vw) - 4
+            lo_y, hi_y = max(box["y"], 0) + 4, min(box["y"] + box["h"], vh) - 24
+            return [min(max(pt[0], lo_x), hi_x), min(max(pt[1], lo_y), hi_y)]
 
         a, b = clamp(plan["a"]), clamp(plan["b"])
         self.evaluate("window.getSelection().removeAllRanges()")
@@ -566,8 +584,11 @@ def main():
         goal = bot.value("#ob-title") or ""
         if not title:
             raise Fail(f"AI 没有把材料标题填进来：{title!r}")
-        if "AI 已生成" not in toast:
+        live = api("/api/health").get("llm", {}).get("mode") == "live"
+        if live and "AI 已生成" not in toast:
             raise Fail(f"提示说的是本地规则而不是模型：{toast}")
+        if not live and "本地规则" not in toast:
+            raise Fail(f"离线时没有如实说明这是本地规则生成的：{toast}")
         if not subject and "学科" not in toast:
             raise Fail(f"模型没给学科，提示却仍然只说生成了标题与主题：{toast}")
         bot.shot("04-suggest")
@@ -633,22 +654,32 @@ def main():
     step("顺着建议打开第一个单元", s08_open_unit)
 
     def s09_mnemonic():
-        if not bot.evaluate("!!document.querySelector('[data-mnemonic-ai]')"):
+        live = api("/api/health").get("llm", {}).get("mode") == "live"
+        has_ai = bool(bot.evaluate("!!document.querySelector('[data-mnemonic-ai]')"))
+        if live and not has_ai:
             raise Fail("AI 开着却没有「AI 编口诀」按钮")
-        bot.click("[data-mnemonic-ai]")
-        if not bot.wait("#mnemonic-ai [data-mnemonic-fill]", 240):
-            raise Fail(f"口诀 240 秒没出结果，框里是：{bot.text_of('#mnemonic-ai')[:80]!r}")
-        box = bot.text_of("#mnemonic-ai")
-        if len(box) < 10:
-            raise Fail(f"口诀框是空的：{box!r}")
-        bot.click("[data-mnemonic-fill]")
+        if not live and has_ai:
+            raise Fail("没配模型却给了「AI 编口诀」按钮（点了必然失败）")
+        if live:
+            bot.click("[data-mnemonic-ai]")
+            if not bot.wait("#mnemonic-ai [data-mnemonic-fill]", 240):
+                raise Fail(f"口诀 240 秒没出结果，框里是：{bot.text_of('#mnemonic-ai')[:80]!r}")
+            box = bot.text_of("#mnemonic-ai")
+            if len(box) < 10:
+                raise Fail(f"口诀框是空的：{box!r}")
+            bot.click("[data-mnemonic-fill]")
+            how = f"模型口诀「{box[:24]}…」已填进速记"
+        else:
+            # 离线时真人就是自己写一句线索：这一步仍然要跑通"速记能存、能出现在复习卡上"
+            bot.type("#note-mnemonic", "探针到期就先合上书讲一遍，讲不出就是没烧开", paste=True)
+            how = "离线自己写的速记"
         filled = bot.value("#note-mnemonic") or ""
         if len(filled) < 6:
             raise Fail("填进速记后文本框还是空的")
         bot.click('[data-save-note="mnemonic"]')
         toast = bot.last_toast_matching("已保存", timeout=30) or bot.toast()
         bot.shot("09-mnemonic")
-        return f"模型口诀「{box[:24]}…」已填进速记并保存（{toast[:24]}）"
+        return f"{how}并保存（{toast[:24]}）"
 
     step("生成口诀、填进速记并保存", s09_mnemonic)
 
@@ -666,8 +697,10 @@ def main():
         if not shown:
             raise Fail("选中文字后浮条没有出现（重选两次仍然不出现）")
         actions = bot.evaluate("document.querySelectorAll('.selection-menu [data-sel]').length") or 0
-        if actions < 4:
-            raise Fail(f"浮条只有 {actions} 个动作")
+        live = api("/api/health").get("llm", {}).get("mode") == "live"
+        # 没配模型时「做卡片 / 问 AI」本来就不出现，只剩存灵感与复制：按模式分别要求
+        if actions < (4 if live else 2):
+            raise Fail(f"浮条只有 {actions} 个动作（当前模式 {'live' if live else 'demo'}）")
         # 真人会犹豫一下再点：这一步同时验证面板不会被 mousedown 抢关
         bot.think(1.0, 1.8)
         bot.click('[data-sel="note"]')
@@ -830,7 +863,18 @@ def main():
 
     def s18_insights():
         bot.goto(APP + "/#/insights", wait_for="#insight-ai-card", timeout=30)
-        if not bot.evaluate("!!document.querySelector('#insight-ai-btn')"):
+        mode = api("/api/health").get("llm", {}).get("mode", "demo")
+        has_btn = bool(bot.evaluate("!!document.querySelector('#insight-ai-btn')"))
+        if mode != "live":
+            # 没配模型时这个入口本来就该收起来；给出来才是缺陷（点了必然失败）
+            if has_btn:
+                raise Fail("没配模型却给了「生成解读」按钮")
+            body = bot.text_of("#insight-ai-body")
+            if "模型" not in body:
+                raise Fail(f"离线时洞察页没有解释为什么不能生成解读：{body[:60]!r}")
+            bot.shot("18-insights")
+            return f"离线（{mode}）：入口按设计收起，页面写明了原因"
+        if not has_btn:
             raise Fail("AI 开着却没有生成解读按钮")
         bot.click("#insight-ai-btn")
         if not bot.wait("#insight-ai-body .badge-teal", 240):

@@ -98,16 +98,16 @@ export async function render(el, ctx, params) {
             <div class="mt-2">${providerChips(cfg.providers || [])}</div>
           </div>
           <div class="form-grid mt-4">
-            <div class="field full"><label>Base URL</label><input class="input" id="llm-base" value="${escapeAttr(cfg.base_url || "")}" placeholder="https://api.openai.com/v1"></div>
-            <div class="field full"><label>API Key</label><input class="input" id="llm-key" type="password" autocomplete="off" placeholder="${cfg.api_key_set ? `已保存 ${escapeHTML(cfg.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">密钥写入 data/llm.json（0600），不会返回给浏览器，也不会进入导出包。</span></div>
-            <div class="field"><label>模型</label><input class="input" id="llm-model" value="${escapeAttr(cfg.model || "")}" placeholder="gpt-4o-mini"></div>
-            <div class="field"><label>深度模型（苏格拉底/费曼）</label><input class="input" id="llm-deep" value="${escapeAttr(cfg.deep_model || "")}" placeholder="留空则与模型相同"></div>
-            <div class="field"><label>认证头名称</label><input class="input" id="llm-auth-header" value="${escapeAttr(cfg.auth_header || "Authorization")}" placeholder="Authorization"><span class="hint">Dots 使用 <code>api-key</code>。</span></div>
-            <div class="field"><label>认证前缀</label><input class="input" id="llm-auth-prefix" value="${escapeAttr(cfg.auth_prefix ?? "Bearer ")}" placeholder="Bearer "><span class="hint">OpenAI 为 <code>Bearer </code>（含空格）；Dots 留空。</span></div>
-            <div class="field"><label>温度 <span id="temp-label">${cfg.temperature}</span></label><input class="slider" id="llm-temp" type="range" min="0" max="1.5" step="0.1" value="${cfg.temperature}"></div>
-            <div class="field"><label>最大输出 tokens（可选）</label><input class="input" id="llm-tokens" type="number" min="64" max="32000" value="${cfg.max_tokens || ""}" placeholder="留空由服务端决定"></div>
-            <div class="field"><label>超时（秒）</label><input class="input" id="llm-timeout" type="number" min="10" max="600" value="${cfg.timeout || 120}"></div>
-            <div class="field full"><label>高级请求参数 JSON（可选）</label><textarea class="textarea" id="llm-extra" placeholder='{}'>${escapeHTML(JSON.stringify(cfg.extra_body || {}, null, 2))}</textarea><span class="hint">会合并进请求体。Dots 可设置 <code>{"chat_template_kwargs":{"enable_thinking":true}}</code> 开启深度思考；默认预设关闭以降低延迟。</span></div>
+            <div class="field full"><label for="llm-base">Base URL</label><input class="input" id="llm-base" value="${escapeAttr(cfg.base_url || "")}" placeholder="https://api.openai.com/v1"></div>
+            <div class="field full"><label for="llm-key">API Key</label><input class="input" id="llm-key" type="password" autocomplete="off" placeholder="${cfg.api_key_set ? `已保存 ${escapeHTML(cfg.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">密钥写入 data/llm.json（0600），不会返回给浏览器，也不会进入导出包。</span></div>
+            <div class="field"><label for="llm-model">模型</label><input class="input" id="llm-model" value="${escapeAttr(cfg.model || "")}" placeholder="gpt-4o-mini"></div>
+            <div class="field"><label for="llm-deep">深度模型（苏格拉底/费曼）</label><input class="input" id="llm-deep" value="${escapeAttr(cfg.deep_model || "")}" placeholder="留空则与模型相同"></div>
+            <div class="field"><label for="llm-auth-header">认证头名称</label><input class="input" id="llm-auth-header" value="${escapeAttr(cfg.auth_header || "Authorization")}" placeholder="Authorization"><span class="hint">Dots 使用 <code>api-key</code>。</span></div>
+            <div class="field"><label for="llm-auth-prefix">认证前缀</label><input class="input" id="llm-auth-prefix" value="${escapeAttr(cfg.auth_prefix ?? "Bearer ")}" placeholder="Bearer "><span class="hint">OpenAI 为 <code>Bearer </code>（含空格）；Dots 留空。</span></div>
+            <div class="field"><label for="llm-temp">温度 <span id="temp-label">${cfg.temperature}</span></label><input class="slider" id="llm-temp" type="range" min="0" max="1.5" step="0.1" value="${cfg.temperature}"></div>
+            <div class="field"><label for="llm-tokens">最大输出 tokens（可选）</label><input class="input" id="llm-tokens" type="number" min="64" max="32000" value="${cfg.max_tokens || ""}" placeholder="留空由服务端决定"></div>
+            <div class="field"><label for="llm-timeout">超时（秒）</label><input class="input" id="llm-timeout" type="number" min="10" max="600" value="${cfg.timeout || 120}"></div>
+            <div class="field full"><label for="llm-extra">高级请求参数 JSON（可选）</label><textarea class="textarea" id="llm-extra" placeholder='{}'>${escapeHTML(JSON.stringify(cfg.extra_body || {}, null, 2))}</textarea><span class="hint">会合并进请求体。Dots 可设置 <code>{"chat_template_kwargs":{"enable_thinking":true}}</code> 开启深度思考；默认预设关闭以降低延迟。</span></div>
           </div>
           <div class="field full mt-3 cache-row">
             <label class="cache-toggle">
@@ -139,10 +139,10 @@ export async function render(el, ctx, params) {
           ${emb.last_error ? `<div class="error-box"><strong>上次 Embedding 调用失败：</strong>${escapeHTML(emb.last_error)}</div>` : ""}
           <div class="callout teal mt-3" style="font-size:11px">推荐：硅基流动 <code>BAAI/bge-m3</code>（1024 维，中文效果好）。不配置也能用；失败会自动回退本地，并在上方显示原因。</div>
           <div class="form-grid mt-3">
-            <div class="field full"><label>Embedding Base URL</label><input class="input" id="emb-base" value="${escapeAttr(emb.base_url || "")}" placeholder="https://api.siliconflow.cn/v1"></div>
-            <div class="field"><label>Embedding 模型</label><input class="input" id="emb-model" value="${escapeAttr(emb.model || "")}" placeholder="BAAI/bge-m3"></div>
-            <div class="field"><label>Embedding API Key</label><input class="input" id="emb-key" type="password" autocomplete="off" placeholder="${emb.api_key_set ? `已保存 ${escapeHTML(emb.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">单独保存在 data/embedding.json（0600），不会进入前端/导出/仓库。</span></div>
-            <div class="field"><label>超时（秒）</label><input class="input" id="emb-timeout" type="number" min="5" max="120" value="${emb.timeout || 30}"></div>
+            <div class="field full"><label for="emb-base">Embedding Base URL</label><input class="input" id="emb-base" value="${escapeAttr(emb.base_url || "")}" placeholder="https://api.siliconflow.cn/v1"></div>
+            <div class="field"><label for="emb-model">Embedding 模型</label><input class="input" id="emb-model" value="${escapeAttr(emb.model || "")}" placeholder="BAAI/bge-m3"></div>
+            <div class="field"><label for="emb-key">Embedding API Key</label><input class="input" id="emb-key" type="password" autocomplete="off" placeholder="${emb.api_key_set ? `已保存 ${escapeHTML(emb.api_key_masked)} · 留空保持不变` : "sk-..."}"><span class="hint">单独保存在 data/embedding.json（0600），不会进入前端/导出/仓库。</span></div>
+            <div class="field"><label for="emb-timeout">超时（秒）</label><input class="input" id="emb-timeout" type="number" min="5" max="120" value="${emb.timeout || 30}"></div>
           </div>
           <div class="row mt-3" style="flex-wrap:wrap">
             <button class="btn btn-primary" id="save-emb">${icon("check", 15)} 保存 Embedding</button>
@@ -156,9 +156,9 @@ export async function render(el, ctx, params) {
         <div class="card settings-card" id="settings-goal">
           <div class="between"><div><h3>学习契约</h3><div class="sub">修改每天可投入的时间或截止日期，系统会重排剩余路径。</div></div><span class="badge badge-ember">计划是活的</span></div>
           ${goal ? `<div class="form-grid mt-4">
-            <div class="field full"><label>当前目标</label><input class="input" id="goal-title" value="${escapeAttr(goal.title)}"></div>
-            <div class="field"><label>每天可投入 <strong id="goal-minutes-label">${goal.daily_minutes} 分钟</strong></label><input class="slider" id="goal-minutes" type="range" min="15" max="120" step="5" value="${goal.daily_minutes}"></div>
-            <div class="field"><label>截止日期</label><input class="input" id="goal-deadline" type="date" value="${escapeAttr(goal.deadline || "")}"></div>
+            <div class="field full"><label for="goal-title">当前目标</label><input class="input" id="goal-title" value="${escapeAttr(goal.title)}"></div>
+            <div class="field"><label for="goal-minutes">每天可投入 <strong id="goal-minutes-label">${goal.daily_minutes} 分钟</strong></label><input class="slider" id="goal-minutes" type="range" min="15" max="120" step="5" value="${goal.daily_minutes}"></div>
+            <div class="field"><label for="goal-deadline">截止日期</label><input class="input" id="goal-deadline" type="date" value="${escapeAttr(goal.deadline || "")}"></div>
             <div class="field full"><span class="hint">重排只针对尚未烧开的单元；已烧开的单元不会回到新学队列，但仍会按 FSRS 安排复习。</span></div>
           </div>
           <div class="row mt-3">

@@ -16,6 +16,26 @@ Boil v1 是**单用户、本地优先**的学习工具，不是多租户 SaaS。
 - 所有响应带 CSP（`script-src 'self'`）、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy` 与 `X-Content-Type-Options: nosniff`；前端无内联脚本。
 - SQL 全部参数化。
 
+### 1.1 传输层的输入边界（`tests/test_security.py`，31 项）
+
+这些不是"看起来安全"，而是每条都有攻击用例盯着：
+
+| 边界 | 行为 | 攻击面 |
+| --- | --- | --- |
+| 静态目录 | `resolve()` 后必须仍在 `static/` 内；越界 403，含 `\x00` 的畸形路径 400 | 目录穿越、把源码/`data/` 发出去 |
+| 请求体 | 只接受带 `Content-Length` 的 JSON 对象；负数/非数字 400，超限 413，`Transfer-Encoding` 411 并断链 | 请求走私、把后续字节当下一个请求 |
+| JSON 形状 | 非法 JSON → 400 `bad_json`；合法但不是对象（`null`/数组/字符串）→ 400 | 让 handler 拿到预期外的类型后 500 |
+| 错误返回 | 一律 `{ok:false,error:{code,message,detail}}`；线程内异常不再逃到 socket | 崩溃断链＝用户只看到"网络错误" |
+| 跨域 | 从不返回任何 `Access-Control-Allow-*`；预检拿不到授权 | 别的网页借你的浏览器写本机配置/读学习数据 |
+| 表单式 POST | `application/x-www-form-urlencoded` 解析不成 JSON → 400，配置不变 | 经典 CSRF |
+| 动词条 | 只有 GET/POST/OPTIONS/HEAD；PUT/PATCH/DELETE 不存在，破坏性操作走 POST + 确认词 | 绕过确认闸门 |
+| 令牌 | 设了 `BOIL_TOKEN` 后 `/api/*` 全部要 `Bearer` 或 `X-Boil-Token`；大小写、多余空格、少一个字符都 401 | 弱校验 |
+| 连接 | 30 秒读写超时 + accept 队列 128 | 声明大 body 却不发送＝逐个耗光线程 |
+
+前端侧的"渲染不执行"由 `tools/audit_frontend.py` 在真浏览器里验证：把 `<img onerror>`、`<svg onload>`、
+`<script>`、`javascript:` 链接种进笔记并逐页渲染，断言 `window.__boilXssFired` 不变、DOM 里没有注入产物，
+并实测内联脚本与跨源脚本都被 CSP 挡掉。
+
 ## 2. 远程访问
 
 如果必须远程访问：
@@ -70,6 +90,8 @@ python3 run.py
 - 没有对模型输出做完整的内容安全过滤；不要把它当作高风险决策系统。
 - CSP 使用 `'unsafe-inline'` 允许内联样式（前端大量使用 style 属性）；如需更严格策略，应改为 nonce/哈希并移除内联样式。
 - 单文件 SQLite 适合单用户；高并发多用户需要迁移到 Postgres。
+- 写操作串行化在一把进程内写锁上（评分、撤销、重置、导入都在事务里跑）：同一个 Boil 进程的并发点击是安全的；
+  同时开两个 Boil 进程写同一个 `data/boil.db` 仍不保证，只有 WAL 读并发可用。
 
 ## 8. 报告漏洞
 

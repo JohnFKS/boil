@@ -502,7 +502,7 @@ function bindBootError() {
 
 function askToken() {
   const body = document.createElement("div");
-  body.innerHTML = `<div class="field"><label>访问令牌</label><input class="input" id="token-input" type="password" placeholder="BOIL_TOKEN" autocomplete="off"><span class="hint">服务端设置了 BOIL_TOKEN。输入后只保存在本机浏览器。</span></div>`;
+  body.innerHTML = `<div class="field"><label for="token-input">访问令牌</label><input class="input" id="token-input" type="password" placeholder="BOIL_TOKEN" autocomplete="off"><span class="hint">服务端设置了 BOIL_TOKEN。输入后只保存在本机浏览器。</span></div>`;
   const modal = openModal({
     title: "需要访问令牌",
     subtitle: "这个 Boil 实例开启了远程访问保护。",

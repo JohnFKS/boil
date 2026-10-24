@@ -75,7 +75,7 @@ export async function render(el, ctx, params) {
       <section class="hero">
         <div class="hero-copy">
           <div class="hero-kicker"><span class="line"></span> ${escapeHTML(goal.title)}</div>
-          <h1>${greeting()}。<br>今天，把哪壶水<em>烧开</em>？</h1>
+          <h2 class="hero-title">${greeting()}。<br>今天，把哪壶水<em>烧开</em>？</h2>
           <p class="hero-sub">${due > 0 ? `有 ${due} 张卡已经到期。先复习，再学新内容——这不是勤奋，是让之前的时间不作废。` : next.kind === "done" ? "这个目标已经全部烧开。你可以去洞察页复盘，或开启一个新目标。" : "今天只需要完成一个小闭环：预消化 → 苏格拉底 → 费曼 → 留下证据。"}</p>
           <div class="hero-actions">
             ${next.href ? `<a class="btn btn-primary btn-lg" href="${next.href}">${icon(next.kind === "review" ? "review" : next.kind === "feynman" ? "teach" : "play", 16)} ${escapeHTML(next.cta || "开始")}</a>` : ""}

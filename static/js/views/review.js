@@ -266,7 +266,7 @@ export async function render(el, ctx, params) {
         ${card.mnemonic ? `<div class="mt-2"><button class="hint-chip" id="mnemonic-btn">${icon("hint", 12)} 速记线索</button><div class="callout gold mt-2" id="mnemonic-box" style="display:none;text-align:left">${escapeHTML(card.mnemonic)}</div></div>` : ""}
         <div class="flashcard-divider"></div>
         <div class="recall-block mt-2">
-          <textarea class="textarea" id="recall-input" rows="3" placeholder="先不看答案，用自己的话回忆一下——写不出来正好说明这里还没懂。"></textarea>
+          <textarea class="textarea" id="recall-input" rows="3" aria-label="先用自己的话回忆一遍" placeholder="先不看答案，用自己的话回忆一下——写不出来正好说明这里还没懂。"></textarea>
           <div class="row between mt-1" style="gap:8px">
             <span class="faint tiny">评分后这份回忆会存进单元页的「回忆记录」，方便对照前后的说法</span>
             <button class="skip-recall" type="button" id="skip-recall">想跳过，直接看答案</button>
