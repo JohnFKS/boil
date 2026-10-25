@@ -318,9 +318,9 @@ Boil 不是把三个仓库塞进一个目录，而是抽取能力、重建领域
 |---|---|---|
 | **mem** | FSRS 调度、复习日志、批注/速记的产品思路、快速捕获 | `boil/srs/fsrs.py` 重写为四档 FSRS-5；`review_logs` / `cards` / `evidence` |
 | **examgen** | 五字段拆解、本质匹配、模板树、三道质检、内容寻址缓存 | `content/packs/math-calculus-ch5.json` + `tools/import_examgen.py`；Pack 规范 |
-| **testlearnweb** | SSE 流式、skill 加载、记忆分层、引用、检索、错误可见性纪律 | 重写为 `boil/socratic.py`、`boil/feynman.py`、`boil/llm.py`、SPA 运行时 |
+| **testlearn**（仓库 `testlearnweb`） | SSE 流式、skill 加载、记忆分层、引用、检索、错误可见性纪律 | 重写为 `boil/socratic.py`、`boil/feynman.py`、`boil/llm.py`、SPA 运行时 |
 
-**没有继承**：testlearnweb 的第三方前端构建产物、zeroflow 接口契约、双 SRS、文件型 JSON 主存储、无鉴权默认。
+**没有继承**：testlearn 的第三方前端构建产物与接口契约、双 SRS、文件型 JSON 主存储、无鉴权默认。
 前端从零重写；内容包只包含作者生成的模板结构，不包含 `date1/` 原始教辅。
 
 合并后的统一契约：
@@ -649,7 +649,7 @@ Boil 的设计受以下公开研究与实践影响（不声称本产品已被证
 
 ## 致谢
 
-- **mem**、**examgen**、**testlearnweb**：作者 JohnFKS 的三个原创项目，Boil 的能力来源与合并基础。
+- **mem**、**examgen**、**testlearn**：作者 JohnFKS 的三个原创项目，Boil 的能力来源与合并基础。
 - **FSRS / open-spaced-repetition**：间隔重复算法与公开研究。
 - **KaTeX**：本地化的数学渲染（MIT，许可证见 `static/vendor/katex/LICENSE`）。
 - **学神模型解说稿**：学习力内容包的思想来源；Boil 将其重写为可教学单元与探针。
