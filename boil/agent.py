@@ -63,7 +63,7 @@ CAPABILITIES: tuple[dict[str, Any], ...] = (
      "risk": "read", "args": {}, "desc": "读疑似重复的单元对（带字面/语义两条证据）"},
     # —— 去：只改前端路由/焦点，不动数据 ——
     {"id": "go.route", "kind": "ui", "action": "navigate", "risk": "read",
-     "args": {"route": "route"}, "desc": "把用户带到某个页面（today/map/review/library/insights/notes/settings）"},
+     "args": {"route": "route"}, "desc": "把用户带到某个页面（today/map/review/sprint/library/insights/notes/settings）"},
     {"id": "go.unit", "kind": "ui", "action": "open_unit", "risk": "read",
      "args": {"unit_id": "str"}, "desc": "打开一个知识单元的页面"},
     {"id": "go.search", "kind": "ui", "action": "open_search", "risk": "read",
@@ -107,6 +107,7 @@ CAPABILITIES: tuple[dict[str, Any], ...] = (
 BY_ID = {c["id"]: c for c in CAPABILITIES}
 
 ROUTES = {"today": "#/dashboard", "dashboard": "#/dashboard", "map": "#/map", "review": "#/review",
+          "sprint": "#/sprint", "冲刺": "#/sprint",
           "library": "#/library", "insights": "#/insights", "notes": "#/notes",
           "settings": "#/settings", "onboarding": "#/onboarding"}
 RATINGS = {1, 2, 3, 4}

@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, decompose
 from .db import Database, json_loads
 from .events import emit
 from .utils import new_id, now_iso, read_json, safe_div, slugify
@@ -103,15 +103,28 @@ def pack_quality(pack: dict[str, Any]) -> dict[str, Any]:
                 ready.append(t)
     dag_ok = seen == len(ids)
     atomic_rate = atomic / total
-    coverage = covered / total
-    score = round((atomic_rate * 0.5 + coverage * 0.4 + (1.0 if dag_ok else 0.0) * 0.1), 4)
+    probe_rate = covered / total
+    score = round((atomic_rate * 0.5 + probe_rate * 0.4 + (1.0 if dag_ok else 0.0) * 0.1), 4)
+    tables = pack.get("sections") or []
+    # 没有小节清单（第三方包、旧包）时不报"全覆盖"：那是"不知道"，不是"没问题"
+    grounding = decompose.grounding(units) if tables or any(
+        (u.get("source_ref") or {}).get("anchor") for u in units) else None
+    kind_hist = {}
+    for u in units:
+        k = str(u.get("point_kind") or "")
+        if k:
+            kind_hist[k] = kind_hist.get(k, 0) + 1
     return {
         "atomic_rate": round(atomic_rate, 4),
-        "probe_coverage": round(coverage, 4),
+        "probe_coverage": round(probe_rate, 4),
         "dag_ok": dag_ok,
         "score": score,
         "atomic_units": atomic,
         "total_units": total,
+        "coverage": decompose.coverage(tables, units) if tables else None,
+        "grounding": grounding,
+        "kinds": kind_hist,
+        "kind_gaps": [k for k in decompose.UNIT_KINDS if k not in kind_hist],
         "issues": issues[:6],
     }
 
@@ -355,6 +368,7 @@ def install_pack(db: Database, user_id: str, goal_id: str, pack: dict[str, Any])
                 "estimated_minutes": int(raw.get("estimated_minutes") or 45),
                 "order_index": int(raw.get("order_index") or 0),
                 "angle": str(raw.get("angle") or ""),
+                "point_kind": str(raw.get("point_kind") or ""),
                 "source_ref_json": json.dumps(raw.get("source_ref") or {}, ensure_ascii=False),
                 "created_at": ts,
                 "updated_at": ts,
@@ -467,11 +481,13 @@ def installed_pack_ids(db: Database, goal_id: str) -> dict[str, str]:
 
 
 def find_pack(pack_id: str) -> dict[str, Any] | None:
-    for p in all_available_packs():
-        if p.get("id") == pack_id:
-            return p
-    row = None
-    return row
+    """按 id 取完整包（含 units / sections / chapters）：地图页要知道章结构与出处。"""
+    if not pack_id:
+        return None
+    for pack in all_available_packs():
+        if pack.get("id") == pack_id:
+            return pack
+    return None
 
 
 def save_user_pack(pack: dict[str, Any]) -> Path:

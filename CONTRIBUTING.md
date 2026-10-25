@@ -11,6 +11,22 @@ make check && make check-js      # Python 编译 + 前端模块语法
 python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 ```
 
+## 验收阶梯（改到哪一层，就要跑到哪一层）
+
+| 层次 | 命令 | 它证明什么 |
+| --- | --- | --- |
+| 语法与单元 | `make check` | 逻辑、FSRS、编译、检索、契约 |
+| HTTP 契约 | `make check`（含 `tests/test_api.py`） | 状态码、`{ok,data}` 形状、错误码 |
+| 安全 | `python3 -m unittest tests.test_security` | 穿越、鉴权、请求体、跨站、密钥不外泄 |
+| 韧性 | `python3 -m unittest tests.test_resilience` | 并发写、坏配置、死上游、掐流、重复重置 |
+| 渲染 | `python3 tools/browser_check.py` | 真浏览器里没有控制台错误、关键控件点得着 |
+| 真人节奏 | `python3 tools/human_journey.py` | 从头学一遍会不会卡住；错题本/速背/自测卷走完 |
+| 无障碍与视口 | `python3 tools/audit_frontend.py` | 9 路由 × 3 视口 × 2 主题 + 键盘 + 浏览器里的 XSS/CSP |
+| 性能 | `python3 tools/perf_probe.py` | 热端点 p50/p95、并发吞吐、静态体积（`reports/perf.json`） |
+
+浏览器类工具都需要一个已运行的实例：`BOIL_APP=http://127.0.0.1:7861 BOIL_DATA_DIR=/tmp/... python3 tools/...`，
+**别拿真实 `data/` 当测试目录**（历史上两次事故都是测试写坏了 `data/llm.json`）。
+
 ## 最重要的规则
 
 1. **不静默失败。** 模型/网络/Pack 校验/导入失败必须让用户看见。
@@ -33,7 +49,7 @@ python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 - 前端使用原生 ES modules 与自研 CSS；不引入构建链。
 - 用户内容必须转义；链接协议白名单。
 - 新增 API 需补 `API.md` 与 `tests/`。
-- 新增页面需通过 `tools/browser_check.py` 的渲染与控制台检查。
+- 新增页面需通过 `tools/browser_check.py` 的渲染与控制台检查，并把该页加进 `tools/audit_frontend.py` 的路由表（视口 × 主题 × 键盘）。
 
 ## 提交
 

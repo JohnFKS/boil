@@ -10,3 +10,5 @@ data/
 *.log
 .DS_Store
 reports/
+core.*
+hs_err_pid*.log

@@ -103,6 +103,14 @@ export const kindMeta = {
   contrast: { label: "对比", className: "contrast" },
 };
 
+export const pointKindMeta = {
+  concept: { label: "概念" },
+  principle: { label: "原理" },
+  procedure: { label: "方法" },
+  fact: { label: "事实" },
+  meta: { label: "策略" },
+};
+
 export function eventMeta(event) {
   const type = event?.type || "";
   const map = {

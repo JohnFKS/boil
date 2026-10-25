@@ -95,7 +95,8 @@ function edgePath(a, b) {
 function nodeHTML(n, p) {
   const st = statusMeta[n.status] || statusMeta.new;
   const mastery = Math.round((n.mastery || 0) * 100);
-  return `<g class="map-node-wrap" data-id="${escapeAttr(n.id)}" data-status="${escapeAttr(n.status)}">
+  const kindLabel = { concept: "概念", principle: "原理", procedure: "方法", fact: "事实", meta: "策略" }[n.point_kind] || "";
+  return `<g class="map-node-wrap" data-id="${escapeAttr(n.id)}" data-status="${escapeAttr(n.status)}" data-section="${escapeAttr(String(n.section || "").split("#")[0])}">
     <foreignObject x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}">
       <div xmlns="http://www.w3.org/1999/xhtml" class="map-node-card ${st.className}">
         <div class="node-top">
@@ -104,16 +105,56 @@ function nodeHTML(n, p) {
         </div>
         <div class="node-bottom">
           <span class="node-bar"><i style="width:${mastery}%;background:${st.color}"></i></span>
-          <span style="font-size:9px;color:var(--faint)">${n.due_count ? `${n.due_count} 待复习` : st.label}</span>
+          <span style="font-size:9px;color:var(--faint)">${n.due_count ? `${n.due_count} 待复习` : (kindLabel || st.label)}</span>
         </div>
       </div>
     </foreignObject>
   </g>`;
 }
 
+const KIND_GAP_LABEL = {
+  concept: "概念", principle: "原理", procedure: "方法/步骤", fact: "事实/参数", meta: "学习策略",
+};
+
+function structureCard(block) {
+  const cov = block.coverage, ground = block.grounding;
+  const sections = block.sections || [];
+  const chapters = block.chapters || [];
+  const gaps = block.kind_gaps || [];
+  const charCount = (ids) => sections.filter(s => ids.has(s.id))
+    .reduce((n, s) => n + (Number(s.chars) || 0), 0);
+  const chapterRows = chapters.map((ch) => {
+    const ids = new Set(ch.section_ids || []);
+    return `<button type="button" class="chapter-row" data-sections="${escapeAttr([...ids].join(","))}">
+      <span class="chapter-title">${escapeHTML(truncate(ch.title || "未命名章", 20))}</span>
+      <span class="faint tiny">${ids.size} 节 · ${charCount(ids).toLocaleString()} 字${ch.engine === "order" ? " · 按顺序分章" : ""}</span>
+    </button>`;
+  }).join("");
+  return `<div class="card map-side-card">
+    <div class="between"><span class="side-label">拆解体检</span>
+      ${block.coverage_mode ? `<span class="badge badge-muted">覆盖档 ${block.coverage_mode === "full" ? "高" : "标准"}</span>` : ""}</div>
+    <div class="facet-row"><span class="muted">材料覆盖</span><span>${cov ? pct(cov.ratio) : "—"}</span>
+      <span class="faint tiny">${cov ? `${cov.covered}/${cov.sections} 节` : "没有小节登记表"}</span></div>
+    <div class="facet-row"><span class="muted">能指回原文</span><span>${ground ? pct(ground.rate) : "—"}</span>
+      <span class="faint tiny">${ground ? `${ground.verified}/${ground.total} 条` : ""}</span></div>
+    <div class="facet-row"><span class="muted">分层</span><span>${chapters.length ? `${chapters.length} 章` : "单层"}</span>
+      <span class="faint tiny">${sections.length} 节</span></div>
+    ${cov && cov.missing?.length ? `<details class="mt-2">
+      <summary class="tiny">还有 ${cov.missing.length} 节没被拆出知识点</summary>
+      <ul class="missing-list">${cov.missing.slice(0, 8).map(m => `<li><code>${escapeHTML(m.id)}</code> ${escapeHTML(truncate(m.title || "", 22))} <span class="faint">${(m.chars || 0).toLocaleString()} 字</span></li>`).join("")}</ul>
+      ${cov.missing.length > 8 ? `<p class="faint tiny">其余 ${cov.missing.length - 8} 节未列出。</p>` : ""}
+      <p class="faint tiny">没覆盖不等于讲得差，只是这部分材料还没进你的计划；把覆盖档调到「高」再编译一次通常能补上。</p>
+    </details>` : ""}
+    ${gaps.length ? `<p class="faint tiny mt-2">这份拆解没出过的类型：${gaps.map(g => escapeHTML(KIND_GAP_LABEL[g] || g)).join("、")}。类型越全，练到的问法才越接近考卷 —— 只有概念时，"为什么"和"怎么做"仍没练过。</p>` : ""}
+    ${(block.lint || []).length ? `<p class="faint tiny mt-2">质检提示：${(block.lint || []).map(escapeHTML).join("、")}</p>` : ""}
+    ${chapters.length > 1 ? `<div class="divider"></div>${chapterRows}` : ""}
+  </div>`;
+}
+
 function defaultSide(data) {
   const goal = data.goal || {};
   const s = data.summary || {};
+  const structure = (data.structure || []).map(structureCard).join("");
   return `<div class="card map-side-card">
     <div class="side-label">当前目标</div>
     <div class="map-side-title">${escapeHTML(goal.title || "")}</div>
@@ -126,6 +167,7 @@ function defaultSide(data) {
     <div class="divider"></div>
     <div class="map-tip">滚轮缩放 · 拖拽平移 · 点击节点查看</div>
   </div>
+  ${structure}
   <div class="card map-side-card">
     <div class="side-label">怎么用这张图</div>
     <div class="rule-list">
@@ -172,14 +214,20 @@ function dupRow(d, i) {
       </div>`;
 }
 
-function nodeSide(n) {
+function nodeSide(n, secTitles) {
   const st = statusMeta[n.status] || statusMeta.new;
   const facets = n.facets || {};
   const labels = { recall: "回忆", explain: "解释", apply: "应用", transfer: "迁移" };
+  const kindLabel = { concept: "概念", principle: "原理", procedure: "方法", fact: "事实", meta: "策略" }[n.point_kind];
+  const section = n.section ? String(n.section).split("#")[0] : "";
   return `<div class="card map-side-card">
     <div class="between"><span class="badge ${n.status === "boiled" ? "badge-teal" : n.status === "rusting" ? "badge-ember" : n.status === "learning" ? "badge-gold" : "badge-muted"}">${st.label}</span><span class="faint tiny">T ${Math.round(n.heat || 0)}° · ${n.due_count ? `${n.due_count} 张待复习` : `${n.estimated_minutes || 45} 分钟`}</span></div>
     <div class="map-side-title mt-3">${escapeHTML(n.title)}</div>
     <div class="map-side-essence">${escapeHTML(n.essence || "")}</div>
+    ${kindLabel || section ? `<div class="node-kind-row mt-2">
+      ${kindLabel ? `<span class="badge badge-violet">${kindLabel}</span>` : ""}
+      ${section ? `<span class="faint tiny">出自 <code>${escapeHTML(section)}</code> ${escapeHTML(secTitles?.[section] || "")}</span>` : `<span class="badge badge-muted">无登记表</span>`}
+    </div>` : ""}
     ${n.tags?.length ? `<div class="chip-row mt-3">${n.tags.slice(0, 4).map(t => `<span class="tag">${escapeHTML(t)}</span>`).join("")}</div>` : ""}
     <div class="divider"></div>
     ${Object.keys(labels).map(k => `<div class="facet-row"><span class="muted">${labels[k]}</span><span class="facet-bar"><i style="width:${Math.round((facets[k]?.score || 0) * 100)}%"></i></span><span class="faint" style="text-align:right">${pct(facets[k]?.score || 0)}</span></div>`).join("")}
@@ -208,6 +256,10 @@ export async function render(el, ctx, params) {
   data.judged = (dup && dup.judged) || 0;
   const nodes = data.nodes || [];
   const edges = data.edges || [];
+  const secTitles = {};
+  for (const block of data.structure || []) {
+    for (const s of block.sections || []) secTitles[s.id] = s.title;
+  }
   if (!nodes.length) {
     el.innerHTML = `<div class="empty"><div class="empty-icon">${icon("map", 22)}</div><h3>地图还是空的</h3><p>这个目标还没有知识单元。</p><a class="btn btn-primary mt-3" href="#/library">去内容库看看</a></div>`;
     return;
@@ -276,6 +328,7 @@ export async function render(el, ctx, params) {
   let dragStart = null;
   let selectedId = null;
   let filter = "all";
+  let chapters = null;
 
   function applyView() {
     svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
@@ -299,7 +352,7 @@ export async function render(el, ctx, params) {
     selectedId = id;
     const node = nodes.find(n => n.id === id);
     if (!node) { side.innerHTML = defaultSide(data); return; }
-    side.innerHTML = nodeSide(node);
+    side.innerHTML = nodeSide(node, secTitles);
     svg.querySelectorAll(".map-node-card").forEach(card => card.classList.remove("selected"));
     svg.querySelector(`[data-id="${CSS.escape(id)}"] .map-node-card`)?.classList.add("selected");
     svg.querySelectorAll(".map-edge").forEach(edge => {
@@ -320,18 +373,38 @@ export async function render(el, ctx, params) {
   }
   function setFilter(f) {
     filter = f;
+    chapters = null;
     el.querySelectorAll("[data-filter]").forEach(b => b.classList.toggle("active", b.dataset.filter === f));
+    side.querySelectorAll("[data-sections]").forEach(b => b.classList.remove("active"));
+    applyVisibility();
+  }
+
+  function applyVisibility() {
+    const inChapter = (node) => !chapters
+      || chapters.includes((node.dataset.section || "").split("#")[0]);
+    const statusOk = (node) => filter === "all" || node.dataset.status === filter;
     svg.querySelectorAll(".map-node-wrap").forEach(node => {
-      const show = f === "all" || node.dataset.status === f;
+      const show = statusOk(node) && inChapter(node);
       node.style.opacity = show ? "1" : "0.12";
       node.style.pointerEvents = show ? "auto" : "none";
     });
+    const byId = new Map(nodes.map(n => [n.id, n]));
     svg.querySelectorAll(".map-edge").forEach(edge => {
-      const s = nodes.find(n => n.id === edge.dataset.source);
-      const t = nodes.find(n => n.id === edge.dataset.target);
-      const show = f === "all" || s?.status === f || t?.status === f;
-      edge.style.opacity = show ? (selectedId ? ".35" : ".7") : "0.05";
+      const s = byId.get(edge.dataset.source), t = byId.get(edge.dataset.target);
+      const show = !s || !t || (filter === "all" || s.status === filter || t.status === filter);
+      edge.setAttribute("opacity", show ? (selectedId ? ".35" : ".7") : "0.05");
     });
+  }
+
+  // 只看某一章：章是小节登记表给的，不是模型随口说的
+  function showChapter(btn) {
+    const ids = (btn.dataset.sections || "").split(",").filter(Boolean);
+    const same = chapters && chapters.join() === ids.join();
+    side.querySelectorAll("[data-sections]").forEach(b => b.classList.remove("active"));
+    if (same || !ids.length) { chapters = null; applyVisibility(); return; }
+    chapters = ids;
+    btn.classList.add("active");
+    applyVisibility();
   }
 
   svg.addEventListener("click", (e) => {
@@ -343,7 +416,9 @@ export async function render(el, ctx, params) {
   });
   side.addEventListener("click", (e) => {
     const soc = e.target.closest("[data-start-soc]");
-    if (soc) ctx.startSocratic(soc.dataset.startSoc);
+    if (soc) { ctx.startSocratic(soc.dataset.startSoc); return; }
+    const chap = e.target.closest("[data-sections]");
+    if (chap) showChapter(chap);
   });
   svg.addEventListener("wheel", (e) => {
     e.preventDefault();

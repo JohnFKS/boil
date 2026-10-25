@@ -24,10 +24,14 @@ function emptyHTML(ctx) {
 }
 
 export async function render(el, ctx, params) {
+  // 错题本的「重练这几张」把 id 列表放进 hash：非到期卡本来进不了队列，
+  // 但"这次错了、现在就该再看一眼"正是错题本存在的理由。
+  const practiceIds = params?.query?.get("ids") || "";
+  const practiceQuery = practiceIds ? `&ids=${encodeURIComponent(practiceIds)}` : "";
   let queue, insights = null;
   try {
     [queue, insights] = await Promise.all([
-      ctx.api.get("/api/review?limit=40"),
+      ctx.api.get(`/api/review?limit=40${practiceQuery}`),
       ctx.api.get("/api/insights").catch(() => null),
     ]);
   } catch (e) {
@@ -66,6 +70,11 @@ export async function render(el, ctx, params) {
         <span class="badge badge-teal">${stats.reviews_today || 0} 今日已复习</span>
       </div>
     </div>
+    ${queue.picked_from === "mistakes" ? `<div class="callout ember mt-2 row wrap" style="justify-content:space-between;align-items:center">
+        <span class="small">错题重练：这一轮是错题本勾上的 ${cards.length} 张，不按到期时间排。
+          ${queue.missing ? `（有 ${queue.missing} 张已经不在了）` : ""}</span>
+        <a class="badge badge-muted" href="#/sprint">回到错题本</a>
+      </div>` : ""}
     <div class="review-layout">
       <div class="review-main" id="review-main">
         <div class="review-head">
@@ -250,6 +259,35 @@ export async function render(el, ctx, params) {
     </div>`;
     slot.querySelector("[data-reload]")?.addEventListener("click", () => location.reload());
     ctx.refreshDashboard().catch(() => {});
+  }
+
+  // 手指刷卡：右滑=会（没翻面时先翻面），左滑=忘了。只认触摸指针，鼠标一律不接管 ——
+  // 桌面上拖选文字、点按钮是既有习惯，抢走就会把划词存灵感那条路堵死。
+  function bindSwipe() {
+    let start = null;
+    const reset = () => { slot.classList.remove("swiping"); slot.style.setProperty("--swipe-x", "0px"); };
+    slot.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "mouse") return;
+      if (e.target.closest("textarea, input, button, a, summary, select, .queue-item")) return;
+      start = { x: e.clientX, y: e.clientY, id: e.pointerId };
+      slot.classList.add("swiping");
+    }, { passive: true });
+    slot.addEventListener("pointermove", (e) => {
+      if (!start || e.pointerId !== start.id) return;
+      const dx = Math.max(-160, Math.min(160, e.clientX - start.x));
+      slot.style.setProperty("--swipe-x", `${dx}px`);
+    }, { passive: true });
+    const finish = (e) => {
+      if (!start || e.pointerId !== start.id) return;
+      const dx = e.clientX - start.x, dy = e.clientY - start.y;
+      start = null;
+      reset();
+      if (Math.abs(dx) < 80 || Math.abs(dy) > Math.abs(dx)) return;
+      if (!revealed) { if (dx > 0) reveal(); return; }
+      if (dx > 0) rate(3); else rate(1);
+    };
+    slot.addEventListener("pointerup", finish, { passive: true });
+    slot.addEventListener("pointercancel", () => { start = null; reset(); }, { passive: true });
   }
 
   function renderCard() {
@@ -484,5 +522,6 @@ export async function render(el, ctx, params) {
   document.addEventListener("keydown", keyHandler);
   ctx.cleanup(() => document.removeEventListener("keydown", keyHandler));
 
+  bindSwipe();
   renderCard();
 }

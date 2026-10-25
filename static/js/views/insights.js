@@ -119,7 +119,9 @@ export async function render(el, ctx, params) {
         ${cal.enough ? `<p class="faint tiny mt-2">平均预测 ${pct(cal.predicted || 0)}，实际答对 ${pct(cal.actual || 0)}；Brier ${cal.brier}（越小越准，0.25 相当于瞎猜）。只统计「复习中」的卡 —— 新卡和学习步骤里内容还在眼前，预测没有意义。当前目标保留率 ${Math.round((cal.requested_retention || 0.9) * 100)}%。</p>` : ""}
       </div>
       <div class="card chart-card">
-        <div class="section-head"><div><div class="section-title">错因分布</div><div class="section-sub">答得不好时你自己标的「哪里没对上」</div></div><span class="badge badge-muted">近 ${mistakes.sample || 0} 次复习</span></div>
+        <div class="section-head"><div><div class="section-title">错因分布</div><div class="section-sub">答得不好时你自己标的「哪里没对上」</div></div>
+          <div class="row" style="gap:8px"><span class="badge badge-muted">近 ${mistakes.sample || 0} 次复习</span>
+            <a class="badge badge-muted" href="#/sprint">打开错题本</a></div></div>
         ${mistakeTags.length ? `<div class="mistake-dist">${mistakeTags.map(t => `<div class="mistake-dist-row"><span class="mistake-dist-label">${escapeHTML(t.label)}</span><span class="mistake-dist-bar" style="width:${Math.max(4, (Number(t.count) || 0) / mistakeMax * 100)}%"></span><span class="mistake-dist-count">${t.count}</span></div>`).join("")}</div>
           <p class="faint tiny mt-2">${mistakes.tagged_reviews || 0} / ${mistakes.sample || 0} 次复习标了错因，没标的不算在内；共有 ${mistakes.missed_total || 0} 次评成「忘了」或「模糊」。</p>`
           : `<div class="empty" style="padding:22px"><div class="empty-icon">${icon("review", 20)}</div><p>还没有错因记录。复习评「忘了／模糊」时勾一个「哪里没对上」，这里才会积累。</p></div>`}

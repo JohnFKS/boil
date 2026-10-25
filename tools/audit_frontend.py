@@ -44,6 +44,7 @@ KEY_CONTROLS = {
     "insights": ["#sidebar .brand", "[data-nav=insights]", "#agent-orb"],
     "notes": ["#sidebar .brand", "[data-nav=notes]", "#agent-orb"],
     "settings": ["#sidebar .brand", "[data-nav=settings]", "#agent-orb"],
+    "sprint": ["#sidebar .brand", "[data-nav=sprint]", "#agent-orb"],
     "unit": ["#sidebar .brand", "#agent-orb"],
     "onboarding": ["#agent-orb"],          # 开课向导没有侧栏，这是设计
 }
@@ -223,13 +224,22 @@ class Audit:
         self.viewport("desktop")
         self.theme("dark")
         self.goto("#/dashboard", "#sidebar")
+        # 等页面真的静下来再走 Tab：顾问卡是异步拉数据的，走到一半重绘会把焦点元素删掉，
+        # 焦点掉回 body 之后会被误判成"绕回起点"，于是一半控件没走过就被判成不可达。
         self.evaluate("document.body.focus();window.scrollTo(0,0);")
-        stops = []
         for _ in range(40):
+            if self.evaluate("document.querySelector('#advisor-body')?.dataset.adviceReady === '1'"):
+                break
+            time.sleep(0.2)
+        time.sleep(0.8)
+        stops = []
+        closed = False
+        lost = 0
+        for _ in range(80):
             self.bot.key("Tab")
             # 用元素自己身上的记号判断"绕回起点"：按 class 当 key 会把 7 个导航链接
             # 看成同一个控件（它们没有 id），于是走 4 站就误判成死循环。
-            info = self.evaluate(
+            probe = (
                 "(()=>{const e=document.activeElement;if(!e||e===document.body)return null;"
                 "const revisit=!!e.dataset.auditSeen; e.dataset.auditSeen='1';"
                 "const r=e.getBoundingClientRect();const s=getComputedStyle(e);"
@@ -238,13 +248,25 @@ class Audit:
                 "cls:String(e.className||'').slice(0,24),"
                 "label:(e.getAttribute('aria-label')||e.textContent||e.title||'').trim().slice(0,24),"
                 "inView:r.top>=0&&r.bottom<=innerHeight+1&&r.width>0&&r.height>0,ring:ring})})()")
+            stop = None
+            for _ in range(4):
+                # 浏览器跟随焦点的滚动走的是 CSS 的 smooth 动画：刚按 Tab 就量坐标，
+                # 会量到动画起点，把"已经滚进视口"的控件报成视口外（真人看不见这个假缺陷）。
+                info = self.evaluate(probe)
+                if not info:
+                    break
+                stop = json.loads(info)
+                if stop["inView"] or stop["revisit"]:
+                    break
+                time.sleep(0.15)
             if not info:
+                lost += 1        # 焦点掉回 body：这一站没量到，不能因此判其它控件不可达
                 continue
-            stop = json.loads(info)
             key = f"{stop['tag']}#{stop['id']}.{stop['cls']}|{stop['label']}"
             if stop["revisit"]:
                 if stop["label"]:
                     stops.append({"key": key, **stop})
+                closed = True
                 break          # 回到已经走过的控件 = 焦点环闭合
             stops.append({"key": key, **stop})
         if len(stops) < 6:
@@ -255,10 +277,14 @@ class Audit:
         no_ring = [s["key"] for s in stops if not s["ring"]]
         if no_ring:
             self.fail("键盘", f"这些控件拿焦点后看不出焦点在哪（没有 outline/box-shadow）：{no_ring[:4]}")
-        self.note(f"Tab 顺序 {len(stops)} 站：{[s['label'] or s['key'] for s in stops][:8]}")
+        self.note(f"Tab 顺序 {len(stops)} 站：{[s['label'] or s['key'] for s in stops][:8]}"
+                  + (f"（焦点掉回 body {lost} 次）" if lost else ""))
         reachables = " ".join(f"{s['id']}" for s in stops)
-        if "agent-orb" not in reachables and not any("orb" in s["key"] for s in stops):
+        if closed and "agent-orb" not in reachables and not any("orb" in s["key"] for s in stops):
             self.fail("键盘", "全局助手悬浮球不能用 Tab 到达")
+        elif not closed:
+            self.fail("键盘", f"Tab 没走完一圈就停了（走到 {len(stops)} 站，掉焦点 {lost} 次）——"
+                              "这一轮的可达性结论不可信")
         # 弹窗焦点陷阱：搜索框（Ctrl/Cmd+K 或搜索按钮）开合
         opened = self.evaluate(
             "(()=>{const b=document.querySelector('#search-btn');"
@@ -426,7 +452,7 @@ def main():
     routes = {
         "dashboard": "#sidebar", "map": "#sidebar", "review": "#sidebar",
         "library": "#sidebar", "insights": "#sidebar", "notes": "#sidebar",
-        "settings": "#sidebar", "onboarding": "#onboarding-body",
+        "settings": "#sidebar", "onboarding": "#onboarding-body", "sprint": "#sprint-cram",
     }
     if unit_id:
         routes["unit/" + unit_id] = "#sidebar"

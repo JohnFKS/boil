@@ -11,6 +11,7 @@ import * as unitView from "./views/unit.js";
 import * as socraticView from "./views/socratic.js";
 import * as feynmanView from "./views/feynman.js";
 import * as reviewView from "./views/review.js";
+import * as sprintView from "./views/sprint.js";
 import * as libraryView from "./views/library.js";
 import * as insightsView from "./views/insights.js";
 import * as notesView from "./views/notes.js";
@@ -43,6 +44,7 @@ const PAGE_META = {
   socratic: { eyebrow: "SOCRATIC DIALOGUE", title: "苏格拉底对话" },
   feynman: { eyebrow: "FEYNMAN CHALLENGE", title: "费曼挑战" },
   review: { eyebrow: "SPACED REPETITION", title: "复习" },
+  sprint: { eyebrow: "EXAM SPRINT", title: "备考冲刺" },
   library: { eyebrow: "LEARNING PACKS", title: "内容库" },
   insights: { eyebrow: "LEARNING EVIDENCE", title: "洞察" },
   notes: { eyebrow: "INSPIRATION", title: "灵感库" },
@@ -124,6 +126,7 @@ function navItems() {
     { key: "dashboard", icon: "today", label: "今日" },
     { key: "map", icon: "map", label: "地图" },
     { key: "review", icon: "review", label: "复习", badge: due || null },
+    { key: "sprint", icon: "target", label: "冲刺" },
     { key: "library", icon: "library", label: "内容库" },
     { key: "insights", icon: "insights", label: "洞察" },
     { key: "notes", icon: "spark", label: "灵感库" },
@@ -323,7 +326,7 @@ async function renderRoute() {
   const view = document.getElementById("view");
   const module = {
     dashboard: dashboardView, map: mapView, unit: unitView, socratic: socraticView,
-    feynman: feynmanView, review: reviewView, library: libraryView,
+    feynman: feynmanView, review: reviewView, sprint: sprintView, library: libraryView,
     insights: insightsView, notes: notesView, settings: settingsView,
   }[name];
   if (!module) {

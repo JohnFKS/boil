@@ -512,7 +512,7 @@ class AiPathTest(TempCase):
             text = "\n\n".join(f"## 第 {i} 节\n这一节讲提取练习的第 {i} 个侧面，需要正文足够长。"
                                f"{'补充说明。' * 60}" for i in range(1, 9))
             expected_batches = len(compiler._batch_sections(
-                compiler._split_sections(text, use_embeddings=False)))
+                compiler._section_tables(compiler._split_sections(text, use_embeddings=False))))
             pack, warnings = compile_material("长材料", "学习科学", text, use_llm=True,
                                               use_embeddings=False)
         finally:
@@ -597,13 +597,16 @@ class AiPathTest(TempCase):
 
     def test_chunk_section_packs_without_losing_text(self):
         body = "\n\n".join(f"第 {i} 段：合上书用自己的话讲出本质与边界。" for i in range(1, 40))
-        pieces = compiler._chunk_section("长节", body, 120)
-        self.assertTrue(all(len(text) <= 120 for _, text in pieces),
-                        [len(t) for _, t in pieces])
-        self.assertEqual("".join(t for _, t in pieces).count("讲出本质与边界"), 39, "切开不能丢段")
+        section = {"id": "sec-1", "title": "长节", "chars": len(body), "first": "", "body": body}
+        pieces = compiler._chunk_section(section, 120)
+        self.assertTrue(all(len(p["body"]) <= 120 for p in pieces),
+                        [len(p["body"]) for p in pieces])
+        self.assertEqual("".join(p["body"] for p in pieces).count("讲出本质与边界"), 39, "切开不能丢段")
         self.assertLess(len(pieces), 15, "小块要装回预算内，不能一段一片")
-        self.assertEqual(pieces[0][0], "长节")
-        self.assertTrue(pieces[-1][0].startswith("长节（续"))
+        self.assertEqual(pieces[0]["title"], "长节")
+        self.assertEqual(pieces[0]["id"], "sec-1", "第一片要保住原小节编号，出处才指得回去")
+        self.assertTrue(pieces[-1]["id"].startswith("sec-1#"), "续片得标成同源的子编号，不然覆盖统计会以为多了几个主题")
+        self.assertTrue(pieces[-1]["title"].startswith("长节（续"))
 
     def test_bare_unit_list_response_is_accepted(self):
         """模型偶尔不按包对象回答，而是直接回一个单元数组——不该因此就退回本地编译。"""

@@ -247,20 +247,29 @@ def main():
             return call("Runtime.evaluate", {"expression": expr, "returnByValue": True,
                                              "awaitPromise": True}).get("result", {}).get("value")
 
-        def real_click(selector: str) -> bool:
+        def real_click(selector: str, report=None) -> bool:
             """派发真实鼠标事件。element.click() 不触发 mousedown，浮层的
             「点外部就关闭」这类逻辑只有真鼠标才测得到。
-            只点已经在视口里的元素：划词浮层跟着滚动会被收掉。"""
+            只点已经在视口里的元素：划词浮层跟着滚动会被收掉。
+            命中校验不能省：坐标点在视口里 ≠ 点得着那个按钮，被浮层盖住时
+            派发会"成功"而什么都没发生，测试就成了假通过。"""
             spot = evaluate(
                 "(()=>{const e=document.querySelector(%s);if(!e)return null;"
                 "const r=e.getBoundingClientRect();"
                 "if(r.width<1||r.height<1)return null;"
                 "if(r.top<0||r.bottom>window.innerHeight||r.left<0||r.right>window.innerWidth)return null;"
-                "return JSON.stringify([r.x+r.width/2,r.y+r.height/2])})()"
+                "const x=r.x+r.width/2, y=r.y+r.height/2;"
+                "const hit=document.elementFromPoint(x,y);"
+                "return JSON.stringify([x,y,!!(hit&&(hit===e||e.contains(hit)||hit.contains(e))),"
+                " hit?(hit.className||hit.tagName):''])})()"
                 % json.dumps(selector))
             if not spot:
                 return False
-            x, y = json.loads(spot)
+            x, y, landed, blocker = json.loads(spot)
+            if not landed:
+                if report is not None:
+                    report.append(f"点击被别的元素挡住了: {selector} → {blocker}")
+                return False
             for kind in ("mousePressed", "mouseReleased"):
                 call("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y,
                                                   "button": "left", "clickCount": 1})
@@ -390,8 +399,9 @@ def main():
                 errors.append(f"候选把真单元当成了被吸收方，跳过点击以免误删: {card}")
             else:
                 print(f"  dup card: {card['head']} | {card['why'][:40]}")
-                if not real_click(".dup-card .dup-row .link-btn"):
-                    errors.append("合并按钮真鼠标点不到（浮层/定位问题）")
+                blocked = []
+                if not real_click(".dup-card .dup-row .link-btn", blocked):
+                    errors.append(f"合并按钮真鼠标点不到（浮层/定位问题）{'：' + blocked[0] if blocked else ''}")
                 else:
                     time.sleep(2.2)
                     done = evaluate("(document.querySelector('.toast')||{}).textContent||''")
@@ -875,7 +885,15 @@ def main():
             "return {display:getComputedStyle(m).display, btns:m.querySelectorAll('.sel-btn').length,"
             "left:Math.round(r.left), right:Math.round(r.right), vw:innerWidth}})()")
         if not touch_menu or touch_menu.get("display") != "flex":
-            errors.append(f"触摸端浮条没有出现: {touch_menu}")
+            where = evaluate(
+                "(()=>{const el=document.querySelector('.essence-text');if(!el)return 'no essence';"
+                "const r=el.getBoundingClientRect();const x=r.x+r.width/2,y=r.y+Math.min(r.height/2,40);"
+                "const hit=document.elementFromPoint(x,y);"
+                "return JSON.stringify({rect:[Math.round(r.top),Math.round(r.bottom)],scrollY,"
+                "point:[Math.round(x),Math.round(y)],hit:hit?(hit.className||hit.tagName):'none',"
+                "popovers:[...document.querySelectorAll('.note-popover,.modal-backdrop,.toast')]"
+                ".map(n=>getComputedStyle(n).display)})})()")
+            errors.append(f"触摸端浮条没有出现: {touch_menu} {where}")
         elif touch_menu.get("right", 0) > touch_menu.get("vw", 0) + 1:
             errors.append(f"触摸端浮条超出屏幕: {touch_menu}")
         else:
@@ -990,6 +1008,61 @@ def main():
         goto("#/settings")
         wait_for(".settings-jump", "模型连接")
         shot("settings-mobile.png")
+
+        # ---------- 本地文档解析：docx 与 rtf 都在浏览器里解，没有第三方库 ----------
+        # 这类代码用 Python 断言等于没测：解压与实体解码是浏览器能力，必须真跑一遍。
+        import base64 as _b64
+        import io as _io
+        import zipfile as _zip
+        _doc = ('<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/'
+                'wordprocessingml/2006/main"><w:body>'
+                '<w:p><w:r><w:t>提取练习比重新阅读更有效</w:t></w:r></w:p>'
+                '<w:p><w:r><w:t>间隔重复对抗&amp;遗忘曲线</w:t></w:r></w:p>'
+                '<w:p><w:r><w:t>睡眠把海马体的回放交给新皮层</w:t></w:r></w:p></w:body></w:document>')
+        _buf = _io.BytesIO()
+        with _zip.ZipFile(_buf, "w", _zip.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("word/document.xml", _doc)
+        docx_b64 = _b64.b64encode(_buf.getvalue()).decode()
+        rtf_src = (r"{\rtf1\ansi\deff0 {\fonttbl{\f0 Times New Roman;}}"
+                   r"\pard 合意困难：交错练习让当下更费劲\par"
+                   r"\pard 但延后测出来的保持率更高。\par"
+                   r"\pard \u26131 好的，别丢掉 \'41 \par}")
+        parsed = evaluate(
+            "(async()=>{const D=window.__boilDocImport;if(!D)return {missing:true};"
+            "const bytes=Uint8Array.from(atob(%s),c=>c.charCodeAt(0));"
+            "const docx=await D.fileToText(new File([bytes],'讲义.docx',"
+            "{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));"
+            "const rtfBytes=Uint8Array.from(atob(%s),c=>c.charCodeAt(0));"
+            "const rtf=await D.fileToText(new File([rtfBytes],'笔记.rtf'));"
+            "let pdfErr='',docErr='';"
+            "try{await D.fileToText(new File(['%%PDF-1.4'],'a.pdf'))}catch(e){pdfErr=e.message}"
+            "try{await D.fileToText(new File(['not a zip'],'old.doc'))}catch(e){docErr=e.message}"
+            "return JSON.stringify({via:docx.via,docx:docx.text,rtf:rtf.text,pdfErr,docErr})})()"
+            % (json.dumps(docx_b64), json.dumps(_b64.b64encode(rtf_src.encode()).decode())))
+        parsed = json.loads(parsed) if isinstance(parsed, str) else (parsed or {})
+        if parsed.get("missing"):
+            errors.append("window.__boilDocImport 没暴露出来：docx/rtf 解析没被验证")
+        else:
+            body = parsed.get("docx") or ""
+            if parsed.get("via") != "docx" or "提取练习比重新阅读更有效" not in body:
+                errors.append(f"docx 正文没解出来: {body[:80]!r}")
+            if "间隔重复对抗&遗忘曲线" not in body:
+                errors.append(f"docx 的 XML 实体没还原: {body[:80]!r}")
+            if "\n\n" not in body:
+                errors.append(f"docx 段落全挤成一行: {body[:60]!r}")
+            rtf_text = parsed.get("rtf") or ""
+            if "合意困难" not in rtf_text or "保持率" not in rtf_text:
+                errors.append(f"rtf 正文没剥出来: {rtf_text[:80]!r}")
+            # \uN 后的那个空格是控制字的分隔符，会被吃掉：所以是"易好的"而不是"易 好的"
+            if "易好的" not in rtf_text or "\\rtf" in rtf_text or "deff0" in rtf_text:
+                errors.append(f"rtf 控制字/转义码没处理干净: {rtf_text[:80]!r}")
+            if "PDF" not in (parsed.get("pdfErr") or ""):
+                errors.append(f"PDF 没有诚实说明: {parsed.get('pdfErr')!r}")
+            if ".docx" not in (parsed.get("docErr") or ""):
+                errors.append(f"旧 .doc 没有诚实说明: {parsed.get('docErr')!r}")
+            else:
+                print("  doc import: docx=%d字 rtf=%d字 · pdf/doc 说明到位" % (len(body), len(rtf_text)))
 
         print("\nerrors:")
         if errors:

@@ -81,6 +81,7 @@ export async function render(el, ctx, params) {
             ${next.href ? `<a class="btn btn-primary btn-lg" href="${next.href}">${icon(next.kind === "review" ? "review" : next.kind === "feynman" ? "teach" : "play", 16)} ${escapeHTML(next.cta || "开始")}</a>` : ""}
             ${due > 0 && currentUnitId ? `<a class="btn btn-ghost btn-lg" href="#/unit/${escapeAttr(currentUnitId)}">先看一眼单元</a>` : ""}
             <a class="btn btn-ghost btn-lg" href="#/map">${icon("map", 15)} 知识地图</a>
+            ${days !== null && days <= 21 ? `<a class="btn btn-ghost btn-lg" href="#/sprint">${icon("target", 15)} 考前冲刺</a>` : ""}
           </div>
           <div class="hero-meta">
             <div class="hero-meta-item"><strong>${progress.done}/${progress.total}</strong><span>已烧开</span></div>

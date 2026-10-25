@@ -23,10 +23,12 @@ import base64
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -41,7 +43,7 @@ CHROME = os.environ.get("BOIL_CHROME", "chromium")
 OUT = ROOT / "screenshots"
 DOWNLOADS = Path(tempfile.mkdtemp(prefix="boil-journey-dl-"))
 
-MATERIAL = """# 让记忆留下来的四件事
+MATERIAL = """# 让记忆留下来的六件事
 
 ## 提取练习比重新阅读更有效
 
@@ -77,6 +79,20 @@ $$R = e^{-t/S}$$
 经历回放给新皮层，快速眼动睡眠和陈述性记忆的稳固尤其相关。熬夜复习的
 代价通常不是那两个小时少看了几页，而是之前几页白看。睡前一小时用来
 做一次轻量的自测，比在凌晨三点重读笔记有效得多。
+
+## 交错练习：先辨别题型再选方法
+
+把好几种题型打乱着练，比一种题型连做二十道更费力，也更像考试。
+连做同类题时不需要判断该用什么方法，只要照着上一步抄；交错练习逼你
+在动手之前先回答「这题属于哪一类」。辨别题型这件事本身才是考场上丢分的地方，
+而不是计算。刚开始成绩会下滑，这是正常的：下滑发生在练习里，回升发生在考场上。
+
+## 自我解释：把「为什么」说出来
+
+做完一道题不只是对答案，还要用自己的话说清每一步为什么成立。
+自我解释能把「我记住了步骤」变成「我知道它为什么这样」，后者才会在
+换了外壳的题目里被迁移过去。说不清楚的那一步就是缺口，把它单独拎出来
+再学一次，比整章重读省事得多。
 """
 
 
@@ -597,6 +613,8 @@ def main():
     step("点「AI 生成信息」", s04_suggest)
 
     def s05_compile():
+        # 覆盖档是真能拧的开关：先拧到「高覆盖」，再看它有没有被带进请求与预览
+        bot.click('[data-coverage="full"]')
         bot.click("[data-submit]")
         if not bot.wait("[data-start]", 600):
             raise Fail("编译 600 秒还没出预览")
@@ -604,12 +622,18 @@ def main():
         for needle in ("全部", "个单元", "阶段计划"):
             if needle not in text:
                 raise Fail(f"预览里没看到「{needle}」")
+        if "拆得够不够" not in text:
+            raise Fail("预览没有报出覆盖率/溯源率，用户无从判断这份拆解够不够")
+        honest = ("本地编译器未生效" in text) or ("高覆盖档" in text)
+        if not honest:
+            raise Fail("预览没说清这次到底按哪一档拆的")
         units = bot.evaluate(
             "document.querySelectorAll('.preview-unit').length") or 0
         if units < 3:
             raise Fail(f"只切出 {units} 个单元，材料白喂了")
         bot.shot("05-compile")
-        return f"模型把材料切成 {units} 个单元，预览带阶段计划"
+        return f"模型把材料切成 {units} 个单元，预览带阶段计划与拆解体检"
+
 
     step("编译材料并预览路径", s05_compile)
 
@@ -739,6 +763,57 @@ def main():
 
     step("回到页面确认引文被高亮", s11_reload_highlight)
 
+    def s11b_decomposition():
+        """拆解体检与出处：地图要知道"材料被拆到哪、哪几节没读"，单元要能指回原句。"""
+        bot.goto(APP + "/#/map", wait_for=".map-svg", timeout=40)
+        if not bot.wait_text("拆解体检", 20):
+            raise Fail("地图侧栏没有出现「拆解体检」卡")
+        card = bot.evaluate(
+            "(()=>{const c=[...document.querySelectorAll('.map-side-card')]"
+            ".find(x=>x.innerText.includes('拆解体检'));if(!c)return null;"
+            "return {text:c.innerText.replace(/\\s+/g,' '),"
+            " chapters:c.querySelectorAll('[data-sections]').length}})()")
+        text = (card or {}).get("text") or ""
+        for needle in ("材料覆盖", "能指回原文", "分层"):
+            if needle not in text:
+                raise Fail(f"体检卡缺少「{needle}」：{text[:90]!r}")
+        if not re.search(r"\d+%", text):
+            raise Fail(f"体检卡没有给出可核对的百分比：{text[:90]!r}")
+        chapters = (card or {}).get("chapters") or 0
+        picked = ""
+        if chapters:
+            before = bot.evaluate(
+                "[...document.querySelectorAll('.map-node-wrap')]"
+                ".filter(n=>n.style.opacity!=='0.12').length") or 0
+            bot.click("[data-sections]")
+            time.sleep(0.8)
+            after = bot.evaluate(
+                "[...document.querySelectorAll('.map-node-wrap')]"
+                ".filter(n=>n.style.opacity!=='0.12').length") or 0
+            if after >= before:
+                raise Fail(f"点「章」没有把其它章的节点淡下去：{before} → {after}")
+            picked = f"点一章从 {before} 个节点收到 {after} 个"
+            bot.click("[data-sections]")      # 再点一次回到全部
+            time.sleep(0.6)
+        node = (api("/api/map")["nodes"] or [{}])[0]
+        bot.goto(APP + "/#/unit/" + urllib.parse.quote(node.get("id") or ""),
+                 wait_for=".unit-main", timeout=40)
+        if not bot.wait_text("出处", 20):
+            raise Fail(f"「{node.get('title','')}」的单元页没有出处区块")
+        quote = bot.text_of(".material-quote")
+        if quote:
+            if re.sub(r"\s+", "", quote) not in re.sub(r"\s+", "", MATERIAL):
+                raise Fail(f"出处写的不是材料里的原话：{quote[:40]!r}")
+            head = f"「{quote[:18]}…」逐字对得上材料"
+        elif "没有可核对的出处" in bot.body():
+            head = "这条如实标成没有可核对的出处"
+        else:
+            raise Fail("既没给出处原句，也没承认这条没有出处")
+        bot.shot("11b-provenance")
+        return (f"体检卡给出覆盖率/溯源率/分层，{chapters} 个章可按节过滤（{picked or '单层'}）；{head}")
+
+    step("地图的拆解体检与单元的逐字出处", s11b_decomposition)
+
     def s12_review_undo():
         bot.click('a[href="#/review"]')
         if not bot.wait("#review-card-slot", 30):
@@ -768,6 +843,107 @@ def main():
         return f"「{front[:16]}…」先回忆再评分，随后撤销：{undone[:24]}（进度 {due_before} → {after[:20]}）"
 
     step("复习：先回忆、翻面、评分、再撤销", s12_review_undo)
+
+    def s12b_mistake_book():
+        """评一次「忘了」，然后要求它在错题本里出现、并能被拉回复习队列。"""
+        bot.click('a[href="#/review"]')
+        if not bot.wait("#flashcard", 20):
+            raise Fail("没有可复习的卡，错题本这一步无从开始")
+        front = bot.text_of("#flash-front")
+        bot.click("#reveal-btn")
+        bot.click('[data-tag="concept"]')
+        bot.click("[data-rate='1']")
+        if not bot.wait("#last-review", 25):
+            raise Fail("评「忘了」之后没有出现撤销条")
+        bot.click('a[href="#/sprint"]')
+        if not bot.wait("#sprint-mistakes", 30):
+            raise Fail("冲刺页没有渲染错题本区块")
+        items = bot.evaluate("document.querySelectorAll('.mistake-item').length") or 0
+        if items < 1:
+            raise Fail(f"刚错过一张卡，错题本却是空的（{items} 条）")
+        first = bot.text_of(".mistake-item .section-title")
+        tags = bot.evaluate("[...document.querySelectorAll('.mistake-item .tag_counts,"
+                             " .mistake-item .badge')].map(b=>b.innerText).join('|')") or ""
+        if "概念" not in tags:
+            raise Fail(f"错题本没带出错因：{tags!r}")
+        bot.click("[data-practice]")
+        if not bot.wait("#review-card-slot", 30):
+            raise Fail("点「重练勾上的错题」没有回到复习页")
+        banner = bot.body()
+        if "错题重练" not in banner:
+            raise Fail("按错题重练时，复习页没有说明这一轮是从错题本来的")
+        bot.shot("12b-mistakes")
+        return f"「{front[:14]}…」评成忘了 → 错题本 {items} 条 → 一键拉回复习（错因：{tags[:20]}）"
+
+    step("错过一次的卡要出现在错题本，并能拉回来重练", s12b_mistake_book)
+
+    def s12c_sprint():
+        """考前速背：斩掉一个、重列回来；再组一份限时卷子交卷判分并走一次打印。"""
+        bot.click('a[href="#/sprint"]')
+        if not bot.wait("#sprint-cram", 30):
+            raise Fail("速背区块没渲染出来")
+        countdown = bot.text_of(".sprint-head .badge")
+        before = bot.evaluate("document.querySelectorAll('.cram-item').length") or 0
+        if not before:
+            raise Fail("速背清单是空的")
+        first_unit = bot.evaluate("document.querySelector('.cram-item .section-title')?.innerText||''")
+        bot.click(".cram-item [data-shot]")
+        if not bot.wait(".sprint-head", 20):
+            raise Fail("斩掉之后页面重绘失败")
+        after = bot.evaluate("document.querySelectorAll('.cram-item').length") or 0
+        if after != before - 1:
+            raise Fail(f"斩掉一个之后清单应从 {before} 变 {before - 1}，实际 {after}")
+        bot.click("[data-cram-reset]")
+        if not bot.wait(".modal-foot .btn-primary", 12):
+            raise Fail("「全部重列」没有弹确认")
+        bot.click(".modal-foot .btn-primary")
+        if not bot.wait(".cram-item", 25):
+            raise Fail("重列之后清单没有回来")
+        restored = bot.evaluate("document.querySelectorAll('.cram-item').length") or 0
+        if restored != before:
+            raise Fail(f"重列后清单数量 {restored}，应为 {before}")
+
+        bot.evaluate("window.print=()=>{window.__printed=(window.__printed||0)+1};"
+                     "window.__printed=0")
+        bot.click("[data-exam-build]")
+        if not bot.wait(".exam-q", 40):
+            raise Fail("点「组一卷」没有出卷子")
+        total = bot.evaluate("document.querySelectorAll('.exam-q').length") or 0
+        clock = bot.text_of("#exam-clock")
+        if "剩余" not in clock:
+            raise Fail(f"卷子上没有倒计时：{clock!r}")
+        bot.type(".exam-q [data-answer]", "提取练习：合上书先把自己记得的讲出来，"
+                                         "写不出来就是缺口，这比再读三遍有用。", paste=True)
+        bot.evaluate("[...document.querySelectorAll('[data-answer]')].forEach((b,i)=>{ if(!b.value) "
+                     "b.value = '要点一：提取练习比再读更有效；要点二：间隔到快忘时复习最省力；"
+                     "要点三：输出与自测暴露缺口。'; })")
+        revealed = bot.evaluate("[...document.querySelectorAll('.exam-key')].filter(k=>!k.hidden).length")
+        if revealed:
+            raise Fail("还没点「答案速览」就已经能看到参考答案")
+        bot.click("[data-exam-reveal]")
+        if not bot.evaluate("[...document.querySelectorAll('.exam-key')].every(k=>!k.hidden)"):
+            raise Fail("答案速览点了没展开全部参考答案")
+        bot.click("[data-exam-submit]")
+        if not bot.wait("#exam-result", 60):
+            raise Fail("交卷之后没有出现判分区块")
+        verdicts = bot.evaluate("[...document.querySelectorAll('.exam-grade-row .badge')]"
+                                ".map(b=>b.innerText.trim()).join('|')") or ""
+        if not any(mark in verdicts for mark in ("✓", "△", "✗", "—")):
+            raise Fail(f"判分结果没有 ✓/△/✗ 标记：{verdicts!r}")
+        if not bot.visible("[data-print='exam']"):
+            raise Fail("判分后没有出现打印入口")
+        bot.click("[data-print='exam']")
+        printed = bot.evaluate("window.__printed") or 0
+        if not printed:
+            raise Fail("点了打印但 window.print 没被调用")
+        sheets = bot.evaluate("document.querySelectorAll('.print-sheet').length")
+        if sheets:
+            raise Fail("打印用的临时纸没有被移除")
+        bot.shot("12c-exam")
+        return (f"{countdown}｜速背 {before}→{after}→重列 {restored}；"
+                f"{total} 题卷子已判分（{verdicts[:24]}…），打印走浏览器通道")
+
+    step("考前速背与限时自测卷：斩掉、重列、组卷、交卷、打印", s12c_sprint)
 
     def s13_focus():
         bot.click("#focus-btn")

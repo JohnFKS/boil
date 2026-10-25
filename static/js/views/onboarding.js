@@ -1,5 +1,9 @@
 /* Onboarding: choose a pack or compile your own material, then create a goal. */
-import { aiFailure, aiSuccess, escapeHTML, icon, toast } from "../utils.js";
+import { aiFailure, aiSuccess, escapeHTML, icon, pct, pointKindMeta, toast } from "../utils.js";
+import { fileToText } from "../docImport.js";
+
+const KIND_LABELS = Object.fromEntries(
+  Object.entries(pointKindMeta).map(([k, v]) => [k, v.label]));
 
 const LEVELS = [
   ["beginner", "刚刚起步"],
@@ -13,8 +17,11 @@ function defaultDate(days = 56) {
   return d.toISOString().slice(0, 10);
 }
 
-const MATERIAL_EXTENSIONS = new Set(["md", "markdown", "json", "txt"]);
+const MATERIAL_EXTENSIONS = new Set(["md", "markdown", "json", "txt", "csv", "tsv", "html", "htm", "docx", "rtf"]);
+// 文本类 2MB 足够；.docx 是 zip，正文小但可能夹图，所以单独放宽到 8MB。
+// 真正卡人的是合并后的字符上限，不是字节。
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_DOCX_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_CHARS = 180000;
 const MAX_FILES = 20;
 
@@ -63,12 +70,15 @@ export async function render(el, ctx, params) {
   let files = [];
   let compileQuality = null;
   let compileWarnings = [];
+  let compileCoverage = null;
+  let compileMetrics = null;
   let draft = {
     name: ctx.state.me?.user?.name || "",
     goalTitle: "",
     materialTitle: "",
     subject: "",
     text: "",
+    coverage: "standard",
     deadline: defaultDate(),
     daily: 40,
     level: "beginner",
@@ -195,14 +205,22 @@ export async function render(el, ctx, params) {
             <div class="field"><label for="ob-subject">学科 / 主题</label><input class="input" id="ob-subject" value="${escapeHTML(materialPack?.subject || draft.subject)}" placeholder="例如：高等数学"></div>
             <div class="field full">
               <label>材料文件（可多选）</label>
-              <div class="file-drop" id="ob-drop" role="button" tabindex="0" aria-label="选择 Markdown、JSON 或 TXT 材料文件">
+              <div class="file-drop" id="ob-drop" role="button" tabindex="0" aria-label="选择材料文件（md、txt、csv、html、json、docx、rtf）">
                 <span class="file-drop-icon">${icon("upload", 18)}</span>
-                <span class="file-drop-copy"><strong>拖入或选择 .md / .json / .txt</strong><span>多份文件会合并到同一个主题；单文件不超过 2 MB</span></span>
+                <span class="file-drop-copy"><strong>拖入或选择 .md / .txt / .csv / .html / .json / .docx / .rtf</strong><span>多份文件会合并到同一个主题；文本 2 MB、docx 8 MB 以内</span></span>
                 <span class="badge badge-muted" id="ob-file-summary">${files.length ? `${files.length} 个文件` : "可多选"}</span>
-                <input type="file" id="ob-files" accept=".md,.markdown,.json,.txt" multiple hidden>
+                <input type="file" id="ob-files" accept=".md,.markdown,.json,.txt,.csv,.tsv,.html,.htm,.docx,.rtf" multiple hidden>
               </div>
               <div class="file-list" id="ob-file-list">${fileListHTML()}</div>
               <span class="hint">JSON 会按键值结构铺平成可读文本；文件与下方粘贴文本合计不超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符。</span>
+            </div>
+            <div class="field full">
+              <label>拆分粒度（覆盖档）</label>
+              <div class="choice-row">
+                <button class="choice ${draft.coverage === "standard" ? "active" : ""}" type="button" data-coverage="standard">标准 · 抓主干</button>
+                <button class="choice ${draft.coverage === "full" ? "active" : ""}" type="button" data-coverage="full">高覆盖 · 不错过可考点</button>
+              </div>
+              <span class="hint">目标分数高、离考试近时选「高覆盖」：章节标题、定义、机制、算法、典型题型与易错点都会各自成一个单元，单元更多、每天要学的时间也更长。这一档只在配置了模型时生效；演示模式按材料小节一条一节。</span>
             </div>
             <div class="field full"><label for="ob-text">材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="也可以把补充讲义、笔记或教材片段粘贴到这里。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
           ` : ""}
@@ -222,6 +240,10 @@ export async function render(el, ctx, params) {
     body.querySelectorAll("[data-level]").forEach(b => b.addEventListener("click", () => {
       draft.level = b.dataset.level;
       body.querySelectorAll("[data-level]").forEach(x => x.classList.toggle("active", x === b));
+    }));
+    body.querySelectorAll("[data-coverage]").forEach(b => b.addEventListener("click", () => {
+      draft.coverage = b.dataset.coverage;
+      body.querySelectorAll("[data-coverage]").forEach(x => x.classList.toggle("active", x === b));
     }));
     const minutes = body.querySelector("#ob-minutes");
     const minutesLabel = body.querySelector("#ob-minutes-label");
@@ -244,21 +266,25 @@ export async function render(el, ctx, params) {
           }
           const ext = fileExtension(file.name);
           if (!MATERIAL_EXTENSIONS.has(ext)) {
-            errors.push(`${file.name}：只支持 .md / .json / .txt`);
+            errors.push(`${file.name}：支持 .md / .txt / .csv / .html / .json / .docx / .rtf`);
             continue;
           }
-          if (file.size > MAX_FILE_BYTES) {
-            errors.push(`${file.name}：超过 2 MB`);
+          const cap = (ext === "docx" || ext === "rtf") ? MAX_DOCX_BYTES : MAX_FILE_BYTES;
+          if (file.size > cap) {
+            errors.push(`${file.name}：超过 ${(cap / 1024 / 1024).toFixed(0)} MB`);
             continue;
           }
           try {
-            let content = await file.text();
+            let content = "";
             if (ext === "json") {
               try {
-                content = flattenJSON(JSON.parse(content));
+                content = flattenJSON(JSON.parse(await file.text()));
               } catch {
                 throw new Error("JSON 解析失败");
               }
+            } else {
+              // docx 是 zip+xml、rtf 是控制字文本，都在浏览器本地解析，不上传任何地方
+              content = (await fileToText(file)).text;
             }
             content = content.replace(/\r\n?/g, "\n").trim();
             if (!content) throw new Error("文件为空");
@@ -417,10 +443,13 @@ export async function render(el, ctx, params) {
           draft = { ...draft, materialTitle, subject, text: pasted };
           const res = await ctx.api.post("/api/packs/compile", {
             title: materialTitle, subject: subject, text: pasted, documents, use_llm: true,
+            coverage: draft.coverage,
           }, { timeout: 600000 });   // 分批编译串好几次模型调用，90s 默认超时必先炸
           materialPack = res.pack;
           compileQuality = res.quality || null;
           compileWarnings = res.warnings || [];
+          compileCoverage = res.coverage || null;
+          compileMetrics = res.summary?.quality || null;
           if (compileWarnings.length) toast(compileWarnings[0], "warn", 7000);
           renderStep3();
           return;
@@ -497,6 +526,21 @@ export async function render(el, ctx, params) {
                   <span class="row" style="gap:6px;flex-wrap:wrap"><strong>${escapeHTML(d.titles?.[0] || "")}</strong><span class="faint">≈</span><strong>${escapeHTML(d.titles?.[1] || "")}</strong><span class="faint tiny">相似度 ${Math.round((d.similarity || 0) * 100)}%</span></span>
                 </div>`).join("")}
             </div>` : ""}
+          </div>` : ""}
+        ${compileMetrics ? `
+          <div class="preview-box mt-3">
+            <div class="between"><strong>拆得够不够</strong>
+              <span class="badge badge-muted">${draft.coverage === "full" ? "高覆盖档" : "标准档"}${compileCoverage && compileCoverage.applied !== draft.coverage ? " · 本地编译器未生效" : ""}</span></div>
+            <div class="qa-grid mt-2">
+              <div><span class="qa-num">${pct((compileMetrics.coverage || {}).ratio || 0)}</span><span class="qa-cap">材料字数被拆到</span></div>
+              <div><span class="qa-num">${pct((compileMetrics.grounding || {}).rate || 0)}</span><span class="qa-cap">能逐字指回原文</span></div>
+              <div><span class="qa-num">${(materialPack.chapters || []).length || "单层"}</span><span class="qa-cap">章</span></div>
+              <div><span class="qa-num">${(materialPack.sections || []).length}</span><span class="qa-cap">小节</span></div>
+            </div>
+            ${!compileCoverage || compileCoverage.applied === draft.coverage ? "" :
+              `<p class="faint tiny mt-2">这次没走模型，本地编译器按材料小节一条一节，覆盖档不改结果；配置模型后「${draft.coverage === "full" ? "高覆盖" : "标准"}」才起作用。</p>`}
+            ${((compileMetrics.coverage || {}).missing || []).length ? `<p class="faint tiny mt-1">还有 ${(compileMetrics.coverage || {}).missing.length} 节没被拆出知识点，开始学习后在地图页可以看到是哪几节。</p>` : ""}
+            ${(compileMetrics.kind_gaps || []).length ? `<p class="faint tiny mt-1">拆解类型缺口：${compileMetrics.kind_gaps.map(k => escapeHTML(KIND_LABELS[k] || k)).join("、")}。</p>` : ""}
           </div>` : ""}
         <details class="mt-3" open>
           <summary>全部 ${units.length} 个单元</summary>

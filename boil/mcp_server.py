@@ -187,6 +187,22 @@ class Tools:
         }
 
 
+    def mistake_book(self, days: int = 30, limit: int = 40) -> dict[str, Any]:
+        data = services.mistake_book(self.db, self.user, days, limit)
+        return {"days": data["days"], "totals": data["totals"],
+                "items": [{k: i.get(k) for k in ("id", "front", "unit_title", "wrongs",
+                                                 "last_wrong_at", "due_label")}
+                          for i in data["items"][:limit]]}
+
+    def cram_plan(self, limit: int = 10) -> dict[str, Any]:
+        data = services.cram_plan(self.db, self.user, limit)
+        return {"days_left": data.get("days_left"), "shot": data.get("shot"),
+                "total": data.get("total"), "left": data.get("left"),
+                "items": [{k: i.get(k) for k in ("unit_id", "title", "essence", "reason",
+                                                 "mastery", "importance")}
+                          for i in data.get("items", [])[:limit]]}
+
+
 TOOL_SPECS = [
     {
         "name": "boil_health",
@@ -278,10 +294,29 @@ TOOL_SPECS = [
         "description": "读取掌握雷达、火候、保留率、缺口与最近 BoilRecord。只读。",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "boil_get_mistakes",
+        "description": "错题本：最近答错过的卡，按错了几次与最近时间排序。只读。",
+        "inputSchema": {"type": "object", "properties": {
+            "days": {"type": "integer", "minimum": 1, "maximum": 365},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "boil_get_cram",
+        "description": "考前速背清单：按截止日期、重要度与掌握度排序的知识点。只读。",
+        "inputSchema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 40},
+        }, "additionalProperties": False},
+    },
 ]
 
 
 def dispatch(tools: Tools, name: str, args: dict[str, Any]) -> Any:
+    if name == "boil_get_mistakes":
+        return tools.mistake_book(int(args.get("days", 30)), int(args.get("limit", 40)))
+    if name == "boil_get_cram":
+        return tools.cram_plan(int(args.get("limit", 10)))
     if name == "boil_health":
         return tools.health()
     if name == "boil_get_advice":

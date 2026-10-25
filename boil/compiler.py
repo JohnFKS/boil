@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from . import llm
+from . import decompose, llm
 from .packs import PackError, derive_key_points, normalize_pack, validate_pack
 from .embeddings import semantic_groups
 from .utils import clamp, new_id, now_iso, slugify, split_cn
@@ -32,6 +32,20 @@ BATCH_CHAR_BUDGET = 7000
 SINGLE_CALL_LIMIT = 6000
 MAX_UNITS_SINGLE = 10
 MAX_UNITS_BATCHED = 40
+
+# 覆盖档：把"这门试你想考多少分"变成拆分粒度，而不是让用户自己猜提示词怎么写
+COVERAGE_MODES = {
+    "standard": ("标准档：覆盖材料里明确出现的知识点，优先章节标题、定义、机制、算法、典型题型与易错点。"
+                 "本批里没写到的东西不要补。"),
+    "full": ("高覆盖档：目标是不错过任何可考点。材料里的章节标题、二级标题、定义、机制、算法、条件、"
+             "步骤、优缺点、典型题型与易错点都要拆出来；一个章节里有多个可考概念就拆成多个单元，"
+             "不许合并成「第 X 章」一条。"),
+}
+DEFAULT_COVERAGE = "standard"
+
+
+def coverage_text(mode: Any) -> str:
+    return COVERAGE_MODES.get(str(mode or DEFAULT_COVERAGE), COVERAGE_MODES[DEFAULT_COVERAGE])
 
 
 def _norm_text(value: Any, limit: int) -> str:
@@ -279,7 +293,9 @@ def _heuristic_unit(title: str, body: str, index: int, subject: str) -> dict[str
         "estimated_minutes": 40,
         "order_index": index,
         "tags": [subject] if subject else [],
-        "source_ref": {"system": "compiler", "kind": "material", "id": f"section-{index + 1}"},
+        "source_ref": {"system": "boil-compiler", "kind": "material", "id": f"sec-{index + 1}",
+                       "anchor": _first_sentences(body, 1, 90), "via": "local"},
+        "point_kind": decompose.classify_kind(f"{title} {body}")[0],
     }
     unit["probes"] = _make_probes(unit)
     unit["cards"] = _make_cards(unit)
@@ -336,14 +352,67 @@ def _split_oversized(title: str, body: str) -> list[tuple[str, str]]:
     return pieces if len(pieces) >= 2 else [(title, body)]
 
 
+def _expand_sections(text: str, use_embeddings: bool = True) -> list[tuple[str, str]]:
+    """切小节 + 把超长小节按锚点切开；顺序即编号顺序，两个编译路径必须走同一条。"""
+    out: list[tuple[str, str]] = []
+    for title, body in _split_sections(text, use_embeddings=use_embeddings):
+        out.extend(_split_oversized(title, body))
+    return out
+
+
+def _section_tables(sections: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """给每个小节一个稳定编号：分批时按编号引用，出处才不会是模型自己编的一串字。"""
+    return [{"id": f"sec-{i + 1}", "title": _norm_text(title, 60), "chars": len(body),
+             "first": _first_sentences(body, 1, 90), "body": body}
+            for i, (title, body) in enumerate(sections)]
+
+
+def _registry(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """持久化用的小节清单：不带正文，只带编号、标题、字数与首句。"""
+    return [{k: t[k] for k in ("id", "title", "chars", "first")} for t in tables]
+
+
+def _provenance(raw: dict[str, Any], tables: list[dict[str, Any]]) -> dict[str, Any]:
+    """给单元定出处：指向具体小节 + 一个**逐字核过**的锚点。
+
+    模型自报的"证据"不算证据：先按它声明的小节核对，核不上就在别的小节里找这句原文；
+    全都核不上就明确标 unverified —— 界面上会显示"未溯源"，而不是假装没有这回事。
+    """
+    declared = _norm_text(raw.get("section") or raw.get("source_section"), 20)
+    claim = str(raw.get("anchor") or raw.get("evidence") or "").strip()[:160]
+    by_id = {t["id"]: t for t in tables}
+    order: list[dict[str, Any]] = []
+    # 模型引用的是批次里的切片编号（sec-3#1），出处要落回整节，否则覆盖统计会漏计这一节
+    base = by_id.get(declared.split("#", 1)[0])
+    if base:
+        order.append(base)
+    elif declared:
+        hit = decompose.canonical_title(declared, [t["title"] for t in tables])
+        if hit:
+            order.extend([t for t in tables if t["title"] == hit[0]])
+    for table in tables:
+        if table not in order:
+            order.append(table)
+    for table in order:
+        verified = decompose.verify(table["body"], claim)
+        if verified:
+            return {"system": "boil-compiler", "kind": "section", "id": table["id"],
+                    "title": table["title"], "anchor": verified[:120], "via": "declared"}
+    for table in order:                      # 模型改写过"证据"时，退回原文里最像的一句
+        found = decompose.fallback_anchor(table["body"],
+                                          str(raw.get("essence") or raw.get("title") or ""))
+        if found:
+            return {"system": "boil-compiler", "kind": "section", "id": table["id"],
+                    "title": table["title"], "anchor": found[:120], "via": "fallback"}
+    return {"system": "boil-compiler", "kind": "unverified", "id": "", "title": "",
+            "anchor": "", "via": "none"}
+
+
 def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool = True) -> dict[str, Any]:
-    sections = _split_sections(text, use_embeddings=use_embeddings)
+    sections = _expand_sections(text, use_embeddings=use_embeddings)
     if not sections:
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
-    expanded: list[tuple[str, str]] = []
-    for sec_title, sec_body in sections:
-        expanded.extend(_split_oversized(sec_title, sec_body))
-    sections = expanded
+    tables = _section_tables(sections)
     units = [_heuristic_unit(t, b, i, subject) for i, (t, b) in enumerate(sections[:8])]
     pid = f"user.{slugify(subject or title, 'material')}.{new_id('')[:6]}"
     pack = {
@@ -363,13 +432,16 @@ def compile_heuristic(title: str, subject: str, text: str, use_embeddings: bool 
         "units": units,
     }
     pack.update(_fallback_plan_fields(units))
+    pack["sections"] = _registry(tables)
+    pack["chapters"] = decompose.chapterize(tables)
     pack["generated_by"] = "rules"
     return normalize_pack(pack, source="compiler")
 
 
 def _normalize_llm_units(data: Any, title: str, subject: str,
                          limit: int = MAX_UNITS_SINGLE,
-                         warnings: list[str] | None = None) -> dict[str, Any]:
+                         warnings: list[str] | None = None,
+                         tables: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if isinstance(data, list):        # 模型偶尔直接回一个单元数组，而不是包对象
         data = {"units": data}
     if not isinstance(data, dict) or not isinstance(data.get("units"), list):
@@ -398,7 +470,10 @@ def _normalize_llm_units(data: Any, title: str, subject: str,
             "estimated_minutes": int(raw.get("estimated_minutes") or 40),
             "order_index": i,
             "tags": [str(x) for x in (raw.get("tags") or [])][:8],
-            "source_ref": {"system": "compiler", "kind": "llm", "id": f"unit-{i + 1}"},
+            "source_ref": _provenance(raw, tables or []),
+            "point_kind": decompose.classify_kind(
+                " ".join([str(raw.get("title") or ""), str(raw.get("essence") or ""),
+                          " ".join(str(x) for x in (raw.get("steps") or []))]))[0],
         }
         if not u["essence"]:
             u["essence"] = u["title"]
@@ -470,14 +545,18 @@ def _cut_at_sentence(text: str, limit: int) -> str:
     return text[:cut]
 
 
-def _chunk_section(title: str, body: str, budget: int) -> list[tuple[str, str]]:
+def _chunk_section(section: dict[str, Any], budget: int) -> list[dict[str, Any]]:
     """无损切开超长小节：先按空行拆段，超长段再按句号切，然后把小块装回预算内。
+
+    切片沿用同一个小节编号（`sec-3#1`、`sec-3#2`）：出处要指得回**原来那一节**，
+    不然覆盖统计会把一节切成三片就谎称覆盖了三个主题。
 
     这里以前写的是 body[:budget]——后半篇被静默丢掉，而产品对用户承诺的是
     「模型读完了全部材料」，截断不吭声就是在说谎。
     """
+    title, body = section["title"], section["body"]
     if len(body) <= budget:
-        return [(title, body)]
+        return [section]
     atoms: list[str] = []
     for block in re.split(r"\n\s*\n", body):
         block = block.strip()
@@ -495,9 +574,12 @@ def _chunk_section(title: str, body: str, budget: int) -> list[tuple[str, str]]:
             pieces[-1] = pieces[-1] + "\n\n" + atom
         else:
             pieces.append(atom)
-    out = [(title if i == 0 else f"{title}（续 {i}）", piece)
+    out = [{"id": section["id"] if i == 0 else f'{section["id"]}#{i}',
+            "title": title if i == 0 else f"{title}（续 {i}）",
+            "chars": len(piece), "first": section["first"] if i == 0 else "", "body": piece}
            for i, piece in enumerate(pieces) if piece.strip()]
-    return out or [(title, _cut_at_sentence(body, budget))]
+    return out or [{"id": section["id"], "title": title, "chars": len(body),
+                    "first": section["first"], "body": _cut_at_sentence(body, budget)}]
 
 
 def _batch_sections(sections: list[tuple[str, str]],
@@ -510,29 +592,28 @@ def _batch_sections(sections: list[tuple[str, str]],
     batches: list[list[tuple[str, str]]] = []
     current: list[tuple[str, str]] = []
     used = 0
-    for title, body in sections:
-        for piece_title, piece in _chunk_section(title, body, budget):
-            size = len(piece_title) + len(piece)
+    for section in sections:
+        for piece in _chunk_section(section, budget):
+            size = len(piece["title"]) + len(piece["body"])
             if current and used + size > budget:
                 batches.append(current)
                 current, used = [], 0
-            current.append((piece_title, piece))
+            current.append(piece)
             used += size
     if current:
         batches.append(current)
     return batches
 
 
-def _skeleton(sections: list[tuple[str, str]]) -> str:
-    """全篇骨架：标题 + 首句。让模型在第一批之前就看见整份材料的形状。"""
-    lines = []
-    for title, body in sections:
-        first = _first_sentences(body, 1, 90)
-        lines.append(f"- {title[:40]}：{first}" if first else f"- {title[:40]}")
+def _skeleton(sections: list[dict[str, Any]]) -> str:
+    """全篇骨架：编号 + 标题 + 首句。让模型在第一批之前就看见整份材料的形状，
+    并且知道每个小节叫什么编号 —— 它报回来的出处才有对得上的对象。"""
+    lines = [f"- [{s['id']}] {s['title'][:40]}：{s['first']}" if s["first"]
+             else f"- [{s['id']}] {s['title'][:40]}" for s in sections]
     return "\n".join(lines)[:12000]
 
 
-def _outline_pass(title: str, subject: str, sections: list[tuple[str, str]],
+def _outline_pass(title: str, subject: str, sections: list[dict[str, Any]],
                   char_total: int) -> dict[str, Any]:
     prompt = (llm.load_prompt("compiler_outline.md")
               .replace("{title}", title).replace("{subject}", subject or "未指定")
@@ -554,7 +635,8 @@ def _outline_titles(outline: dict[str, Any]) -> str:
 
 
 def compile_material_batched(title: str, subject: str, text: str,
-                             use_embeddings: bool = True
+                             use_embeddings: bool = True,
+                             coverage: str = DEFAULT_COVERAGE
                              ) -> tuple[dict[str, Any], list[str]]:
     """长材料分批编译：先全篇骨架出大纲，再逐批只针对本批出单元。
 
@@ -564,17 +646,19 @@ def compile_material_batched(title: str, subject: str, text: str,
     sections = _split_sections(text, use_embeddings=use_embeddings)
     if not sections:
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
-    outline_data = _outline_pass(title, subject, sections, len(text))
+    tables = _section_tables(sections)
+    outline_data = _outline_pass(title, subject, tables, len(text))
     outline_hint = _outline_titles(outline_data)
-    batches = _batch_sections(sections)
+    batches = _batch_sections(tables)
     collected: list[dict[str, Any]] = []
     for i, batch in enumerate(batches):
         # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
-        body = "\n\n".join(f"## {t}\n{b}" for t, b in batch)
+        body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
         prompt = (llm.load_prompt("compiler_batch.md")
                   .replace("{title}", title).replace("{subject}", subject or "未指定")
                   .replace("{outline}", outline_hint)
                   .replace("{batch_index}", str(i + 1)).replace("{batch_total}", str(len(batches)))
+                  .replace("{coverage}", coverage_text(coverage))
                   .replace("{text}", body))
         try:
             data = llm.chat_json([
@@ -597,7 +681,11 @@ def compile_material_batched(title: str, subject: str, text: str,
               "digest": outline_data.get("digest") or {},
               "units": collected}
     pack = _normalize_llm_units(merged, title, subject,
-                                limit=MAX_UNITS_BATCHED, warnings=warnings)
+                                limit=MAX_UNITS_BATCHED, warnings=warnings, tables=tables)
+    pack["sections"] = _registry(tables)
+    pack["chapters"] = decompose.chapterize(tables)
+    # 记的是"当时拧到哪一档"，不是"覆盖了百分之多少"；后者是 quality.coverage
+    pack["source"]["coverage_mode"] = coverage
     if len(batches) > 1:
         pack["source"]["batches"] = len(batches)
         pack["source"]["material_chars"] = len(text)
@@ -609,20 +697,28 @@ def compile_material_batched(title: str, subject: str, text: str,
 
 def compile_material(title: str, subject: str, text: str,
                      use_llm: bool = True,
-                     use_embeddings: bool = True) -> tuple[dict[str, Any], list[str]]:
+                     use_embeddings: bool = True,
+                     coverage: str = DEFAULT_COVERAGE) -> tuple[dict[str, Any], list[str]]:
     title = (title or "未命名材料").strip()
     subject = (subject or "").strip()
     warnings: list[str] = []
     if use_llm and llm.enabled():
+        coverage = str(coverage or DEFAULT_COVERAGE)
+        if coverage not in COVERAGE_MODES:
+            coverage = DEFAULT_COVERAGE
         if len(text) > SINGLE_CALL_LIMIT:
             try:
-                return compile_material_batched(title, subject, text, use_embeddings=use_embeddings)
+                return compile_material_batched(title, subject, text, use_embeddings=use_embeddings,
+                                                coverage=coverage)
             except Exception as exc:
                 warnings.append(f"分批编译失败，已回退单次抽取或本地编译器：{str(exc)[:160]}")
+        tables = _section_tables(_expand_sections(text, use_embeddings=use_embeddings))
         prompt = llm.load_prompt("compiler_extract.md")
         prompt = prompt.replace("{title}", title).replace("{subject}", subject or "未指定")
-        body = text if len(text) <= SINGLE_CALL_LIMIT else text[:SINGLE_CALL_LIMIT]
-        if body != text:
+        prompt = prompt.replace("{coverage}", coverage_text(coverage))
+        labeled = "\n\n".join(f"### [{s['id']}] {s['title']}\n{s['body']}" for s in tables)
+        body = labeled if len(labeled) <= SINGLE_CALL_LIMIT else text[:SINGLE_CALL_LIMIT]
+        if len(text) > SINGLE_CALL_LIMIT:
             warnings.append(f"只送进了前 {SINGLE_CALL_LIMIT:,} 字（材料共 {len(text):,} 字），"
                             "后半篇没有被模型读到；建议缩短材料或重试分批编译")
         prompt = prompt.replace("{text}", body)
@@ -632,7 +728,10 @@ def compile_material(title: str, subject: str, text: str,
                 {"role": "user", "content": prompt},
             ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=12000)
             trimmed: list[str] = []
-            pack = _normalize_llm_units(data, title, subject, warnings=trimmed)
+            pack = _normalize_llm_units(data, title, subject, warnings=trimmed, tables=tables)
+            pack["sections"] = _registry(tables)
+            pack["chapters"] = decompose.chapterize(tables)
+            pack["source"]["coverage_mode"] = coverage
             errors = validate_pack(pack)
             if errors:
                 raise PackError("模型生成的 Pack 未通过校验", errors)

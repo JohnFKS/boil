@@ -832,5 +832,101 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(exc.code, 400)
 
 
+class DecompositionHttpTest(unittest.TestCase):
+    """拆解结果的 API 面：地图要知道章/小节/覆盖率，单元要能指回原文那一句。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="boil-decomp-api-")
+        base = Path(cls.tmp.name)
+        cls.old = {k: getattr(config, k) for k in
+                   ("PACKS_DIR", "DATA_DIR", "LLM_CONFIG_PATH", "LLM_STATE_PATH", "TOKEN")}
+        config.DATA_DIR = base
+        config.PACKS_DIR = base / "packs"
+        config.LLM_CONFIG_PATH = base / "llm.json"
+        config.LLM_STATE_PATH = base / "llm_state.json"
+        config.TOKEN = ""
+        config.PACKS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.old_emb = (embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE)
+        embeddings._CONFIG_OVERRIDE = base / "embedding.json"
+        embeddings._CACHE_OVERRIDE = base / "embedding_cache.json"
+        cls.db = Database(base / "decomp.db")
+        cls.app = App(cls.db)
+        Handler.app = cls.app
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.server.daemon_threads = True
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.db.close()
+        Handler.app = None
+        for key, value in cls.old.items():
+            setattr(config, key, value)
+        embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE = cls.old_emb
+        cls.tmp.cleanup()
+
+    def call(self, method, path, payload=None):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(self.base + path, data=data,
+                                     headers={"Content-Type": "application/json"} if data else {},
+                                     method=method)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    MATERIAL = (
+        "## 进程是资源分配的单位\n"
+        "进程是操作系统进行资源分配的基本单位，每个进程拥有独立的地址空间。\n"
+        "进程切换需要保存和恢复完整的上下文，因此开销较大。\n\n"
+        "## 线程与调度\n"
+        "线程是 CPU 调度的基本单位，也称作轻量级进程，同一进程内的线程共享地址空间。\n"
+        "线程切换只保存寄存器与栈指针，所以比进程切换便宜得多。\n\n"
+        "## 死锁的四个必要条件\n"
+        "死锁的产生必须同时满足互斥、请求与保持、不可剥夺和循环等待四个必要条件。\n"
+        "破坏其中任意一个条件即可预防死锁，银行家算法则用于避免死锁进入不安全状态。\n"
+    )
+
+    def test_map_and_unit_expose_decomposition(self):
+        comp = self.call("POST", "/api/packs/compile", {
+            "title": "操作系统小抄", "subject": "计算机", "use_llm": False,
+            "coverage": "full", "text": self.MATERIAL})["data"]
+        pack = comp["pack"]
+        self.assertEqual([s["id"] for s in pack["sections"]], ["sec-1", "sec-2", "sec-3"])
+        self.assertTrue(pack["chapters"])
+        # 本地编译器不读覆盖档：请求了 full 也不能假装生效
+        self.assertEqual(comp["coverage"], {"requested": "full", "applied": ""})
+        self.call("POST", "/api/onboarding", {
+            "name": "拆解测试者", "pack_id": pack["id"], "goal_title": "考过操作系统",
+            "daily_minutes": 40, "deadline": "2026-12-31"})
+        m = self.call("GET", "/api/map")["data"]
+        block = m["structure"][0]
+        self.assertEqual(block["coverage"]["ratio"], 1.0)
+        self.assertEqual(block["grounding"]["rate"], 1.0)
+        self.assertEqual(block["coverage"]["missing"], [])
+        self.assertTrue(block["chapters"][0]["section_ids"])
+        node = m["nodes"][0]
+        self.assertIn(node["point_kind"], ("concept", "principle", "procedure", "fact", "meta"))
+        self.assertTrue(node["section"].startswith("sec-"))
+        u = self.call("GET", "/api/units/" + urllib.parse.quote(node["id"]))["data"]
+        self.assertTrue(u["material"]["available"])
+        self.assertTrue(u["material"]["title"])
+        self.assertIn(u["material"]["anchor"],
+                      "".join(s["first"] + " " for s in pack["sections"]) + self.MATERIAL,
+                      "界面展示的出处句子必须是材料里逐字出现过的那一句")
+
+    def test_demo_pack_without_registry_reports_unknown_coverage(self):
+        """演示包没有小节登记表：地图要显示"不知道"，不能把没依据的覆盖率写成 100%。"""
+        self.call("POST", "/api/onboarding", {
+            "name": "拆解测试者", "pack_id": "boil.xueshen.learning", "goal_title": "学习力",
+            "daily_minutes": 40, "deadline": "2026-12-31"})
+        block = self.call("GET", "/api/map")["data"]["structure"][0]
+        self.assertIsNone(block["coverage"])
+        self.assertEqual(block["chapters"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

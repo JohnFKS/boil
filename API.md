@@ -115,7 +115,7 @@ Base URL：`http://127.0.0.1:7860`
   "build": "fdaa941",
   "ref": "refs/heads/main",
   "source_checkout": true,
-  "schema_version": 8,
+  "schema_version": 9,
   "changelog_source": "CHANGELOG.md",
   "releases": [
     {
@@ -238,6 +238,8 @@ Base URL：`http://127.0.0.1:7860`
       "due_count": 0,
       "facets": {},
       "order_index": 0,
+      "point_kind": "concept",
+      "section": "sec-3",
       "tags": [],
       "boundaries": [],
       "key_points": []
@@ -246,9 +248,34 @@ Base URL：`http://127.0.0.1:7860`
   "edges": [
     {"id": "rel_xxx", "source": "u_a", "target": "u_b", "kind": "prerequisite"}
   ],
+  "structure": [
+    {
+      "pack_id": "user.…", "name": "第 3 章 导数", "coverage_mode": "full",
+      "generated_by": "model",
+      "chapters": [{"title": "导数的定义", "section_ids": ["sec-1", "sec-2"], "engine": "semantic"}],
+      "sections": [{"id": "sec-1", "title": "…", "chars": 812, "first": "…"}],
+      "coverage": {"sections": 12, "covered": 9, "ratio": 0.83, "section_ratio": 0.75,
+                   "missing": [{"id": "sec-7", "title": "…", "chars": 402}], "per_section": {"sec-1": 2}},
+      "grounding": {"verified": 18, "total": 20, "rate": 0.9, "kinds": {"section": 18, "unverified": 2}},
+      "kinds": {"concept": 8, "procedure": 5},
+      "kind_gaps": ["fact", "meta"],
+      "lint": ["schedule_like_title"]
+    }
+  ],
   "summary": {}
 }
 ```
+
+`structure` 逐包给出这份材料被拆成了什么样，界面上的「拆解体检」卡就是它的渲染：
+
+- `coverage.ratio` 按**材料字数**加权（不是按小节个数）：只引用了一句带过小节的拆解，不该被算成读完了半本书。
+  `coverage.missing` 列出还没被拆出知识点的小节，最多 20 条。
+- `coverage` 为 `null` 表示这份包没有小节登记表（演示包、第三方包）—— 那是**不知道**，不是"全覆盖"。
+- `grounding.rate` 是能逐字指回原文的条目占比；`kinds` / `kind_gaps` 给出概念 / 原理 / 方法 / 事实 / 策略的分布与缺口。
+- `chapters[].engine`：`semantic` 是按语义聚的；`order` 表示嵌入模型不可用、退化成按顺序分章。
+- `lint` 只列 `error`/`warn` 级问题码，例如 `schedule_like_title`（标题其实是学习安排）、
+  `type_tail_title`（标题挂了题型尾巴，可归回材料里已有的名字）。
+- `coverage_mode` 是这份包编译时用的覆盖档；本地规则编译器不读覆盖档，此时该字段缺省。
 
 ### `POST /api/units/{unit_id}/notes`
 
@@ -294,7 +321,18 @@ Base URL：`http://127.0.0.1:7860`
 
 返回：
 
-- `unit`（含 steps/boundaries/misconceptions/faq/key_points/angle/source_ref）
+- `unit`（含 steps/boundaries/misconceptions/faq/key_points/angle/point_kind/source_ref）
+- `material`：这一条是从材料的哪一节、哪一句长出来的
+
+  ```json
+  {"available": true, "section_id": "sec-3", "title": "线程与调度",
+   "anchor": "线程是 CPU 调度的基本单位", "via": "declared", "kind": "section",
+   "section_chars": 412}
+  ```
+
+  `available=false` 表示这条没有可核对的出处（模型给的"证据"在原文里逐字找不到，或者这份包压根没有小节登记表）；
+  界面据此显示「没有可核对的出处」，而不是假装它来自某段原文。
+  `via`：`declared`＝按声明的节号核过，`fallback`＝模型改写过证据、退回原文里最像的一句，`local`＝本地编译器直接切出来的。
 - `mastery`、`status`、`heat`、`heat_label`、`pn`、`records`
 - `notes`（速记/笔记）、`related`（语义相关单元）
 - `probes`、`cards`、`sessions`、`relations`、`attempts`、`recalls`（复习回忆原文）
@@ -470,9 +508,18 @@ POST /api/styles/apply       {"answers": [0,1,0,2,1]}
     {"name": "讲义.md", "text": "……"},
     {"name": "笔记.txt", "text": "……"}
   ],
-  "use_llm": true
+  "use_llm": true,
+  "coverage": "standard"
 }
 ```
+
+`coverage` 是**覆盖档**（拆分粒度），只能是 `standard` / `full`，其它值回落成 `standard`：
+
+- `standard`：覆盖材料里明确出现的知识点，优先章节标题、定义、机制、算法、典型题型与易错点。
+- `full`：目标是不错过任何可考点 —— 二级标题、条件、步骤、优缺点都各自成单元，不许合并成「第 X 章」一条。
+
+这一档只送进模型、由模型执行；**本地规则编译器不读它**（它按材料小节一条一节）。响应里的
+`coverage` 因此把两者分开报：`{"requested": "full", "applied": ""}` 表示拧了档但没生效，界面会如实说明。
 
 `documents` 可选，用于把多个文件合并到同一个主题：后端会按文件名添加二级标题，再接上 `text` 作为“补充笔记”。最多 20 个文件，合并后上限 200,000 字符；空文档会忽略。
 
@@ -485,12 +532,20 @@ POST /api/styles/apply       {"answers": [0,1,0,2,1]}
     "outline": [{"title": "第一部分", "summary": "为什么先学它", "unit_titles": ["…"]}],
     "study_plan": [{"phase": "地基", "unit_titles": ["…"], "focus": "本阶段目标", "minutes": 180}],
     "digest": {"overview": "150 字以内的材料总览", "advice": ["学习建议"]},
+    "sections": [{"id": "sec-1", "title": "……", "chars": 812, "first": "……"}],
+    "chapters": [{"title": "……", "section_ids": ["sec-1", "sec-2"], "engine": "semantic"}],
     "generated_by": "model"
   },
   "summary": {},
+  "coverage": {"requested": "full", "applied": "full"},
   "warnings": []
 }
 ```
+
+`pack.sections` 是小节登记表，每条只有 `id` / `title` / `chars` / `first` —— **正文不回传也不落盘**，
+只在编译那一次用于逐字核对锚点。每个 unit 带 `source_ref` 与 `point_kind`，
+`source_ref.anchor` 是那一节里逐字出现过的一句话，界面上作为「出处」直接展示。
+`summary.quality` 里另有 `coverage` / `grounding` / `kinds` / `kind_gaps` 四项量化指标（含义见 `GET /api/map`）。
 
 - `use_llm=true` 且配置了模型：LLM 结构化抽取；失败显式降级并给出 warning。
 - 无模型 / `use_llm=false`：本地确定性编译器。
@@ -746,6 +801,111 @@ data: {}
   "remaining": 15
 }
 ```
+
+---
+
+## 7.5 备考冲刺（错题本 / 考前速背 / 限时自测卷）
+
+这一组能力是把"离考试还有八天"这条路补上：它们与 FSRS 队列刻意分开——间隔重复管"以后别忘了"，
+冲刺管"这两天别再丢分"。数据全在本地库，不请求任何模型也能完整使用。
+
+### `GET /api/review?ids=c_xxx,c_yyy`
+
+错题本的「重练这几张」用的入口。给了 `ids` 就跳过到期判断，按传入顺序出卡：
+
+```json
+{ "cards": [ { "id": "c_xxx", "due_label": "错题重练", "mistake_tags": ["concept"] } ],
+  "picked_from": "mistakes", "requested": 2, "missing": 1 }
+```
+
+`missing` 是找不到（已删卡/不属于本用户）的数量，不假装都找到了。卡片 id 里带包名与单元名，
+实测 67 字符，因此后端**不截断** id：截断会查不到还报成功。
+
+### `GET /api/mistakes?days=30&limit=80`
+
+```json
+{
+  "days": 30,
+  "items": [{ "id": "c_xxx", "front": "…", "back": "…", "unit_id": "u_xxx", "unit_title": "…",
+              "wrongs": 2, "last_wrong_at": "2026-10-24T11:00:00Z",
+              "tag_counts": [{ "key": "concept", "label": "概念没吃透", "count": 2 }],
+              "due_label": "已到期", "is_due": true }],
+  "exam_items": [{ "exam_id": "exam_x", "prompt": "…", "answer": "…", "yours": "…",
+                   "verdict": "wrong", "missed": ["要点二"], "at": "…" }],
+  "totals": { "cards": 1, "wrongs": 2, "due_now": 1, "exam_misses": 3,
+              "tags": [{ "key": "concept", "label": "概念没吃透", "count": 2 }] }
+}
+```
+
+口径值得写清楚：**错题本只收"最近一次仍然答错"的卡**。判先后用 `rowid` 不用时间戳，
+因为 `reviewed_at` 只到秒，同一秒里"先错后对"分不出来，那样答对了的卡会永远赖在本子里吓唬人。
+`tag_counts` 统计窗口内所有答错记录，包括后来答对的那些（错了两次又答对，仍然值得知道错过）。
+`exam_items` 来自自测卷：那些题没有对应的复习卡，靠卷子本身重看。
+
+### `GET /api/cram?limit=12`
+
+```json
+{
+  "has_goal": true,
+  "goal": { "id": "goal_x", "title": "期末", "deadline": "2026-11-01" },
+  "days_left": 8,
+  "items": [{ "unit_id": "u_xxx", "title": "…", "essence": "…", "key_points": ["…"],
+              "mnemonic": "…", "probes": [{ "id": "p_x", "prompt": "…", "answer": "…" }],
+              "misconceptions": ["…"], "mastery": 0.06, "due_count": 2, "mistakes": 3,
+              "importance": 5, "score": 0.87, "reason": "重要、掌握度低、时间紧、错过 3 次" }],
+  "shot": 1, "total": 8, "left": 7
+}
+```
+
+排序按 `重要度 × (1 − 掌握度) × 截止临近度 × 错过次数`，`reason` 用人话说明"为什么先背它"。
+三周内开始加临近权重；没有截止日期时 `days_left` 为 `null`，排序自动退化成"重要 + 没掌握"。
+
+### `POST /api/cram/shot` · `POST /api/cram/reset`
+
+`{"unit_id": "u_xxx", "undo": false}` → `{"unit_id": "…", "shot": true}`。斩掉只影响这份清单，
+**不改复习排程、不删任何数据**；`undo: true` 把这一斩收回去。`reset` 清掉全部已斩（重列清单）。
+不属于当前目标的 `unit_id` 返回 400，不会静默成功。事件记为 `cram.shot` / `cram.unshot` / `cram.reset`。
+
+### `POST /api/exam`
+
+```json
+// 请求
+{ "minutes": 25, "count": 8, "unit_ids": null }
+// 响应
+{ "exam_id": "exam_x", "title": "期末 · 自测卷", "minutes": 25,
+  "questions": [{ "id": "p_x", "unit_id": "u_x", "unit_title": "…", "kind": "recall", "prompt": "…" }],
+  "note": "" }
+```
+
+题目**只**取自资料编译时生成的探测题，绝不现编；每个单元最多 2 题以逼出跨单元覆盖；
+学过的单元排在前面，一门都没学也允许出卷，但会在 `note` 里写明"这份卷子当练习用，别当诊断"。
+响应里没有 `answer` 也没有 `rubric`，交卷前看不到答案。`minutes` 夹在 5–180，`count` 夹在 3–25。
+没有目标或一道题都凑不出来时返回 400 + 可读 message。
+
+### `POST /api/exam/submit`
+
+```json
+// 请求
+{ "exam_id": "exam_x", "answers": [{ "id": "p_x", "text": "自己的话…" }] }
+// 响应
+{ "exam_id": "exam_x", "title": "…",
+  "result": { "score": 0.62, "gradable": 8, "needs_self_check": 0, "graded_by": "rules",
+              "counts": { "correct": 4, "partial": 1, "wrong": 1, "blank": 2, "ungraded": 0 },
+              "items": [{ "id": "p_x", "verdict": "correct", "score": 1.0,
+                          "missed": [], "answer": "参考答案", "prompt": "…", "unit_title": "…" }],
+              "hint": "…" },
+  "answers": [{ "id": "p_x", "text": "你写的", "answer": "参考答案" }] }
+```
+
+判分按评分要点做关键词覆盖（`utils.coverage`）：≥75% 记 ✓，≥35% 记 △，其余 ✗；空着记 `blank`
+并按 0 分计入平均；**那道题没有评分要点时记 `ungraded`，`score` 为 `null`** —— 判不动就承认判不动，
+不编一个分数出来。`graded_by` 恒为 `rules`，没有模型参与。交卷写 `attempts`（`kind='exam'`）、
+按实际用时计入 `study_days`，并把丢分的题送进错题本。一份卷子不能交两次（400）。
+
+### `GET /api/exams?limit=20`
+
+历史卷子列表：`{ "exams": [{ "id", "title", "minutes", "count", "status", "score", "counts",
+"started_at", "submitted_at" }] }`，`status` 为 `open`（未交）或 `graded`。
 
 ---
 

@@ -1,6 +1,7 @@
 /* Unit detail: the pre-digested learning surface. */
 import {
   escapeHTML, escapeAttr, icon, pct, radarSVG, ringSVG, statusMeta, kindMeta,
+  pointKindMeta,
   renderMarkdown, truncate, relativeTime, formatDateTime, confirmDialog, toast,
 } from "../utils.js";
 import { highlightQuotes } from "../quoteHighlight.js";
@@ -56,6 +57,7 @@ export async function render(el, ctx, params) {
     ? (pn.missing?.length ? `标准步骤 ${pn.total || "—"} 步，最近报告还缺 ${pn.missing.length} 步。` : `最近报告没有发现缺口；用极致对标验收。`)
     : "还没有对话或讲解证据。先预消化，再开始苏格拉底。";
   const notes = data.notes || {};
+  const mat = data.material || { available: false };
   const related = data.related || [];
   const cards = data.cards || [];
   const probes = data.probes || [];
@@ -71,6 +73,7 @@ export async function render(el, ctx, params) {
           <span class="badge ${st.status === "boiled" ? "badge-teal" : st.status === "learning" ? "badge-gold" : st.status === "rusting" ? "badge-ember" : "badge-muted"}">${meta.label}</span>
           <span class="badge badge-muted">${u.estimated_minutes || 45} 分钟</span>
           <span class="badge badge-muted">难度 ${u.difficulty || 3}/5</span>
+          ${u.point_kind ? `<span class="badge badge-violet">${escapeHTML(pointKindMeta[u.point_kind]?.label || u.point_kind)}</span>` : ""}
           ${u.source_ref?.system ? `<span class="badge badge-violet">${escapeHTML(u.source_ref.system)}</span>` : ""}
         </div>
         <h2>${escapeHTML(u.title)}</h2>
@@ -236,14 +239,22 @@ export async function render(el, ctx, params) {
         ${related.length ? `<div class="card side-card"><div class="between"><span class="side-label">相关单元</span><span class="badge badge-violet">语义相似</span></div><div class="mt-2">${related.map(r => `<a class="card-mini" href="#/unit/${escapeAttr(r.id)}"><span style="min-width:0">${escapeHTML(truncate(r.title, 26))}</span><span class="due">${Math.round((r.score || 0) * 100)}%</span></a>`).join("")}</div></div>` : ""}
 
         <div class="card side-card">
-          <div class="side-label">来源</div>
-          <div class="source-line mt-2">
-            ${u.source_ref?.system ? `<span class="badge badge-muted">${escapeHTML(u.source_ref.system)}</span>` : ""}
-            ${u.source_ref?.kind ? `<span>${escapeHTML(u.source_ref.kind)}</span>` : ""}
-            ${u.source_ref?.id ? `<code>${escapeHTML(u.source_ref.id)}</code>` : ""}
-            ${u.source_ref?.version ? `<span>v${escapeHTML(u.source_ref.version)}</span>` : ""}
+          <div class="between"><span class="side-label">出处</span>
+            ${u.point_kind ? `<span class="badge badge-muted">${escapeHTML(pointKindMeta[u.point_kind]?.label || u.point_kind)}</span>` : ""}
           </div>
-          <div class="faint tiny mt-2">${u.source_ref?.path ? escapeHTML(u.source_ref.path) : "来源未记录"}</div>
+          ${mat.available && mat.anchor ? `
+            <div class="source-line mt-2">
+              ${mat.section_id ? `<code>${escapeHTML(mat.section_id)}</code>` : ""}
+              ${mat.title ? `<span>${escapeHTML(truncate(mat.title, 22))}</span>` : ""}
+              ${mat.via === "fallback" ? `<span class="badge badge-gold">原文回填</span>` : ""}
+            </div>
+            <blockquote class="material-quote mt-2">${escapeHTML(mat.anchor)}</blockquote>
+            <div class="faint tiny mt-2">这一句逐字抄自你的材料；编译器核过才敢挂上来。</div>`
+            : `
+            <div class="callout warn mt-2"><strong>没有可核对的出处</strong><br>
+              <span class="small">这条指不回材料里的具体句子${mat.kind === "unverified" ? "：模型给的「证据」在原文里逐字找不到" : ""}。可以学，但别把它当材料原话；建议回材料里自己确认一遍。</span>
+            </div>`}
+          <div class="faint tiny mt-2">${u.source_ref?.system ? `${escapeHTML(u.source_ref.system)} · ` : ""}${u.source_ref?.version ? `v${escapeHTML(u.source_ref.version)} · ` : ""}${mat.section_chars ? `${mat.section_chars} 字的那一节` : "来源未记录"}</div>
         </div>
       </aside>
     </div>`;

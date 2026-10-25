@@ -32,6 +32,7 @@ GET_ENDPOINTS = (
     "/api/health", "/api/me", "/api/goals", "/api/dashboard", "/api/advice", "/api/map",
     "/api/units/duplicates", "/api/notes", "/api/packs", "/api/review", "/api/cards",
     "/api/insights", "/api/search?q=a", "/api/settings/llm", "/api/settings/embeddings",
+    "/api/mistakes", "/api/cram", "/api/exams",
     "/api/styles/questions", "/api/releases", "/api/agent/capabilities", "/api/events",
     "/api/export", "/api/export/anki", "/api/focus", "/api/units/" + "nope",
 )

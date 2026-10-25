@@ -7,16 +7,16 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import (config, embeddings, heat, llm, mastery, planner, quality, socratic, styles)
+from . import (config, decompose, embeddings, heat, llm, mastery, planner, quality, socratic, styles)
 from .compiler import compile_material
 from .db import Database, SCHEMA_VERSION, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
-from .packs import (PackError, all_available_packs, get_goal_relations,
+from .packs import (PackError, all_available_packs, find_pack, get_goal_relations,
                     get_goal_units, install_pack, normalize_pack, pack_progress,
                     pack_quality, pack_summary, save_user_pack, unit_from_row,
                     validate_pack)
 from .srs.fsrs import card_from_row, interval_label, scheduler
-from .utils import (clamp, coverage, days_between, new_id, now, now_iso,
+from .utils import (clamp, coverage, days_between, iso_after, new_id, now, now_iso,
                     parse_iso, round4, safe_div, slugify, today_str, truncate)
 
 DEFAULT_PACK = "boil.xueshen.learning"
@@ -409,6 +409,34 @@ def update_goal_and_replan(db: Database, user_id: str, payload: dict[str, Any]) 
     return dashboard(db, user_id, goal["id"])
 
 
+def pack_structure(db: Database, goal_id: str) -> list[dict[str, Any]]:
+    """这份目标所用内容包的拆解形状：章→小节、覆盖率、溯源率、类型缺口。
+
+    没有小节登记表（演示包、第三方包）时如实给 None，让界面显示"不知道"，
+    而不是把没依据的覆盖率凑成 100%。
+    """
+    rows = db.query("SELECT DISTINCT pack_id FROM units WHERE goal_id=?", (goal_id,))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        pack = find_pack(row["pack_id"])
+        if not pack:
+            continue
+        quality_block = pack_quality(pack)
+        out.append({"pack_id": pack.get("id"),
+                    "name": pack.get("name") or "",
+                    "coverage_mode": str((pack.get("source") or {}).get("coverage_mode") or ""),
+                    "generated_by": pack.get("generated_by") or "",
+                    "chapters": pack.get("chapters") or [],
+                    "sections": pack.get("sections") or [],
+                    "coverage": quality_block["coverage"],
+                    "grounding": quality_block["grounding"],
+                    "kinds": quality_block["kinds"],
+                    "kind_gaps": quality_block["kind_gaps"],
+                    "lint": [i["code"] for i in quality.lint_pack(pack)
+                             if i["level"] in ("error", "warn")]})
+    return out
+
+
 def map_data(db: Database, user_id: str, goal_id: str | None = None) -> dict[str, Any]:
     goal = active_goal(db, user_id, goal_id)
     if not goal:
@@ -420,7 +448,10 @@ def map_data(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
     nodes = []
     for i, u in enumerate(live_units):
         st = statuses[u["id"]]
+        ref = u.get("source_ref") or {}
         nodes.append({**_unit_card(u, st), "order_index": i,
+                      "point_kind": u.get("point_kind") or "",
+                      "section": ref.get("id") or "",
                       "facets": st.get("facets") or {},
                       "boundaries": u.get("boundaries") or [],
                       "key_points": u.get("key_points") or []})
@@ -428,6 +459,7 @@ def map_data(db: Database, user_id: str, goal_id: str | None = None) -> dict[str
               "kind": r["kind"]} for r in relations
              if r["from_unit"] in statuses and r["to_unit"] in statuses]
     return {"goal": goal, "nodes": nodes, "edges": edges,
+            "structure": pack_structure(db, goal["id"]),
             "summary": mastery.summary(db, user_id, goal["id"])}
 
 
@@ -515,7 +547,7 @@ def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str
     content = re.sub(r"\r\n?", "\n", str(payload.get("content") or "")).strip()[:4000]
     if not quote and not content:
         raise ValueError("引用文字和灵感内容至少要有一个")
-    unit_id = str(payload.get("unit_id") or "").strip()[:80] or None
+    unit_id = str(payload.get("unit_id") or "").strip()[:200] or None
     if unit_id and not db.one("SELECT id FROM units WHERE id=?", (unit_id,)):
         unit_id = None
     goal = active_goal(db, user_id)
@@ -536,7 +568,7 @@ def create_note(db: Database, user_id: str, payload: dict[str, Any]) -> dict[str
     note_id = new_id("no")
     db.insert("notes", {
         "id": note_id, "user_id": user_id,
-        "goal_id": str(payload.get("goal_id") or "").strip()[:80] or (goal["id"] if goal else None),
+        "goal_id": str(payload.get("goal_id") or "").strip()[:200] or (goal["id"] if goal else None),
         "unit_id": unit_id, "kind": "inspiration",
         "quote": quote, "content": content, "anchor_json": json_dumps(anchor_out),
         "source": source,
@@ -1054,6 +1086,46 @@ def unmerge_unit(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
             "degraded": not record_found, "note": note}
 
 
+def section_of(pack: dict[str, Any] | None, section_id: str) -> dict[str, Any] | None:
+    """按编号找到那一节（切片编号 sec-3#1 归回 sec-3），返回标题与原文。"""
+    if not pack or not section_id:
+        return None
+    want = str(section_id).split("#", 1)[0]
+    for table in pack.get("sections") or []:
+        if table.get("id") == want:
+            return table
+    return None
+
+
+def material_of(unit: dict[str, Any]) -> dict[str, Any]:
+    """这一条是从材料的哪一节、哪一句长出来的。
+
+    锚点在编译时就逐字核过才写进包（`kind=section`）；这里不重新发明一套判断，
+    只做两件事：确认那个节号在这份包的登记表里还存在，以及把标题带回去。
+    演示包与第三方包没有登记表，就如实返回 available=False，
+    界面显示"没有可核对的出处"，而不是假装它来自某段原文。
+    """
+    ref = unit.get("source_ref") or {}
+    anchor = str(ref.get("anchor") or "")
+    out = {"available": False, "section_id": str(ref.get("id") or ""),
+           "title": str(ref.get("title") or ""), "anchor": anchor,
+           "via": str(ref.get("via") or ""), "kind": str(ref.get("kind") or ""),
+           "section_chars": None}
+    if not anchor:
+        return out
+    pack = find_pack(unit.get("pack_id") or "")
+    table = section_of(pack, out["section_id"])
+    if table:
+        out["title"] = table.get("title") or out["title"]
+        out["section_chars"] = table.get("chars")
+        # 登记表里若真带着正文（第三方包），就地再核一次字面是否命中
+        body = str(table.get("body") or "")
+        out["available"] = bool(decompose.verify(body, anchor)) if body else True
+    elif out["section_id"]:
+        out["available"] = out["kind"] == "section"     # 旧包没有登记表，但不等于锚点是编的
+    return out
+
+
 def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
     row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
     if not row:
@@ -1124,6 +1196,7 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
             "related": related,
             "probes": probes, "cards": cards, "sessions": sessions,
             "relations": relations, "attempts": attempts, "recalls": recalls,
+            "material": material_of(unit),
             "source": unit.get("source_ref") or {}}
 
 
@@ -1460,6 +1533,406 @@ def attach_mistake_tags(target: dict[str, Any], source: dict[str, Any]) -> dict[
     target["mistake_labels"] = [MISTAKE_LABELS.get(t, t) for t in tags]
     target.pop("mistake_tags_json", None)
     return target
+
+
+# ---------------------------------------------------------------------------
+# 错题本与考前速背（借鉴 kaobuddy 的两处设计，落到 Boil 自己的数据结构上）
+# ---------------------------------------------------------------------------
+def mistake_book(db: Database, user_id: str, days: int = 30, limit: int = 80) -> dict[str, Any]:
+    """答错过的东西，按"错了几次 / 最近什么时候 / 错在哪"聚合出来。
+
+    这些数据一直都在（每条复习日志都带错因与失分标记），但从来没有任何视图把它们端到人面前：
+    洞察页那根错因柱子只能告诉你"概念没吃透最多"，答不出"是哪一张卡"。错题本的价值
+    恰恰在于能指着具体某一张卡说"这里你错过三次"。
+    """
+    days = int(clamp(days, 1, 365))
+    limit = int(clamp(limit, 1, 200))
+    since = iso_after(-86400 * days)
+    # 按 rowid 判先后，不按 reviewed_at：时间戳只到秒，同一秒里"先错后对"会分不出来，
+    # 于是答对了的卡一直赖在错题本上。
+    logs = db.query(
+        "SELECT rowid AS rid, card_id, mistake_tags_json, reviewed_at, rating FROM review_logs "
+        "WHERE user_id=? AND reviewed_at>=? ORDER BY rid LIMIT 4000", (user_id, since))
+    per_card: dict[str, dict[str, Any]] = {}
+    tag_totals: dict[str, int] = {}
+    for row in logs:
+        entry = per_card.setdefault(row["card_id"], {"wrongs": 0, "last_wrong_at": "", "tags": {},
+                                                     "last_rid": 0, "last_rating": 4})
+        entry["last_rid"] = int(row["rid"])
+        entry["last_rating"] = int(row["rating"])
+        if int(row["rating"]) > 2:
+            continue
+        entry["wrongs"] += 1
+        entry["last_wrong_at"] = row["reviewed_at"]
+        for tag in json_loads(row["mistake_tags_json"] or "[]", []):
+            if tag in MISTAKE_KEYS:
+                entry["tags"][tag] = entry["tags"].get(tag, 0) + 1
+                tag_totals[tag] = tag_totals.get(tag, 0) + 1
+    # 还留在本子里的只有"最近一次仍然答错"的：错题本是现在的状态，不是历史档案
+    ids = [cid for cid, e in per_card.items() if e["last_rating"] <= 2]
+    items: list[dict[str, Any]] = []
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.query(
+            "SELECT c.*, u.title AS unit_title FROM cards c JOIN units u ON u.id=c.unit_id "
+            f"WHERE c.user_id=? AND c.id IN ({placeholders})", (user_id, *ids))
+        for row in rows:
+            card = dict(row)
+            meta = per_card[card["id"]]
+            out = _public_card(card)
+            out["unit_title"] = card.get("unit_title") or ""
+            out["wrongs"] = meta["wrongs"]
+            out["last_wrong_at"] = meta["last_wrong_at"]
+            out["tag_counts"] = [{"key": k, "label": MISTAKE_LABELS.get(k, k), "count": v}
+                                 for k, v in sorted(meta["tags"].items(), key=lambda x: -x[1])]
+            out["due_label"] = _due_label(card)
+            out["is_due"] = bool(card.get("due_at") and card["due_at"] <= now_iso())
+            items.append(out)
+    items.sort(key=lambda x: (-x["wrongs"], x["last_wrong_at"]), reverse=False)
+    items = items[:limit]
+    exam_misses = _exam_mistakes(db, user_id, since)
+    due_now = sum(1 for i in items if i["is_due"])
+    return {
+        "days": days,
+        "items": items,
+        "exam_items": exam_misses,
+        "totals": {
+            "cards": len(items), "wrongs": sum(i["wrongs"] for i in items),
+            "due_now": due_now, "exam_misses": len(exam_misses),
+            "tags": [{"key": k, "label": MISTAKE_LABELS.get(k, k), "count": tag_totals.get(k, 0)}
+                     for k, _ in MISTAKE_TAGS if tag_totals.get(k)],
+        },
+        "mistake_tags": [{"key": k, "label": v} for k, v in MISTAKE_TAGS],
+    }
+
+
+def _exam_mistakes(db: Database, user_id: str, since: str) -> list[dict[str, Any]]:
+    """自测卷里判错的那些题：没有对应的卡，单独成列，重练时靠探测题本身。"""
+    out: list[dict[str, Any]] = []
+    for exam in db.query(
+            "SELECT id, title, questions_json, answers_json, result_json, submitted_at "
+            "FROM exams WHERE user_id=? AND status='graded' AND submitted_at>=? "
+            "ORDER BY submitted_at DESC LIMIT 20", (user_id, since)):
+        results = json_loads(exam["result_json"], {}) or {}
+        questions = {q.get("id"): q for q in json_loads(exam["questions_json"], []) or []}
+        answers = {a.get("id"): a.get("text", "") for a in json_loads(exam["answers_json"], []) or []}
+        for verdict in results.get("items") or []:
+            if verdict.get("verdict") == "correct":
+                continue
+            question = questions.get(verdict.get("id")) or {}
+            out.append({
+                "exam_id": exam["id"], "exam_title": exam["title"], "probe_id": verdict.get("id"),
+                "prompt": question.get("prompt", ""), "unit_title": question.get("unit_title", ""),
+                "answer": question.get("answer", ""), "yours": answers.get(verdict.get("id"), ""),
+                "verdict": verdict.get("verdict"), "score": verdict.get("score"),
+                "missed": verdict.get("missed") or [], "at": exam["submitted_at"],
+            })
+    return out
+
+
+def review_by_ids(db: Database, user_id: str, card_ids: list[str]) -> dict[str, Any]:
+    """错题本/自测卷的「就练这些」：跳过到期判断，按给定 id 出卡。
+
+    复习队列本来只给"到期的卡"，但错题的意义恰恰是"还没到期也该再看一眼"。
+    """
+    # 卡片 id 里含单元标题与包名，长度不可假设：不能截断，截断就查不到还谎报"找到了"
+    ids = [s for s in (str(i or "").strip() for i in (card_ids or [])) if 0 < len(s) <= 120][:60]
+    if not ids:
+        return {"cards": [], "picked_from": "mistakes", "requested": 0, "missing": 0}
+    placeholders = ",".join("?" for _ in ids)
+    rows = db.query(
+        "SELECT c.*, u.title AS unit_title, u.essence AS unit_essence FROM cards c "
+        f"JOIN units u ON u.id=c.unit_id WHERE c.user_id=? AND c.id IN ({placeholders})",
+        (user_id, *ids))
+    by_id = {r["id"]: r for r in rows}
+    cards = []
+    for card_id in ids:
+        row = by_id.get(card_id)
+        if not row:
+            continue
+        card = dict(row)
+        card["preview"] = scheduler.preview_labels(card_from_row(card))
+        card["due_label"] = "错题重练"
+        card["retention"] = round4(scheduler.retrievability(float(card.get("stability") or 0),
+                                                            _elapsed_days(card)))
+        card["mnemonic"] = ""
+        attach_mistake_tags(card, card)
+        cards.append(card)
+    return {"cards": cards, "picked_from": "mistakes", "requested": len(ids),
+            "missing": len(ids) - len(cards)}
+
+
+def cram_plan(db: Database, user_id: str, limit: int = 12) -> dict[str, Any]:
+    """考前速背：离考试越近、越重要、越没掌握，越先出现在清单上；背一个斩一个。
+
+    与 FSRS 队列是两套东西，故意不做成一套：间隔重复的目标是"长期不忘"，而考前冲刺的
+    目标是"这两天别再丢分"。冲刺清单是一次性的，斩掉就不再出现，也不写回排程。
+    """
+    goal = active_goal(db, user_id)
+    if not goal:
+        return {"has_goal": False, "items": [], "days_left": None, "shot": 0, "total": 0}
+    deadline = goal.get("deadline")
+    days_left = int(round(days_between(now(), parse_iso(deadline)))) if deadline else None
+    units = db.query(
+        "SELECT * FROM units WHERE goal_id=? AND merged_into IS NULL ORDER BY order_index, id",
+        (goal["id"],))
+    statuses = _unit_status_map(db, user_id, units) if units else {}
+    shot_rows = {r["target_id"] for r in db.query(
+        "SELECT target_id FROM cram_shots WHERE user_id=? AND kind='unit'", (user_id,))}
+    mnemonic_rows = {r["unit_id"]: r["content"] for r in db.query(
+        "SELECT unit_id, content FROM unit_notes WHERE user_id=? AND kind='mnemonic'", (user_id,))}
+    mistakes: dict[str, int] = {}
+    for row in db.query(
+            "SELECT c.unit_id AS unit_id, COUNT(*) AS n FROM review_logs l JOIN cards c ON c.id=l.card_id "
+            "WHERE l.user_id=? AND l.rating<=2 GROUP BY c.unit_id", (user_id,)):
+        mistakes[row["unit_id"]] = int(row["n"] or 0)
+    items = []
+    for unit in units:
+        if unit["id"] in shot_rows:
+            continue
+        state = statuses.get(unit["id"]) or {}
+        mastered = float(state.get("average") or 0.0)
+        importance = int(unit.get("importance") or 3)
+        urgency = 0.0
+        if days_left is not None:
+            urgency = clamp(1.0 - max(0, days_left) / 21.0, 0.0, 1.0)   # 三周内开始加压
+        probes = db.query(
+            "SELECT id, kind, prompt, answer, rubric_json FROM probes WHERE unit_id=? "
+            "ORDER BY created_at, id LIMIT 3", (unit["id"],))
+        score = (importance / 5.0) * 0.4 + (1.0 - mastered) * 0.35 + urgency * 0.25 \
+            + min(mistakes.get(unit["id"], 0), 5) / 5.0 * 0.15
+        items.append({
+            "unit_id": unit["id"], "title": unit["title"],
+            "essence": unit.get("essence") or "",
+            "key_points": json_loads(unit.get("key_points_json") or "[]", [])[:4],
+            "mnemonic": mnemonic_rows.get(unit["id"], ""),
+            "probes": [{"id": p["id"], "kind": p["kind"], "prompt": p["prompt"],
+                        "answer": p.get("answer") or ""} for p in probes],
+            "misconceptions": json_loads(unit.get("misconceptions_json") or "[]", [])[:2],
+            "mastery": round4(mastered), "mastery_label": state.get("status_label", ""),
+            "heat": state.get("heat"), "due_count": int(state.get("due_count") or 0),
+            "mistakes": mistakes.get(unit["id"], 0), "importance": importance,
+            "estimated_minutes": int(unit.get("estimated_minutes") or 0),
+            "score": round4(score),
+            "reason": _cram_reason(importance, mastered, urgency, mistakes.get(unit["id"], 0)),
+        })
+    items.sort(key=lambda x: -x["score"])
+    return {
+        "has_goal": True, "goal": {"id": goal["id"], "title": goal["title"], "deadline": deadline},
+        "days_left": days_left,
+        "items": items[:int(clamp(limit, 1, 40))],
+        "shot": len(shot_rows & {u["id"] for u in units}),
+        "total": len(units), "left": len(items),
+    }
+
+
+def _cram_reason(importance: int, mastered: float, urgency: float, mistakes: int) -> str:
+    parts = []
+    if importance >= 4:
+        parts.append("重要")
+    if mastered < 0.4:
+        parts.append("掌握度低")
+    if urgency > 0.5:
+        parts.append("时间紧")
+    if mistakes:
+        parts.append(f"错过 {mistakes} 次")
+    return "、".join(parts) or "按计划该过一遍"
+
+
+def cram_shot(db: Database, user_id: str, unit_id: str, undo: bool = False) -> dict[str, Any]:
+    """斩掉一个速背项（或撤销这一斩）。速背是"背一个斩一个"，不是打勾打卡。"""
+    unit_id = str(unit_id or "").strip()
+    # id 里带单元标题的 slug，中文标题实测能到 96 字符：按 64 截断会把刚发出去的 id
+    # 变成一个查不到的 id，然后报"不属于你的目标"。宁可拒绝，不要截断。
+    if not unit_id or len(unit_id) > 200:
+        raise ValueError("缺少或过长的 unit_id")
+    if not db.one("SELECT id FROM units WHERE id=? AND goal_id IN "
+                  "(SELECT id FROM goals WHERE user_id=?)", (unit_id, user_id)):
+        raise ValueError("这个单元不在你的目标里")
+    if undo:
+        db.execute("DELETE FROM cram_shots WHERE user_id=? AND kind='unit' AND target_id=?",
+                   (user_id, unit_id))
+        emit(db, "cram.unshot", {"unit_id": unit_id}, user_id)
+        return {"unit_id": unit_id, "shot": False}
+    db.execute(
+        "INSERT INTO cram_shots (id, user_id, kind, target_id, shot_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(user_id, kind, target_id) DO NOTHING",
+        (new_id("cs"), user_id, "unit", unit_id, now_iso()))
+    emit(db, "cram.shot", {"unit_id": unit_id}, user_id)
+    return {"unit_id": unit_id, "shot": True}
+
+
+def cram_reset(db: Database, user_id: str) -> dict[str, Any]:
+    removed = db.execute("DELETE FROM cram_shots WHERE user_id=? AND kind='unit'", (user_id,)).rowcount
+    emit(db, "cram.reset", {"removed": removed}, user_id)
+    return {"removed": int(removed or 0)}
+
+
+# ---------------------------------------------------------------------------
+# 限时自测卷：跨单元组卷 + 判分 + 错题进本子
+# ---------------------------------------------------------------------------
+EXAM_MINUTES = (5, 180)
+EXAM_COUNT = (3, 25)
+
+
+def exam_build(db: Database, user_id: str, minutes: int = 30, count: int = 8,
+               unit_ids: Any = None) -> dict[str, Any]:
+    """从已有探测题里组一份跨单元卷子。题目一律来自材料编译的产物，不现编。
+
+    没学过的单元不出题：一卷全是没见过的题，除了打击人没有任何诊断价值。
+    """
+    goal = active_goal(db, user_id)
+    if not goal:
+        raise ValueError("还没有目标：先开一门再组卷")
+    minutes = int(clamp(int(minutes or 30), EXAM_MINUTES[0], EXAM_MINUTES[1]))
+    count = int(clamp(int(count or 8), EXAM_COUNT[0], EXAM_COUNT[1]))
+    wanted = {str(u).strip() for u in (unit_ids or []) if str(u).strip()}
+    statuses = _unit_status_map(db, user_id, db.query(
+        "SELECT * FROM units WHERE goal_id=? AND merged_into IS NULL", (goal["id"],))) or {}
+    touched = {uid for uid, st in statuses.items() if (st or {}).get("status") != "new"}
+    rows = db.query(
+        "SELECT p.id, p.unit_id, p.kind, p.prompt, p.answer, p.rubric_json, u.title AS unit_title "
+        "FROM probes p JOIN units u ON u.id=p.unit_id "
+        "WHERE u.goal_id=? AND u.merged_into IS NULL ORDER BY u.order_index, p.created_at, p.id",
+        (goal["id"],))
+    pool = [r for r in rows if (not wanted or r["unit_id"] in wanted)]
+    fresh = [r for r in pool if r["unit_id"] in touched]
+    picked_units: dict[str, int] = {}
+    questions: list[dict[str, Any]] = []
+    # 学过的单元排前面（一卷全是没学过的题没有诊断价值），但不够 count 时用其余单元补满，
+    # 否则一门只学了两个单元就永远出不了 8 张题
+    ordered = [r for r in pool if r["unit_id"] in touched] + [r for r in pool if r["unit_id"] not in touched]
+    for source in ordered:
+        if picked_units.get(source["unit_id"], 0) >= 2:      # 每个单元最多 2 题，逼出跨单元覆盖
+            continue
+        if any(q["prompt"] == source["prompt"] for q in questions):
+            continue
+        picked_units[source["unit_id"]] = picked_units.get(source["unit_id"], 0) + 1
+        questions.append({
+            "id": source["id"], "unit_id": source["unit_id"], "unit_title": source["unit_title"],
+            "kind": source["kind"], "prompt": source["prompt"],
+            "answer": source.get("answer") or "",
+            "rubric": json_loads(source.get("rubric_json") or "[]", []),
+        })
+        if len(questions) >= count:
+            break
+    if not questions:
+        raise ValueError("这些单元里还没有可用的探测题：先去学一遍，让系统把题面生成出来")
+    exam_id = new_id("exam")
+    ts = now_iso()
+    key = [{"id": q["id"], "answer": q["answer"], "rubric": q["rubric"]} for q in questions]
+    public = [{k: q[k] for k in ("id", "unit_id", "unit_title", "kind", "prompt")} for q in questions]
+    title = f"{goal['title']} · 自测卷"
+    with db.transaction():
+        db.insert("exams", {
+            "id": exam_id, "user_id": user_id, "goal_id": goal["id"], "title": title,
+            "minutes": minutes, "questions_json": json_dumps(public),
+            "answer_key_json": json_dumps(key), "status": "open",
+            "graded_by": "rules", "started_at": ts,
+        })
+        emit(db, "exam.started", {"exam_id": exam_id, "count": len(public),
+                                  "minutes": minutes, "cold_start": not bool(fresh)}, user_id)
+    return {
+        "exam_id": exam_id, "title": title, "minutes": minutes, "questions": public,
+        "deadline": goal.get("deadline"),
+        "note": "" if fresh else "这些单元都还没开始学：这份卷子当练习用，别当诊断。",
+    }
+
+
+def exam_grade(db: Database, user_id: str, exam_id: str, answers: Any) -> dict[str, Any]:
+    """按评分要点判分：能规则判的就规则判，没有要点的题如实标"待自己对答案"。
+
+    不拿"看起来像"冒充"判过了"：判不动的题必须让人自己看答案，这是自测卷唯一的诚信要求。
+    """
+    exam = db.one("SELECT * FROM exams WHERE id=? AND user_id=?", (str(exam_id or "").strip(), user_id))
+    if not exam:
+        raise ValueError("找不到这份卷子")
+    if exam["status"] == "graded":
+        raise ValueError("这份卷子已经交过了：重新组一份新的")
+    questions = json_loads(exam["questions_json"], []) or []
+    key = {k["id"]: k for k in json_loads(exam["answer_key_json"], []) or []}
+    given = {}
+    for item in (answers or []):
+        if isinstance(item, dict):
+            given[str(item.get("id"))] = str(item.get("text") or "")
+    ts = now_iso()
+    items = []
+    counts = {"correct": 0, "partial": 0, "wrong": 0, "blank": 0, "ungraded": 0}
+    for question in questions:
+        entry = key.get(question["id"]) or {}
+        rubric = [str(x) for x in (entry.get("rubric") or []) if str(x).strip()]
+        text = (given.get(question["id"]) or "").strip()[:4000]
+        if not text:
+            verdict, score, missed = "blank", 0.0, list(rubric)
+        elif not rubric:
+            verdict, score, missed = "ungraded", None, []
+        else:
+            ratio, _hits, missed = coverage(text, rubric)
+            score = round4(ratio)
+            verdict = "correct" if ratio >= 0.75 else ("partial" if ratio >= 0.35 else "wrong")
+        counts[verdict] += 1
+        items.append({
+            "id": question["id"], "verdict": verdict, "score": score,
+            "missed": [m for m in missed][:6],
+            "answer": entry.get("answer") or "", "prompt": question.get("prompt", ""),
+            "unit_title": question.get("unit_title", ""),
+        })
+    gradable = [i for i in items if i["score"] is not None]
+    total = round4(sum(float(i["score"]) for i in gradable) / len(gradable)) if gradable else None
+    result = {
+        "items": items, "counts": counts, "score": total,
+        "gradable": len(gradable), "needs_self_check": counts["ungraded"],
+        "graded_by": "rules",
+        "hint": ("评分要点来自资料；" + (f"{counts['ungraded']} 道题没有要点，需要你自己对答案。"
+                                        if counts["ungraded"] else "全部题目都按要点判过。")),
+    }
+    with db.transaction():
+        db.execute(
+            "UPDATE exams SET status='graded', answers_json=?, result_json=?, submitted_at=?, "
+            "graded_by='rules' WHERE id=?",
+            (json_dumps([{"id": q["id"], "text": given.get(q["id"], "")} for q in questions]),
+             json_dumps(result), ts, exam["id"]))
+        for item in items:
+            question = next((q for q in questions if q["id"] == item["id"]), None)
+            if not question:
+                continue
+            text = (given.get(question["id"]) or "").strip()
+            if not text:
+                continue
+            db.insert("attempts", {
+                "id": new_id("at"), "user_id": user_id, "unit_id": question["unit_id"],
+                "probe_id": question["id"], "kind": "exam", "response": text[:4000],
+                "score": float(item["score"]) if item["score"] is not None else 0.0,
+                "confidence": 0.0, "hints_used": 0,
+                "feedback_json": json_dumps({"source": "exam", "exam_id": exam["id"],
+                                             "verdict": item["verdict"], "missed": item["missed"]}),
+                "created_at": ts,
+            })
+        used = int(clamp((now() - parse_iso(exam["started_at"])).total_seconds() / 60.0, 0, 600))
+        touch_study_day(db, user_id, minutes=used)
+        emit(db, "exam.graded", {"exam_id": exam["id"], "score": total, "counts": counts}, user_id)
+    return {"exam_id": exam["id"], "title": exam["title"], "result": result,
+            "answers": [{"id": q["id"], "text": given.get(q["id"], ""),
+                         "prompt": q.get("prompt", ""), "unit_title": q.get("unit_title", ""),
+                         "answer": (key.get(q["id"]) or {}).get("answer", "")} for q in questions]}
+
+
+def exam_list(db: Database, user_id: str, limit: int = 20) -> dict[str, Any]:
+    rows = db.query(
+        "SELECT id, title, minutes, status, started_at, submitted_at, result_json, questions_json "
+        "FROM exams WHERE user_id=? ORDER BY started_at DESC LIMIT ?",
+        (user_id, int(clamp(limit, 1, 50))))
+    out = []
+    for row in rows:
+        result = json_loads(row["result_json"], {}) or {}
+        out.append({
+            "id": row["id"], "title": row["title"], "minutes": row["minutes"],
+            "status": row["status"], "started_at": row["started_at"],
+            "submitted_at": row["submitted_at"],
+            "count": len(json_loads(row["questions_json"], []) or []),
+            "score": result.get("score"), "counts": result.get("counts"),
+        })
+    return {"exams": out}
 
 
 # ---------------------------------------------------------------------------
@@ -1846,12 +2319,13 @@ def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any
 
 def compile_preview(db: Database, title: str, subject: str, text: str,
                     use_llm: bool = True, use_embeddings: bool = True,
-                    documents: list[Any] | None = None) -> dict[str, Any]:
+                    documents: list[Any] | None = None,
+                    coverage: str = "standard") -> dict[str, Any]:
     merged, docs = merge_material_documents(documents, text)
     if len(merged) < 60:
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
     pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
-                                      use_embeddings=use_embeddings)
+                                      use_embeddings=use_embeddings, coverage=coverage)
     qa = quality.qa_pack(pack)
     warnings = warnings + qa["warnings"]
     if docs:
@@ -1861,6 +2335,10 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
         pack["source"]["material_chars"] = len(merged)
     save_user_pack(pack)
     return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
+            # 覆盖档只在模型路径生效：本地编译器按小节一条一节，拧档位不改变任何东西，
+            # 所以要把"请求的档位"和"真正生效的档位"分开返回，界面才不能说谎
+            "coverage": {"requested": coverage,
+                         "applied": str((pack.get("source") or {}).get("coverage_mode") or "")},
             "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
                         "near_duplicates": qa["near_duplicates"],
                         "engine": qa["engine"]}}
@@ -1887,7 +2365,7 @@ def focus_finish(db: Database, user_id: str, session: str, minutes: int,
 
     只有 completed 才计入 study_days：把 15 分钟的半截算成 25 分钟，热力图就成假的了。
     """
-    session = str(session or "").strip()[:64]
+    session = str(session or "").strip()[:200]
     if not session:
         raise ValueError("缺少专注会话标识")
     outcome = "completed" if outcome == "completed" else "abandoned"

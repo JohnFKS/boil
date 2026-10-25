@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from . import embeddings, llm
+from . import decompose, embeddings, llm
 from .compiler import PROBE_TEMPLATES
 
 DUPLICATE_TITLE_RATIO = 0.82
@@ -32,9 +32,35 @@ def lint_pack(pack: dict[str, Any]) -> list[dict[str, Any]]:
         issues.append({"code": "no_units", "level": "error", "unit_id": None,
                        "detail": "内容包没有任何单元"})
     seen_titles: dict[str, str] = {}
+    titles = [str(u.get("title") or "") for u in units]
+    section_titles = [str(s.get("title") or "") for s in (pack.get("sections") or [])]
+
+    def pool_of(unit: dict[str, Any]) -> list[str]:
+        """候选名里必须剔掉自己：否则任何标题都能"匹配到自己"，归一化就永远不出建议。"""
+        own = norm(unit.get("title"))
+        return [t for t in titles if norm(t) != own] + section_titles
+
     for unit in units:
-        uid = norm(unit.get("id")) or norm(unit.get("title"))
         title = norm(unit.get("title"))
+        schedule = decompose.schedule_like(unit.get("title"))
+        if schedule:
+            back = decompose.canonical_title(unit.get("title"), pool_of(unit))
+            issues.append({"code": "schedule_like_title", "level": "warn",
+                           "unit_id": str(unit.get("id") or "") or None,
+                           "detail": f"标题「{title[:24]}」不像知识点：{schedule}"
+                                      + (f"；材料里更合适的名字是「{back[0]}」" if back else "")})
+        else:
+            # 「…的实现」「…判断问题」这类标题考的是同一个知识点，只是挂了题型尾巴
+            tail = decompose.strip_type_tail(unit.get("title"))
+            if tail != title:
+                back = decompose.canonical_title(unit.get("title"), pool_of(unit))
+                if back and norm(back[0]) != title:
+                    issues.append({"code": "type_tail_title", "level": "info",
+                                   "unit_id": str(unit.get("id") or "") or None,
+                                   "detail": f"标题「{title[:24]}」带着题型尾巴；"
+                                             f"材料里更合适的名字是「{back[0]}」（{back[1]}）"})
+
+        uid = norm(unit.get("id")) or title
         essence = norm(unit.get("essence"))
         if not title:
             issues.append({"code": "no_title", "level": "error", "unit_id": uid,
@@ -65,6 +91,15 @@ def lint_pack(pack: dict[str, Any]) -> list[dict[str, Any]]:
         if missing:
             issues.append({"code": "probe_kinds", "level": "warn", "unit_id": uid,
                            "detail": "缺少探针类型：" + "、".join(sorted(missing))})
+        if not unit.get("point_kind"):
+            issues.append({"code": "kind_missing", "level": "info", "unit_id": uid,
+                           "detail": "没有标出这是概念/原理/方法/事实里的哪一类",
+                           "patch": {"point_kind": decompose.classify_kind(
+                               f'{title} {essence} {" ".join(str(s) for s in steps)}')[0]}})
+        ref = unit.get("source_ref") or {}
+        if not (ref.get("anchor") and ref.get("id")):
+            issues.append({"code": "ungrounded", "level": "info", "unit_id": uid,
+                           "detail": "这条指不回材料里的具体句子，界面上会标成未溯源"})
         cards = unit.get("cards") or []
         if not cards:
             issues.append({"code": "no_cards", "level": "info", "unit_id": uid,

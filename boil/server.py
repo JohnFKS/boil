@@ -12,11 +12,11 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import (advisor, agent, backup, config, embeddings, events, feynman, llm,
                 markdown_fix, mastery, releases, services, socratic, styles)
-from .compiler import compile_material
+from .compiler import COVERAGE_MODES, compile_material
 from .db import Database, json_loads
 from .events import recent
 from .packs import PackError, unit_from_row
@@ -87,6 +87,13 @@ class App:
             ("POST", re.compile(r"^/api/feynman/evaluate$"), self.feynman_evaluate),
             ("GET", re.compile(r"^/api/review$"), self.review),
             ("GET", re.compile(r"^/api/cards$"), self.cards),
+            ("GET", re.compile(r"^/api/mistakes$"), self.mistakes),
+            ("GET", re.compile(r"^/api/cram$"), self.cram),
+            ("POST", re.compile(r"^/api/cram/shot$"), self.cram_shot),
+            ("POST", re.compile(r"^/api/cram/reset$"), self.cram_reset),
+            ("POST", re.compile(r"^/api/exam$"), self.exam_build),
+            ("POST", re.compile(r"^/api/exam/submit$"), self.exam_submit),
+            ("GET", re.compile(r"^/api/exams$"), self.exams),
             ("POST", re.compile(r"^/api/review/([^/]+)$"), self.review_rate),
             ("POST", re.compile(r"^/api/reviews/undo$"), self.review_undo),
             ("GET", re.compile(r"^/api/focus$"), self.focus_today),
@@ -329,9 +336,12 @@ class App:
             raise ApiError(400, "documents 必须是数组", "bad_request")
         use_llm = bool(body.get("use_llm", True))
         use_embeddings = bool(body.get("use_embeddings", True))
+        coverage = str(body.get("coverage") or "standard")
+        if coverage not in COVERAGE_MODES:
+            raise ApiError(400, "coverage 只能是 standard 或 full", "bad_request")
         return services.compile_preview(self.db, title, subject, text, use_llm,
                                         use_embeddings=use_embeddings,
-                                        documents=documents)
+                                        documents=documents, coverage=coverage)
 
     def material_fix(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -427,7 +437,57 @@ class App:
     def review(self, req, match, query, body):
         limit = int(_q(query, "limit") or 30)
         unit_id = _q(query, "unit_id") or None
+        ids = [s for s in (_q(query, "ids") or "").split(",") if s.strip()]
+        if ids:
+            return services.review_by_ids(self.db, config.DEFAULT_USER, ids)
         return services.review_queue(self.db, config.DEFAULT_USER, limit, unit_id)
+
+    def mistakes(self, req, match, query, body):
+        return services.mistake_book(self.db, config.DEFAULT_USER,
+                                     days=int(_q(query, "days") or 30),
+                                     limit=int(_q(query, "limit") or 80))
+
+    def cram(self, req, match, query, body):
+        return services.cram_plan(self.db, config.DEFAULT_USER, int(_q(query, "limit") or 12))
+
+    def cram_shot(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.cram_shot(self.db, config.DEFAULT_USER,
+                                      str(body.get("unit_id") or ""),
+                                      undo=bool(body.get("undo")))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def cram_reset(self, req, match, query, body):
+        return services.cram_reset(self.db, config.DEFAULT_USER)
+
+    def exam_build(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        try:
+            return services.exam_build(self.db, config.DEFAULT_USER,
+                                       minutes=int(body.get("minutes") or 30),
+                                       count=int(body.get("count") or 8),
+                                       unit_ids=body.get("unit_ids"))
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def exam_submit(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        answers = body.get("answers")
+        if answers is not None and not isinstance(answers, list):
+            raise ApiError(400, "answers 必须是数组", "bad_request")
+        try:
+            return services.exam_grade(self.db, config.DEFAULT_USER,
+                                       str(body.get("exam_id") or ""), answers or [])
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
+
+    def exams(self, req, match, query, body):
+        return services.exam_list(self.db, config.DEFAULT_USER, int(_q(query, "limit") or 20))
 
     def cards(self, req, match, query, body):
         return services.list_cards(
@@ -587,6 +647,21 @@ class App:
         services.reset_user(self.db, config.DEFAULT_USER)
         services.ensure_user(self.db)
         return {"ok": True, "reset": True}
+
+
+SECRET_QUERY_KEYS = ("token", "key", "secret", "password", "authorization", "api_key")
+
+
+def redact_path(raw: str | None) -> str:
+    """日志里可以有路径与查询键，不能有凭据值：令牌、密钥一律 ***。"""
+    parts = urlsplit(raw or "")
+    pairs = []
+    for name, values in parse_qs(parts.query, keep_blank_values=True).items():
+        secret = any(s in name.lower() for s in SECRET_QUERY_KEYS)
+        shown = "***" if secret else quote((values[0] or "")[:60], safe="")
+        pairs.append(f"{quote(name, safe='')}={shown}")
+    query = ("?" + "&".join(pairs)) if pairs else ""
+    return truncate(f"{parts.path}{query}", 160)
 
 
 def _q(query: dict[str, list[str]], key: str) -> str:
@@ -853,10 +928,25 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
+    def parse_request(self):
+        # rid 与起始时间在"请求行读完之后"钉下：打在 handle_one_request 开头会把
+        # keep-alive 连接上浏览器自己的思考时间也算成服务端耗时 —— 实测会出现
+        # "GET /api/settings/llm 200 7409ms" 这种假慢请求。
+        self._rid = os.urandom(4).hex()
+        self._t0 = time.perf_counter()
+        return super().parse_request()
+
+    def log_request(self, code="-", size="-"):
+        if self.command == "GET" and (self.path or "").startswith("/api/health"):
+            return          # 前端每秒级轮询健康检查，全记下来等于把日志淹掉
+        ms = (time.perf_counter() - getattr(self, "_t0", time.perf_counter())) * 1000.0
+        print(f"[http] rid={getattr(self, '_rid', '-')} ip={self.address_string()} "
+              f"{self.command} {redact_path(self.path)} {code} {ms:.1f}ms", file=sys.stderr)
+
     def log_message(self, fmt, *args):
         if args and str(args[0]).startswith("GET /api/health"):
             return
-        print(f"[http] {self.address_string()} {fmt % args}", file=sys.stderr)
+        print(f"[http] rid={getattr(self, '_rid', '-')} {fmt % args}", file=sys.stderr)
 
 
 class Server(ThreadingHTTPServer):

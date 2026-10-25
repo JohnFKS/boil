@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from boil import compiler, embeddings, llm, quality
+from boil import compiler, decompose, embeddings, llm, quality
 
 
 _TMP = None
@@ -68,7 +68,7 @@ class LintTest(unittest.TestCase):
                          "本地编译器应该补齐四类探针")
 
     def test_safe_repairs_fill_essence_and_are_idempotent(self):
-        pack = {"units": [unit(id="u9", essence="")]}
+        pack = {"units": [unit(id="u9", essence="", point_kind="procedure")]}
         issues = quality.lint_pack(pack)
         fixed, applied = quality.apply_safe_repairs(pack, issues)
         self.assertEqual(applied, 1)
@@ -76,6 +76,15 @@ class LintTest(unittest.TestCase):
         again_issues = quality.lint_pack(fixed)
         _fixed2, applied2 = quality.apply_safe_repairs(fixed, again_issues)
         self.assertEqual(applied2, 0, "没有实际变化时不该再计一次修改（qa-skip）")
+
+    def test_kind_missing_is_repaired_by_rules_not_left_blank(self):
+        pack = {"units": [unit(id="u9", title="银行家算法", point_kind="")]}
+        issues = quality.lint_pack(pack)
+        kind_issue = [i for i in issues if i["code"] == "kind_missing"]
+        self.assertEqual(len(kind_issue), 1)
+        fixed, applied = quality.apply_safe_repairs(pack, issues)
+        self.assertGreaterEqual(applied, 1)
+        self.assertIn(fixed["units"][0]["point_kind"], decompose.UNIT_KINDS)
 
     def test_qa_skip_when_patch_equals_original(self):
         pack = {"units": [unit(essence="提取练习")]}

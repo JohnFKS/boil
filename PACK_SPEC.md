@@ -89,7 +89,29 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 | `cover` | string | 否 | `ember` / `ink` / `steam` / `mint` |
 | `tags` | string[] | 否 | 展示标签 |
 | `source` | object | 否 | 来源、版本、生成时间、说明 |
+| `sections` | Section[] | 否 | 小节登记表；`coverage` / 出处核对的依据 |
+| `chapters` | Chapter[] | 否 | 第二层（章）：把小节聚成章 |
 | `units` | Unit[] | 是 | 非空，最多 100 个 |
+
+### Section（小节登记表）
+
+```json
+{"id": "sec-7", "title": "线程与调度", "chars": 412, "first": "线程是 CPU 调度的基本单位……"}
+```
+
+- `id` 是出处的指向目标，编译时按材料顺序编号；分批时长小节会切出 `sec-7#1` 这样的切片，
+  但登记表里只保留 `sec-7` —— 否则一节被切成三片就会被算成覆盖了三个主题。
+- **不带正文**：正文只在编译那一次用于逐字核对锚点，不回传、不落盘，避免把用户材料整份复制进包文件。
+- 第三方包可以不填 `sections`；此时质量指标里的 `coverage` 是 `null`（"不知道"），不是 100%。
+
+### Chapter（章）
+
+```json
+{"title": "进程与线程", "section_ids": ["sec-1", "sec-2", "sec-7"], "engine": "semantic"}
+```
+
+`engine`：`semantic` 按语义聚；`order` 表示嵌入模型不可用、退化成按顺序分块。
+归属是软的 —— 一节同时像两个章时可以进两个章。
 
 ## 3. Unit 字段
 
@@ -110,6 +132,7 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 | `estimated_minutes` | int | 否 | 默认 45 |
 | `order_index` | int | 否 | 顺序；同时用于隐式前置关系 |
 | `tags` | string[] | 否 | 单元标签 |
+| `point_kind` | string | 否 | `concept` / `principle` / `procedure` / `fact` / `meta`；缺失时质检按规则补 |
 | `source_ref` | object | 否 | 来源与版本；用于追溯 |
 | `relations` | Relation[] | 否 | 出边；目前支持 `prerequisite` |
 | `probes` | Probe[] | 是 | 至少 1 个；建议包含 recall + explain + apply + boundary |
@@ -124,6 +147,20 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 - `to` 必须存在于同一 Pack。
 - `kind` 目前只使用 `prerequisite`；其他类型保留。
 - 没有显式前置时，安装器会按 `order_index` 建立顺序前置。
+
+### SourceRef（出处）
+
+```json
+{"system": "boil-compiler", "kind": "section", "id": "sec-2", "title": "线程与调度",
+ "anchor": "线程是 CPU 调度的基本单位", "via": "declared"}
+```
+
+- `anchor` 必须是 `sections[id]` 那一节里**逐字出现**的一句话（10–40 字）。
+  编译器按空白差异容忍匹配（浏览器与模型都会吞换行），但不接受改写：
+  模型自报的"证据"核不上就不算证据。
+- `via`：`declared` 按声明的节号核过；`fallback` 模型改写了证据、退回原文里最像的那一句；
+  `local` 本地编译器自己切出来的；`none`（`kind:"unverified"`）全都核不上 —— 界面会标成「未溯源」。
+- 节号写错但句子是真的：按句子重新定位到真实那一节，出处以原文为准。
 
 ### Probe
 
@@ -188,6 +225,10 @@ Pack 是 Boil 的内容更新单元。一个 Pack 可以包含一个学科的一
 - **探针覆盖率**：recall / explain / apply / boundary 四类齐全的单元比例。
 - **DAG 无环**：prerequisite 关系无环。
 - **综合分**：0.5 × 原子率 + 0.4 × 探针覆盖 + 0.1 × DAG。
+- **材料覆盖率 `coverage`**：被任一单元引用过的小节，按**材料字数**加权的占比（不是按小节个数）。
+  没有 `sections` 登记表时为 `null`：那是"不知道"，不是"没问题"。同时给出 `missing`（哪几节没被拆）。
+- **溯源率 `grounding.rate`**：能逐字指回材料原句的单元占比，并附 `kinds` 分布（section / material / unverified）。
+- **类型缺口 `kind_gaps`**：概念 / 原理 / 方法 / 事实 / 策略里这份拆解一条都没有的那些。
 
 这是一个工程门禁，不是学习效果证明；高 stakes 内容仍需人工复核与来源核对。
 

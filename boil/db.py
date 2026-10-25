@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 from . import config
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -226,6 +226,31 @@ CREATE TABLE IF NOT EXISTS review_logs (
   source TEXT NOT NULL DEFAULT 'web'
 );
 
+CREATE TABLE IF NOT EXISTS cram_shots (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'unit',
+  target_id TEXT NOT NULL,
+  shot_at TEXT NOT NULL,
+  UNIQUE(user_id, kind, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS exams (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  goal_id TEXT,
+  title TEXT NOT NULL DEFAULT '',
+  minutes INTEGER NOT NULL DEFAULT 30,
+  questions_json TEXT NOT NULL DEFAULT '[]',
+  answer_key_json TEXT NOT NULL DEFAULT '[]',
+  answers_json TEXT NOT NULL DEFAULT '[]',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'open',
+  graded_by TEXT NOT NULL DEFAULT 'rules',
+  started_at TEXT NOT NULL,
+  submitted_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS explanations (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -313,6 +338,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_unit ON notes(user_id, unit_id);
 # 旧库升级用：新库由 SCHEMA 直接带上，旧库启动时幂等补列。
 EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "units": [("angle", "TEXT NOT NULL DEFAULT ''"),
+              ("point_kind", "TEXT NOT NULL DEFAULT ''"),
               ("merged_into", "TEXT"), ("merged_reason", "TEXT NOT NULL DEFAULT ''"),
               ("merged_op", "TEXT")],
     "cards": [("mistake_tags_json", "TEXT NOT NULL DEFAULT '[]'")],
