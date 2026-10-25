@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import io
+import io
 import json
 import re
 import sys
@@ -183,32 +185,33 @@ class IsolatedLlmConfig(unittest.TestCase):
     真踩过：`llm.set_config({"api_key": ""})` 在 tearDown 里把开发机上的真 key 清成了空串。
     所以路径重定向写在基类里，并且断言它生效，而不是指望每个测试自己记得。
     （`make test` 与 CI 另外把 BOIL_DATA_DIR 指到临时目录，做第二层保险。）
+
+    重定向挂在 `run()` 而不是 `setUp()`：子类覆盖 `setUp`/`tearDown` 却不 call super
+    这种事真的发生过（PlanOfflineTest 就是），结果隔离被静默跳过；而 `PlanModelTest.tearDown`
+    漏掉 super 又把全局路径留在了它自己的临时目录里，等那个 TemporaryDirectory 被 GC 回收、
+    目录被 rmtree 之后，下一个测试再写配置就撞上"目录已经没了"。
+    CPython 3.10 与 3.12 的回收时机不同，所以这条只在 CI 的 3.10 job 上炸出来。
     """
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(prefix="boil-agent-cfg-")
-        base = Path(self._tmp.name)
-        self._old = {
-            "DATA_DIR": config.DATA_DIR,
-            "LLM_CONFIG_PATH": config.LLM_CONFIG_PATH,
-            "LLM_STATE_PATH": config.LLM_STATE_PATH,
-            "EMB_CONFIG": embeddings._CONFIG_OVERRIDE,
-            "EMB_CACHE": embeddings._CACHE_OVERRIDE,
-        }
+    def run(self, result=None):
+        tmp = tempfile.TemporaryDirectory(prefix="boil-agent-cfg-")
+        base = Path(tmp.name)
+        old = {key: getattr(config, key) for key in
+               ("DATA_DIR", "LLM_CONFIG_PATH", "LLM_STATE_PATH")}
+        old_emb = (embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE)
         config.DATA_DIR = base
         config.LLM_CONFIG_PATH = base / "llm.json"
         config.LLM_STATE_PATH = base / "llm_state.json"
         (base / "embedding.json").write_text('{"enabled": false}', encoding="utf-8")
         embeddings._CONFIG_OVERRIDE = base / "embedding.json"
         embeddings._CACHE_OVERRIDE = base / "embedding_cache.json"
-        self.assertIn("boil-agent-cfg-", str(config.LLM_CONFIG_PATH))
-        super().setUp()
-
-    def tearDown(self):
-        for key, value in self._old.items():
-            setattr(config, key, value)
-        self._tmp.cleanup()
-        super().tearDown()
+        try:
+            return super().run(result)
+        finally:
+            for key, value in old.items():
+                setattr(config, key, value)
+            embeddings._CONFIG_OVERRIDE, embeddings._CACHE_OVERRIDE = old_emb
+            tmp.cleanup()
 
     @staticmethod
     def nonsense():
@@ -218,6 +221,38 @@ class IsolatedLlmConfig(unittest.TestCase):
             if candidate not in blob:
                 return candidate
         return "ｆｇｈｊｋｌ"
+
+
+class IsolationSurvivesCheatingSubclass(unittest.TestCase):
+    """把上面那条不变量钉住：忘了 call super 也不该碰到真配置。"""
+
+    def test_redirects_even_when_subclass_skips_super(self):
+        before = (str(config.LLM_CONFIG_PATH), str(config.DATA_DIR),
+                  str(embeddings._CONFIG_OVERRIDE))
+        seen: list[str] = []
+
+        class Cheater(IsolatedLlmConfig):
+            def setUp(self):                    # 故意不 super()
+                seen.append(str(config.LLM_CONFIG_PATH))
+
+            def tearDown(self):                 # 故意不 super()
+                pass
+
+            def test_writes_go_to_the_temp_dir(self):
+                llm.set_config({"api_key": "sk-test-not-a-real-key"})
+                self.assertIn("boil-agent-cfg-", str(config.LLM_CONFIG_PATH))
+
+        suite = unittest.TestLoader().loadTestsFromTestCase(Cheater)
+        outcome = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+        why = outcome.failures[0][1] if outcome.failures else (
+            outcome.errors[0][1] if outcome.errors else "")
+        self.assertTrue(outcome.wasSuccessful(), f"内层用例失败了：{why}")
+        self.assertEqual(1, len(seen))
+        self.assertIn("boil-agent-cfg-", seen[0], "子类跳过 super() 就没有隔离")
+        self.assertEqual(before, (str(config.LLM_CONFIG_PATH), str(config.DATA_DIR),
+                                  str(embeddings._CONFIG_OVERRIDE)),
+                         "测试结束后全局路径必须回到原处，不能留在已删除的临时目录里")
+
 
 
 class PlanOfflineTest(IsolatedLlmConfig):

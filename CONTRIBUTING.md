@@ -16,6 +16,7 @@ python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 | 层次 | 命令 | 它证明什么 |
 | --- | --- | --- |
 | 语法与单元 | `make check` | 逻辑、FSRS、编译、检索、契约 |
+| 测试隔离不被绕过 | `tests/test_zz_config_leak_guard.py` + `test_agent` 的守卫用例 | 跑完整套之后全局配置路径必须回到原处；覆盖 `setUp` 忘了 `super()` 也不许碰到真实 `data/llm.json` |
 | HTTP 契约 | `make check`（含 `tests/test_api.py`） | 状态码、`{ok,data}` 形状、错误码 |
 | 安全 | `python3 -m unittest tests.test_security` | 穿越、鉴权、请求体、跨站、密钥不外泄 |
 | 韧性 | `python3 -m unittest tests.test_resilience` | 并发写、坏配置、死上游、掐流、重复重置 |

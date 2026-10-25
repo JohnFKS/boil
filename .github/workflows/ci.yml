@@ -29,6 +29,12 @@ jobs:
           node-version: "22"
       - name: Compile Python
         run: python -m compileall -q boil tests tools run.py
+      - name: Check Python 3.10 is still the floor
+        # CI 矩阵跑 3.10 与 3.12，但"只用旧版本有的东西"这件事得有人盯着：
+        # 一条 3.11+ 的写法在 3.12 的 job 上永远不会红，只会在 3.10 上炸成一堆 traceback。
+        run: |
+          pip install --quiet vermin
+          vermin --target=3.10- --no-parse-comments --backport typing boil tests tools run.py
       - name: Check frontend syntax
         run: |
           set -e

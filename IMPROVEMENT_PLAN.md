@@ -1422,3 +1422,35 @@ kaobuddy 能吃 PDF/DOCX/RTF/图片/B 站字幕。Boil 原来只吃 `.md/.txt/.j
   现在审计会先等 `#advisor-body[data-advice-ready]`、对"还没进视口"的焦点位重量最多四次，
   并且**只有真的闭合了一圈才下"可达/不可达"的结论**（没闭合就如实报"这一轮结论不可信"）。
   教训：断言"某控件不可达"之前，先证明整条焦点环真的走完了。
+
+### 22.6 只有 CI 的 3.10 job 会告诉你的那个 bug
+
+推送后 CI 红了：`test (3.10)` 在 "Unit and integration tests" 失败，`test (3.12)` 全绿，本地 3.12 连跑三次也全绿。
+先排除两种便宜的解释：`vermin --target=3.10-` 判定这套代码**只需要 3.8**（不是用了新 API），
+本地重跑也不 flaky。于是拉了一个真的 `python 3.10.15` 独立构建跑整套 —— 一次就复现：
+
+```
+FileNotFoundError: '/tmp/.../boil-agent-cfg-wpqk49d1/llm.json0aml55sh'
+  boil/utils.py:111 os.chmod(tmp, mode)   ← 写配置文件时，那个目录已经不存在了
+```
+
+真正的因果链有两环，都不是产品代码的问题：
+
+1. `IsolatedLlmConfig` 把"配置路径重定向"写在 `setUp` 里，而 `PlanOfflineTest` 覆盖了自己的
+   `setUp`/`tearDown` 且**没有 call `super()`** —— 隔离被静默跳过。它写 `llm.json` 写到哪儿，
+   完全取决于上一个测试有没有擦干净。**在没设 `BOIL_DATA_DIR` 的开发机上，那就是仓库里的
+   `data/llm.json`，也就是把开发者自己的真实密钥清空**（这个事故基类注释里记着，结果防线本身可绕）。
+2. `PlanModelTest.tearDown` 也漏了 `super()`，于是全局路径被留在它自己的临时目录里；
+   等那个 `TemporaryDirectory` 对象被 GC 回收、finalizer `rmtree` 掉目录，下一个测试写配置就撞空目录。
+   **CPython 3.10 与 3.12 的回收时机不同**，所以 3.12 上"看起来没问题"。
+
+修法是把不变量放到绕不开的位置，而不是指望每个人记得写 `super()`：
+
+- 隔离改挂在 `IsolatedLlmConfig.run()` 上（`run` 是最外层包装，覆盖 `setUp`/`tearDown` 都影响不到它）。
+- `tests/test_agent.py` 加一条守卫：现场定义一个"故意不 call super"的子类跑一遍，
+  断言它仍然被隔离、且跑完全局路径回到原处。
+- `tests/test_zz_config_leak_guard.py`（文件名以 zz 开头 = discovery 最后执行）在**整套跑完之后**
+  检查 `config.*` 与嵌入覆盖值没被留在别处，并确认可写的 `llm.json` 不是仓库里那个真密钥文件。
+
+两条守卫都做了变异测试：把隔离拆掉 / 故意注入一次泄漏，守卫确实变红。教训写进 CONTRIBUTING 的
+验证阶梯里：**能靠"子类自觉 call super"维持的隔离，等于没有隔离。**
