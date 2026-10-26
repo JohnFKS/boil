@@ -17,6 +17,7 @@ python3 tools/browser_check.py   # 需要 Chromium 和已运行的服务
 | --- | --- | --- |
 | 语法与单元 | `make check` | 逻辑、FSRS、编译、检索、契约 |
 | 仓库体检（大文件/密钥文件） | `tests/test_zz_repo_hygiene.py` | 跟踪列表里不许出现 >2 MB 的文件、`core.*` 崩溃转储或任何密钥形态文件 |
+| 真人边界探针 | `tools/real_user_probe.py --phase 1/2/3`（需本机 Chromium） | 连点、中途刷新、填错地址、清空地址、手机找设置、重启后状态：只断言用户看得见的文字 |
 | 测试隔离不被绕过 | `tests/test_zz_config_leak_guard.py` + `test_agent` 的守卫用例 | 跑完整套之后全局配置路径必须回到原处；覆盖 `setUp` 忘了 `super()` 也不许碰到真实 `data/llm.json` |
 | HTTP 契约 | `make check`（含 `tests/test_api.py`） | 状态码、`{ok,data}` 形状、错误码 |
 | 安全 | `python3 -m unittest tests.test_security` | 穿越、鉴权、请求体、跨站、密钥不外泄 |

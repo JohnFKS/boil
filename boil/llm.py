@@ -20,7 +20,8 @@ from typing import Any, Iterable, Iterator
 from urllib.parse import urlsplit
 
 from . import config
-from .utils import jwt_like_mask, now_iso, read_json, write_json_atomic
+from .utils import (jwt_like_mask, normalize_base_url, now_iso, read_json,
+                   write_json_atomic)
 
 DEFAULT_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -182,7 +183,16 @@ def get_config() -> dict[str, Any]:
     if not isinstance(stored, dict):
         stored = {}
     cfg = {**base, **{k: v for k, v in stored.items() if v is not None}}
-    cfg["base_url"] = (_text(cfg.get("base_url")) or DEFAULT_BASE).rstrip("/")
+    # 同 embeddings：显式清空过就保持空，别让"清掉地址"变成"发去 OpenAI"。
+    # 优先级：文件里写过的值（含空串）> 环境变量 > 内置默认。
+    stored_url = stored.get("base_url")
+    if isinstance(stored_url, str) and stored_url.strip():
+        url = stored_url.strip()
+    elif isinstance(stored_url, str):
+        url = ""
+    else:
+        url = _text(base.get("base_url")) or DEFAULT_BASE
+    cfg["base_url"] = url.rstrip("/")
     cfg["model"] = _text(cfg.get("model")) or DEFAULT_MODEL
     cfg["deep_model"] = _text(cfg.get("deep_model")) or cfg["model"]
     cfg["api_key"] = _text(cfg.get("api_key"))
@@ -213,8 +223,10 @@ def get_config() -> dict[str, Any]:
 
 def set_config(payload: dict[str, Any]) -> dict[str, Any]:
     cur = get_config()
+    incoming = payload.get("base_url")
     out = {
-        "base_url": (payload.get("base_url") or cur["base_url"]).rstrip("/"),
+        "base_url": normalize_base_url(incoming if str(incoming or "").strip()
+                                       else cur["base_url"]).rstrip("/"),
         "model": (payload.get("model") or cur["model"]).strip(),
         "deep_model": (payload.get("deep_model") or "").strip(),
         "temperature": payload.get("temperature", cur["temperature"]),
@@ -265,7 +277,9 @@ def mask(key: str) -> str:
 def enabled() -> bool:
     if config.LLM_OFF:
         return False
-    return bool(get_config().get("api_key"))
+    cfg = get_config()
+    # 没有地址的 Key 不该被当成"可以开始发请求"：那会退到默认厂商端点
+    return bool(cfg.get("api_key") and cfg.get("base_url"))
 
 
 def mode() -> str:

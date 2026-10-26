@@ -561,7 +561,10 @@ class App:
     def llm_set(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
-        llm.set_config(body)
+        try:
+            llm.set_config(body)
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
         return llm.public_config()
 
     def llm_cache_clear(self, req, match, query, body):
@@ -574,13 +577,16 @@ class App:
     def embedding_set(self, req, match, query, body):
         if not isinstance(body, dict):
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
-        embeddings.set_config(
-            base_url=body.get("base_url"),
-            model=body.get("model"),
-            api_key=body.get("api_key"),
-            enabled=body.get("enabled"),
-            timeout=body.get("timeout"),
-        )
+        try:
+            embeddings.set_config(
+                base_url=body.get("base_url"),
+                model=body.get("model"),
+                api_key=body.get("api_key"),
+                enabled=body.get("enabled"),
+                timeout=body.get("timeout"),
+            )
+        except ValueError as exc:
+            raise ApiError(400, str(exc), "bad_request") from exc
         return embeddings.public_config()
 
     def embedding_test(self, req, match, query, body):

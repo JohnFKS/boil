@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+from urllib.parse import urlparse
 import secrets
 import tempfile
 import time
@@ -78,6 +79,24 @@ def slugify(text: str, fallback: str = "item") -> str:
     text = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", text, flags=re.UNICODE)
     text = re.sub(r"-{2,}", "-", text).strip("-")
     return text[:64] or fallback
+
+
+def normalize_base_url(value: Any, field: str = "Base URL") -> str:
+    """把"模型地址"这种一眼能填错的东西，在保存时就拦下来。
+
+    以前不校验：填成 `ht tp://x` 也回一句"已启用"，用户要到第一次调用失败才知道坏了，
+    而失败信息是网络层的，看不出是自己粘错了地址。
+    """
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if re.search(r"\s", url):
+        raise ValueError(f"{field} 里不能有空格，看起来是把别的东西一起粘进来了")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"{field} 要写成 https://主机/路径 的形式，"
+                         f"例如 https://api.openai.com/v1（现在这个是 {url[:40]}）")
+    return url.rstrip("/")
 
 
 def clamp(value: float, low: float, high: float) -> float:

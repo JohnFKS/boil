@@ -54,6 +54,33 @@ class EmbeddingTest(unittest.TestCase):
         self.assertEqual(sum(len(g) for g in groups), len(paragraphs))
 
 
+class EmbeddingBaseUrlValidation(EmbeddingTest):
+    """嵌入地址和模型地址是同一种错误入口，得一起收。"""
+
+    def test_nonsense_base_url_is_rejected(self):
+        for bad in ("ht tp://x", "not-a-url", "https://", "ftp://a.b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    embeddings.set_config(base_url=bad)
+
+
+    def test_cleared_url_does_not_refill_the_suggested_cloud_endpoint(self):
+        embeddings.set_config(base_url="https://cloud.example/v1", api_key="sk-e", model="m")
+        self.assertTrue(embeddings.configured())
+        embeddings.set_config(base_url="")
+        self.assertEqual(embeddings.get_config()["base_url"], "")
+        self.assertFalse(embeddings.configured(),
+                         "清空地址后还指向第三方，等于用户关不掉了上传")
+
+    def test_valid_base_url_is_normalized_and_blank_clears_back_to_local(self):
+        embeddings.set_config(base_url="http://127.0.0.1:9/v1/")
+        self.assertEqual(embeddings.get_config()["base_url"], "http://127.0.0.1:9/v1")
+        # 与模型配置不同：嵌入有独立的 enabled 开关，清空地址就是"回到本地"，
+        # 所以这里空串是显式清除而不是"保持原值"。
+        embeddings.set_config(base_url="   ")
+        self.assertEqual(embeddings.get_config()["base_url"], "")
+
+
 class MathPackTest(unittest.TestCase):
     def test_math_pack_has_formulas_and_katex_assets(self):
         import json

@@ -455,7 +455,11 @@ export function openModal({ title = "", subtitle = "", body = "", actions = [], 
     modal.style.transform = "translateY(8px) scale(.99)";
     setTimeout(() => backdrop.remove(), 160);
     document.removeEventListener("keydown", onKey);
-    if (opener && opener.isConnected) opener.focus();   // 键盘用户不该被丢回页面顶端
+    // 键盘用户不该被丢回页面顶端。用快捷键打开的弹窗没有"打开它的按钮"，
+    // 这时 opener 是 body，focus() 等于什么都没做 —— 退到能再次打开它的那个入口上。
+    const back = (opener && opener !== document.body && opener.isConnected) ? opener
+      : document.querySelector("#search-btn");
+    if (back && back.focus) back.focus();
   };
   const onKey = (e) => {
     if (e.key === "Escape" && closable) { close(); return; }

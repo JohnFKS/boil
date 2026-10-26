@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
-from .utils import jwt_like_mask, read_json, write_json_atomic
+from .utils import jwt_like_mask, normalize_base_url, read_json, write_json_atomic
 
 LOCAL_DIM = 256
 LOCAL_MODEL = "local-hash-256"
@@ -101,7 +101,12 @@ def get_config() -> dict[str, Any]:
         cfg["model"] = _env("BOIL_EMBEDDING_MODEL")
     if _env("BOIL_EMBEDDING_TIMEOUT").isdigit():
         cfg["timeout"] = int(_env("BOIL_EMBEDDING_TIMEOUT"))
-    cfg["base_url"] = str(cfg.get("base_url") or SUGGEST["base_url"]).rstrip("/")
+    # 只有"从没配过"才回填建议地址；用户显式清空过就必须尊重空值 ——
+    # 否则"我把地址栏清掉了"会变成继续往第三方发文本。
+    if "base_url" in stored:
+        cfg["base_url"] = str(stored.get("base_url") or "").strip().rstrip("/")
+    else:
+        cfg["base_url"] = str(cfg.get("base_url") or SUGGEST["base_url"]).rstrip("/")
     cfg["model"] = str(cfg.get("model") or SUGGEST["model"])
     cfg["api_key"] = str(cfg.get("api_key") or "").strip()
     cfg["enabled"] = bool(cfg.get("enabled", True))
@@ -117,7 +122,7 @@ def set_config(base_url: str | None = None, model: str | None = None,
     if not isinstance(cur, dict):
         cur = {}
     if base_url is not None:
-        cur["base_url"] = str(base_url).strip().rstrip("/")
+        cur["base_url"] = normalize_base_url(base_url).rstrip("/")
     if model is not None:
         cur["model"] = str(model).strip()
     if api_key is not None:

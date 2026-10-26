@@ -220,6 +220,64 @@ class LLMGatewayTest(unittest.TestCase):
         self.assertNotIn("response_format", FakeHandler.requests[1])
 
 
+
+class BaseUrlValidationTest(unittest.TestCase):
+    """Base URL 是用户最容易粘错的一项：保存时就要说清楚，而不是等第一次调用失败。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="boil-url-")
+        base = Path(self.tmp.name)
+        self.old = {k: getattr(config, k) for k in ("DATA_DIR", "LLM_CONFIG_PATH", "LLM_STATE_PATH")}
+        config.DATA_DIR = base
+        config.LLM_CONFIG_PATH = base / "llm.json"
+        config.LLM_STATE_PATH = base / "llm_state.json"
+
+    def tearDown(self):
+        for key, value in self.old.items():
+            setattr(config, key, value)
+        self.tmp.cleanup()
+
+    def test_nonsense_urls_are_rejected_with_a_readable_reason(self):
+        for bad, why in (("ht tp://x", "空格"), ("not-a-url", "https://"),
+                         ("https://", "主机"), ("ftp://a.b", "https://")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    llm.set_config({"base_url": bad})
+                self.assertIn(why, str(ctx.exception))
+
+    def test_valid_urls_are_kept_and_normalized(self):
+        llm.set_config({"base_url": "http://127.0.0.1:9/v1/"})
+        self.assertEqual(llm.get_config()["base_url"], "http://127.0.0.1:9/v1")
+
+    def test_blank_base_url_keeps_the_previous_one(self):
+        llm.set_config({"base_url": "https://good.example/v1"})
+        llm.set_config({"base_url": "   "})
+        self.assertEqual(llm.get_config()["base_url"], "https://good.example/v1")
+
+
+    def test_clearing_the_url_really_disables_the_gateway_instead_of_defaulting_to_openai(self):
+        """清掉地址 = 不发了。回填默认厂商端点等于把材料寄给用户没选过的服务商。"""
+        llm.set_config({"base_url": "https://my.example/v1", "api_key": "sk-x"})
+        self.assertTrue(llm.enabled())
+        config.LLM_CONFIG_PATH.write_text(json.dumps({"base_url": "", "api_key": "sk-x"}),
+                                          encoding="utf-8")
+        self.assertEqual(llm.get_config()["base_url"], "")
+        self.assertFalse(llm.enabled(), "没有地址却有 Key 时不该自认已启用")
+
+    def test_a_never_configured_install_still_falls_back_to_the_default_endpoint(self):
+        cfg = llm.get_config()
+        self.assertEqual(cfg["base_url"], llm.DEFAULT_BASE)
+        self.assertFalse(llm.enabled())
+
+    def test_a_rejected_save_leaves_the_old_config_intact(self):
+        llm.set_config({"base_url": "https://good.example/v1", "api_key": "sk-keep-me-123456"})
+        with self.assertRaises(ValueError):
+            llm.set_config({"base_url": "ht tp://bad"})
+        cfg = llm.get_config()
+        self.assertEqual(cfg["base_url"], "https://good.example/v1")
+        self.assertEqual(cfg["api_key"], "sk-keep-me-123456")
+
+
 class CacheTest(unittest.TestCase):
     """内容寻址缓存：同样输入第二次不再打网络，也不再漂移。"""
 

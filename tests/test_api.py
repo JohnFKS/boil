@@ -794,6 +794,22 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(action["requires_typed_confirm"])
         self.assertEqual(action["risk"], "danger")
 
+    def test_31_nonsense_base_url_is_400_not_500(self):
+        """填错地址是真人最常犯的错：要 400 + 说清哪儿不对，不能 500 也不能默默保存成功。"""
+        for path in ("/api/settings/llm", "/api/settings/embeddings"):
+            for bad in ("ht tp://x", "not-a-url"):
+                with self.subTest(path=path, bad=bad):
+                    try:
+                        self.call("POST", path, {"base_url": bad})
+                        self.fail(f"{path} 接受了坏地址 {bad!r}")
+                    except urllib.error.HTTPError as exc:
+                        body = exc.read().decode()
+                        self.assertEqual(exc.code, 400, f"{path} 对坏地址回了 {exc.code}")
+                        self.assertIn("Base URL", body)
+        good = self.call("POST", "/api/settings/embeddings",
+                         {"base_url": "http://127.0.0.1:9/v1"})["data"]
+        self.assertEqual(good["base_url"], "http://127.0.0.1:9/v1")
+
     def test_07_unknown_route(self):
         try:
             self.call("GET", "/api/nope")
