@@ -1857,3 +1857,23 @@ button.release-head:hover { border-color: var(--line-strong); color: var(--text)
 .material-quote { margin: 0; padding: 8px 10px; border-left: 2px solid var(--teal); background: rgba(45,212,191,0.07); font-size: 12px; line-height: 1.65; color: var(--text-2); border-radius: 0 8px 8px 0; }
 .node-kind-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .node-kind-row code { font-family: var(--font-mono); font-size: 10px; }
+
+/* 编译任务：百分比、统计、逐条事件与常驻错误 */
+.compile-stats { display: flex; flex-wrap: wrap; gap: 6px; }
+.compile-warn { border-left: 2px solid var(--gold); background: var(--gold-soft); padding: 8px 10px; border-radius: 0 8px 8px 0; font-size: 11.5px; color: var(--text-2); }
+.compile-warn strong { color: var(--gold); }
+.compile-warn ul { margin: 5px 0 0; padding-left: 16px; }
+.compile-warn li { margin-top: 3px; }
+.compile-events-wrap summary, .compile-progress details summary { cursor: pointer; font-size: 11.5px; color: var(--muted); }
+.compile-events { margin-top: 6px; max-height: 190px; overflow-y: auto; display: grid; gap: 3px; font-size: 11px; }
+.compile-event { display: grid; grid-template-columns: 58px 34px 1fr; gap: 6px; align-items: start; padding: 4px 6px; border-left: 2px solid var(--line-strong); background: rgba(127, 127, 127, 0.05); border-radius: 0 5px 5px 0; }
+.compile-event-time { font-family: var(--font-mono); color: var(--faint); white-space: nowrap; }
+.compile-event-level { color: var(--muted); }
+.compile-event-body { color: var(--text-2); line-height: 1.5; word-break: break-word; }
+.compile-event-phase { color: var(--faint); margin-right: 6px; }
+.compile-event-detail { display: block; color: var(--faint); font-size: 10.5px; margin-top: 2px; }
+.compile-event.level-warn { border-left-color: var(--gold); }
+.compile-event.level-warn .compile-event-level { color: var(--gold); }
+.compile-event.level-error { border-left-color: var(--danger); background: var(--danger-soft); }
+.compile-event.level-error .compile-event-level { color: var(--danger); }
+.compile-trace { max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-size: 10px; color: var(--muted); }

@@ -113,6 +113,60 @@ class CompileJobsUnitTest(unittest.TestCase):
         self.assertIsNone(compile_jobs.status("missing"))
         self.assertIsNone(compile_jobs.cancel("missing"))
 
+    def test_detailed_events_warnings_and_stats(self):
+        def runner(on_progress):
+            on_progress("outline", 0, 1, "正在通读全篇并生成学习大纲…")
+            on_progress("batch", 0, 2, "大纲已就绪，共 2 批材料要编译…",
+                        "info", "12 个小节 · 58,189 字符")
+            on_progress("batch", 1, 2, "第 1/2 批模型调用失败，本批已跳过",
+                        "warn", "HTTP 400")
+            on_progress("batch", 2, 2, "已完成第 2/2 批", "info", "本批新增 3 个单元")
+            return {"pack": {"id": "x", "units": [{"title": "成本函数"}]},
+                    "warnings": ["第 1/2 批编译失败，已跳过：HTTP 400"]}
+
+        job = compile_jobs.submit(
+            {"documents": [{"name": "a.md", "text": "x" * 100}], "use_llm": True}, runner)
+        st = self._wait(job["job_id"])
+        self.assertEqual(st["state"], "done")
+        self.assertGreaterEqual(len(st["events"]), 5)
+        self.assertIn("warn", {e["level"] for e in st["events"]})
+        self.assertTrue(any("HTTP 400" in e["detail"] for e in st["events"]))
+        self.assertTrue(any("HTTP 400" in w for w in st["warnings"]))
+        self.assertGreaterEqual(st["stats"]["warnings"], 1)
+        self.assertEqual(st["stats"]["units"], 1)
+        self.assertEqual(st["percent"], 100)
+        self.assertEqual(st["phase_label"], "已完成")
+        self.assertEqual(st["material"]["documents"], 1)
+        self.assertEqual(st["material"]["chars"], 100)
+
+    def test_validation_stage_keeps_batch_scale(self):
+        def runner(on_progress):
+            on_progress("batch", 0, 10, "共 10 批材料要编译…")
+            on_progress("batch", 10, 10, "已完成第 10/10 批")
+            on_progress("validate", 1, 1, "正在做内容质检…")
+            return {"pack": {"id": "x", "units": []}}
+
+        job = compile_jobs.submit({"text": "scale"}, runner)
+        st = self._wait(job["job_id"])
+        self.assertEqual((st["current"], st["total"]), (10, 10))
+        self.assertEqual(st["percent"], 100)
+
+    def test_error_exposes_phase_message_and_traceback(self):
+        def runner(on_progress):
+            on_progress("batch", 2, 5, "正在编译第 3/5 批…")
+            raise RuntimeError("模型服务返回 HTTP 502")
+
+        job = compile_jobs.submit({"text": "err"}, runner)
+        st = self._wait(job["job_id"])
+        self.assertEqual(st["state"], "error")
+        self.assertEqual(st["error"]["phase"], "batch")
+        self.assertIn("HTTP 502", st["error"]["message"])
+        self.assertIn("RuntimeError", st["error"]["traceback"])
+        self.assertTrue(any(e["level"] == "error" for e in st["events"]))
+        self.assertEqual((st["current"], st["total"]), (2, 5))
+        # 错误不该被算成「告警」
+        self.assertEqual(st["stats"]["errors"], 1)
+
 
 class CompilerBudgetTest(unittest.TestCase):
     def test_skeleton_stays_within_budget_and_keeps_tail_sections(self):
@@ -226,6 +280,18 @@ class CompileJobsApiTest(unittest.TestCase):
         code, sync = self.call("POST", "/api/packs/compile", body)
         self.assertEqual(code, 200)
         self.assertTrue(sync["data"]["pack"]["units"])
+
+    def test_status_exposes_detailed_progress(self):
+        body = {"title": "详细进度", "text": MATERIAL, "use_llm": False,
+                "use_embeddings": False}
+        code, started = self.call("POST", "/api/packs/compile", {**body, "async": True})
+        self.assertEqual(code, 200)
+        st = self.wait_done(started["data"]["job_id"])
+        for key in ("events", "warnings", "stats", "percent", "phase_label", "material"):
+            self.assertIn(key, st)
+        self.assertTrue(st["events"])
+        self.assertEqual(st["percent"], 100)
+        self.assertTrue(any("本地编译器" in e["message"] for e in st["events"]))
 
     def test_async_validates_before_queueing(self):
         code, payload = self.call("POST", "/api/packs/compile", {

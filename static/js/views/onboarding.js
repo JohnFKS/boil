@@ -1,7 +1,7 @@
 /* Onboarding: choose a pack or compile your own material, then create a goal. */
 import { aiFailure, aiSuccess, escapeHTML, icon, pct, pointKindMeta, toast } from "../utils.js";
 import { fileToText } from "../docImport.js";
-import { compileProgressText, runCompile, savedJobId } from "../compileJob.js";
+import { compileProgressMarkup, renderCompileProgress, runCompile, savedJobId } from "../compileJob.js";
 
 const KIND_LABELS = Object.fromEntries(
   Object.entries(pointKindMeta).map(([k, v]) => [k, v.label]));
@@ -188,17 +188,12 @@ export async function render(el, ctx, params) {
     body.querySelector("[data-skip]")?.addEventListener("click", () => ctx.navigate("#/dashboard"));
   }
 
+  function compileBox() {
+    return body.querySelector("[data-compile-progress]");
+  }
+
   function showCompileProgress(st) {
-    const box = body.querySelector("#ob-compile-progress");
-    if (!box) return;
-    box.style.display = "";
-    const done = st.total > 0 ? Math.min(100, Math.round(st.current / st.total * 100)) : 0;
-    const bar = body.querySelector("#ob-compile-bar");
-    if (bar) bar.style.width = `${done}%`;
-    const msg = body.querySelector("#ob-compile-msg");
-    if (msg) msg.textContent = compileProgressText(st);
-    const clock = body.querySelector("#ob-compile-clock");
-    if (clock) clock.textContent = done ? `${done}%` : "准备中";
+    renderCompileProgress(compileBox(), st);
   }
 
   function beginCompile() {
@@ -206,19 +201,21 @@ export async function render(el, ctx, params) {
     compileAbort = ctrl;
     const btn = body.querySelector("[data-submit]");
     if (btn) { btn.disabled = true; btn.innerHTML = "正在编译…"; }
-    const cancel = body.querySelector("#ob-compile-cancel");
+    const cancel = body.querySelector("[data-compile-cancel]");
     if (cancel) cancel.onclick = () => ctrl.abort();
     showCompileProgress({ state: "running", current: 0, total: 0,
                           message: "正在提交编译任务…", elapsed: 0 });
     return ctrl;
   }
 
-  function endCompile(label) {
+  function endCompile(label, keepProgress = false) {
     compileAbort = null;
     const btn = body.querySelector("[data-submit]");
     if (btn) { btn.disabled = false; btn.innerHTML = label || btn.innerHTML; }
-    const box = body.querySelector("#ob-compile-progress");
-    if (box) box.style.display = "none";
+    if (!keepProgress) {
+      const box = compileBox();
+      if (box) box.style.display = "none";
+    }
   }
 
   function applyCompileResult(res) {
@@ -240,11 +237,13 @@ export async function render(el, ctx, params) {
       });
       applyCompileResult(res);
     } catch (e) {
-      endCompile();
+      const failed = e.jobStatus;
       toast(e.cancelled ? "已取消编译，可重新选择材料再试"
                         : `${e.message || "无法继续上次的编译"}；请重新选择材料文件。`,
             e.cancelled ? "info" : "error", 8000);
       renderStep2();
+      if (failed) showCompileProgress(failed);   // 失败原因常驻，别只剩一个 8 秒 toast
+      endCompile(undefined, Boolean(failed));
     } finally {
       busy = false;
     }
@@ -296,14 +295,7 @@ export async function render(el, ctx, params) {
           <strong>${mode === "material" ? "下一步会先编译，不会立刻开始。" : `将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。`}</strong><br>
           ${mode === "material" ? "编译完成后，你可以预览单元再开始。" : `预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
         </div>
-        <div class="preview-box" id="ob-compile-progress" style="display:none">
-          <div class="between"><strong>正在编译材料</strong><span class="badge badge-muted" id="ob-compile-clock">准备中</span></div>
-          <div class="progress-line"><i id="ob-compile-bar" style="width:0%"></i></div>
-          <div class="between mt-2">
-            <span class="hint" id="ob-compile-msg">正在提交任务…</span>
-            <button class="btn btn-ghost btn-sm" type="button" id="ob-compile-cancel">取消编译</button>
-          </div>
-        </div>
+        ${compileProgressMarkup()}
         <div class="onboarding-actions">
           <button class="btn btn-ghost" data-back>上一步</button>
           <button class="btn btn-primary" data-submit>${mode === "material" ? "编译并预览" : "生成学习路径"} ${icon("arrow", 15)}</button>
@@ -505,6 +497,7 @@ export async function render(el, ctx, params) {
       busy = true;
       const btn = body.querySelector("[data-submit]");
       const old = btn.innerHTML;
+      let failedWithDetail = false;
       btn.disabled = true; btn.innerHTML = "正在准备…";
       try {
         if (mode === "material") {
@@ -535,10 +528,12 @@ export async function render(el, ctx, params) {
         }
         await createGoal({ name, pack_id: selected.id, goal_title: goalTitle, deadline, daily_minutes: daily, level: draft.level });
       } catch (e) {
+        failedWithDetail = Boolean(e.jobStatus);
+        if (e.jobStatus) showCompileProgress(e.jobStatus);
         toast(e.cancelled ? "已取消编译，可以修改材料后重试" : (e.message || "创建失败"),
               e.cancelled ? "info" : "error", 7000);
       } finally {
-        endCompile(old);
+        endCompile(old, failedWithDetail);
         busy = false;
       }
     });
@@ -594,7 +589,7 @@ export async function render(el, ctx, params) {
                 </span>
               </div>`).join("")}
           </div>` : ""}
-        ${qualityIssues.length || duplicates.length ? `
+        ${qualityIssues.length || duplicates.length || compileWarnings.length ? `
           <div class="preview-box mt-3">
             <div class="between"><strong>编译质检</strong><span class="badge ${compileQuality?.engine === "model" ? "badge-teal" : "badge-muted"}">${compileQuality?.engine === "model" ? "AI 复核" : "本地规则"}</span></div>
             ${qualityIssues.length ? `<ul class="digest-advice">${qualityIssues.map(i => `<li>[${escapeHTML(i.code)}] ${escapeHTML(i.detail || "")}</li>`).join("")}</ul>` : ""}

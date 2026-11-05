@@ -2324,6 +2324,16 @@ def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any
     }
 
 
+def _report(cb: Any, phase: str, current: int, total: int, message: str,
+            level: str = "info", detail: str = "") -> None:
+    if cb is None:
+        return
+    if level == "info" and not detail:
+        cb(phase, current, total, message)
+    else:
+        cb(phase, current, total, message, level, detail)
+
+
 def compile_preview(db: Database, title: str, subject: str, text: str,
                     use_llm: bool = True, use_embeddings: bool = True,
                     documents: list[Any] | None = None,
@@ -2332,17 +2342,26 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
     merged, docs = merge_material_documents(documents, text)
     if len(merged) < 60:
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
+    _report(on_progress, "prepare", 0, 0, "材料已合并，准备编译",
+            detail=f"{len(docs)} 份文件 · {len(merged):,} 字符 · 覆盖档 {coverage}")
     pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
                                       use_embeddings=use_embeddings, coverage=coverage,
                                       on_progress=on_progress)
+    _report(on_progress, "validate", 1, 1, "正在做内容质检…",
+            detail=f"生成 {len(pack.get('units') or [])} 个单元")
     qa = quality.qa_pack(pack)
     warnings = warnings + qa["warnings"]
+    for note in qa["warnings"]:
+        _report(on_progress, "validate", 1, 1, str(note), level="warn")
     if docs:
         pack.setdefault("source", {})["documents"] = [
             {"name": d["name"], "chars": d["chars"]} for d in docs
         ]
         pack["source"]["material_chars"] = len(merged)
     save_user_pack(pack)
+    _report(on_progress, "validate", 1, 1, "内容包已保存，准备预览",
+            detail=f"pack={pack['id']} · {len(pack.get('units') or [])} 个单元 · "
+                   f"{len(warnings)} 条告警")
     return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
             # 覆盖档只在模型路径生效：本地编译器按小节一条一节，拧档位不改变任何东西，
             # 所以要把"请求的档位"和"真正生效的档位"分开返回，界面才不能说谎

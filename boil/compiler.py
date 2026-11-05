@@ -53,10 +53,18 @@ def coverage_text(mode: Any) -> str:
 
 
 def _progress(cb: Any, phase: str, current: int = 0, total: int = 0,
-              message: str = "") -> None:
-    """把编译进度交给后台任务。回调可以用异常中断（取消），这里不吞。"""
-    if cb is not None:
+              message: str = "", *, level: str = "info", detail: str = "") -> None:
+    """把编译进度/告警交给后台任务。回调可以用异常中断（取消），这里不吞。
+
+    普通进度维持四参数调用，兼容只关心「第几批」的旧回调；告警与错误才带上
+    level/detail，让前端和日志能把「哪一批因为什么失败了」说清楚。
+    """
+    if cb is None:
+        return
+    if level == "info" and not detail:
         cb(phase, current, total, message)
+    else:
+        cb(phase, current, total, message, level, detail)
 
 
 def _norm_text(value: Any, limit: int) -> str:
@@ -686,14 +694,21 @@ def compile_material_batched(title: str, subject: str, text: str,
         # 否则用户拿到的是"只看了前 6000 字"的包，还以为材料都读过了。
         outline_data = {}
         warnings.append(f"全篇大纲生成失败，已按材料原顺序分批：{str(exc)[:140]}")
+        _progress(on_progress, "outline", 0, 1, "全篇大纲生成失败，改按材料原顺序分批",
+                  level="warn", detail=str(exc))
     outline_hint = _outline_titles(outline_data)
     batches = _batch_sections(tables)
     _progress(on_progress, "batch", 0, len(batches),
-              f"大纲已就绪，共 {len(batches)} 批材料要编译…")
+              f"大纲已就绪，共 {len(batches)} 批材料要编译…",
+              detail=(f"{len(tables)} 个小节 · {len(text):,} 字符 · "
+                      f"每批预算 {BATCH_CHAR_BUDGET:,} 字符 · {coverage} 档"))
     collected: list[dict[str, Any]] = []
     for i, batch in enumerate(batches):
+        before = len(collected)
         _progress(on_progress, "batch", i, len(batches),
-                  f"正在编译第 {i + 1}/{len(batches)} 批…")
+                  f"正在编译第 {i + 1}/{len(batches)} 批…",
+                  detail=f"本批 {sum(len(s['title']) + len(s['body']) for s in batch):,} 字符 · "
+                         f"{len(batch)} 个小节")
         # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
         body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
         prompt = (llm.load_prompt("compiler_batch.md")
@@ -709,13 +724,20 @@ def compile_material_batched(title: str, subject: str, text: str,
             ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=9000)
         except Exception as exc:
             warnings.append(f"第 {i + 1}/{len(batches)} 批编译失败，已跳过：{str(exc)[:140]}")
+            _progress(on_progress, "batch", i + 1, len(batches),
+                      f"第 {i + 1}/{len(batches)} 批模型调用失败，本批已跳过",
+                      level="warn", detail=str(exc))
             continue
         for unit in (data.get("units") or []) if isinstance(data, dict) else []:
             if isinstance(unit, dict):
                 collected.append(unit)
         _progress(on_progress, "batch", i + 1, len(batches),
-                  f"已完成第 {i + 1}/{len(batches)} 批")
+                  f"已完成第 {i + 1}/{len(batches)} 批",
+                  detail=f"本批新增 {len(collected) - before} 个单元，累计 {len(collected)} 个")
     if not collected:
+        _progress(on_progress, "batch", len(batches), len(batches),
+                  "全部分批都没有产出单元", level="error",
+                  detail="模型连续失败或返回空结果，请检查模型连接后重试")
         raise PackError("分批编译没有产出任何单元", ["请重试或使用本地编译器"])
     _progress(on_progress, "validate", len(batches), len(batches), "正在整理单元并校验…")
     merged = {"name": outline_data.get("name") or title,
@@ -748,6 +770,13 @@ def compile_material(title: str, subject: str, text: str,
     title = (title or "未命名材料").strip()
     subject = (subject or "").strip()
     warnings: list[str] = []
+    if not (use_llm and llm.enabled()):
+        reason = "本次请求未启用模型" if not use_llm else "未配置模型，当前为演示模式"
+        _progress(on_progress, "prepare", 0, 0, f"使用本地编译器：{reason}")
+    else:
+        _progress(on_progress, "prepare", 0, 0,
+                  f"已连接真实模型 {llm.model_name(deep=True)}，材料 {len(text):,} 字符",
+                  detail=f"单次抽取阈值 {SINGLE_CALL_LIMIT:,} 字符，超出则走分批编译")
     if use_llm and llm.enabled():
         coverage = str(coverage or DEFAULT_COVERAGE)
         if coverage not in COVERAGE_MODES:
@@ -758,6 +787,8 @@ def compile_material(title: str, subject: str, text: str,
                                                 coverage=coverage, on_progress=on_progress)
             except Exception as exc:
                 warnings.append(f"分批编译失败，已回退单次抽取或本地编译器：{str(exc)[:160]}")
+                _progress(on_progress, "batch", 0, 1, "分批编译失败，改走单次抽取",
+                          level="warn", detail=str(exc))
         _progress(on_progress, "extract", 0, 1, "正在抽取知识点…")
         tables = _section_tables(_expand_sections(text, use_embeddings=use_embeddings))
         prompt = llm.load_prompt("compiler_extract.md")
@@ -766,8 +797,11 @@ def compile_material(title: str, subject: str, text: str,
         labeled = "\n\n".join(f"### [{s['id']}] {s['title']}\n{s['body']}" for s in tables)
         body = labeled if len(labeled) <= SINGLE_CALL_LIMIT else text[:SINGLE_CALL_LIMIT]
         if len(text) > SINGLE_CALL_LIMIT:
-            warnings.append(f"只送进了前 {SINGLE_CALL_LIMIT:,} 字（材料共 {len(text):,} 字），"
-                            "后半篇没有被模型读到；建议缩短材料或重试分批编译")
+            truncated = (f"只送进了前 {SINGLE_CALL_LIMIT:,} 字（材料共 {len(text):,} 字），"
+                         "后半篇没有被模型读到；建议缩短材料或重试分批编译")
+            warnings.append(truncated)
+            _progress(on_progress, "extract", 0, 1, "材料被截断，后半篇未送入模型",
+                      level="warn", detail=truncated)
         prompt = prompt.replace("{text}", body)
         try:
             data = llm.chat_json([
@@ -787,7 +821,10 @@ def compile_material(title: str, subject: str, text: str,
             return pack, warnings
         except Exception as exc:
             warnings.append(f"真实模型编译失败，已回退本地编译器：{str(exc)[:180]}")
-    _progress(on_progress, "rules", 0, 1, "正在用本地编译器切分材料…")
+            _progress(on_progress, "extract", 1, 1, "模型抽取失败，回退本地编译器",
+                      level="warn", detail=str(exc))
+    _progress(on_progress, "rules", 0, 1, "正在用本地编译器切分材料…",
+              detail=("这是一次降级结果" if warnings else "本地规则按材料小节一条一节切分"))
     pack = compile_heuristic(title, subject, text, use_embeddings=use_embeddings)
     errors = validate_pack(pack)
     if errors:
