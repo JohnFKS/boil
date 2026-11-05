@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from . import (advisor, agent, backup, config, embeddings, events, feynman, llm,
-                markdown_fix, mastery, releases, services, socratic, styles)
+from . import (advisor, agent, backup, compile_jobs, config, embeddings, events,
+                feynman, llm, markdown_fix, mastery, releases, services, socratic, styles)
 from .compiler import COVERAGE_MODES, compile_material
 from .db import Database, json_loads
 from .events import recent
@@ -77,6 +77,8 @@ class App:
             ("GET", re.compile(r"^/api/packs$"), self.packs),
             ("GET", re.compile(r"^/api/packs/([^/]+)$"), self.pack_detail),
             ("POST", re.compile(r"^/api/packs/compile$"), self.compile_pack),
+            ("GET", re.compile(r"^/api/packs/compile/status$"), self.compile_status),
+            ("POST", re.compile(r"^/api/packs/compile/cancel$"), self.compile_cancel),
             ("POST", re.compile(r"^/api/packs/suggest$"), self.pack_suggest),
             ("POST", re.compile(r"^/api/material/fix$"), self.material_fix),
             ("POST", re.compile(r"^/api/packs/import$"), self.pack_import),
@@ -325,23 +327,53 @@ class App:
             raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
         return services.import_pack(body)
 
-    def compile_pack(self, req, match, query, body):
-        if not isinstance(body, dict):
-            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
-        title = str(body.get("title") or "我的材料")
-        subject = str(body.get("subject") or "")
-        text = str(body.get("text") or "")
+    def _compile_args(self, body: dict[str, Any]) -> dict[str, Any]:
         documents = body.get("documents")
         if documents is not None and not isinstance(documents, list):
             raise ApiError(400, "documents 必须是数组", "bad_request")
-        use_llm = bool(body.get("use_llm", True))
-        use_embeddings = bool(body.get("use_embeddings", True))
         coverage = str(body.get("coverage") or "standard")
         if coverage not in COVERAGE_MODES:
             raise ApiError(400, "coverage 只能是 standard 或 full", "bad_request")
-        return services.compile_preview(self.db, title, subject, text, use_llm,
-                                        use_embeddings=use_embeddings,
-                                        documents=documents, coverage=coverage)
+        return {
+            "title": str(body.get("title") or "我的材料"),
+            "subject": str(body.get("subject") or ""),
+            "text": str(body.get("text") or ""),
+            "documents": documents,
+            "use_llm": bool(body.get("use_llm", True)),
+            "use_embeddings": bool(body.get("use_embeddings", True)),
+            "coverage": coverage,
+        }
+
+    def compile_pack(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        args = self._compile_args(body)
+        # 同步路径保留给脚本、离线探针和旧客户端；浏览器一律走 async=true。
+        if not body.get("async"):
+            return services.compile_preview(self.db, **args)
+        # 异步也要先做快速校验：材料超长/过短立刻 400，别让用户等一次轮询才知道。
+        merged, _ = services.merge_material_documents(args["documents"], args["text"])
+        if len(merged) < 60:
+            raise ApiError(400, "材料太短，至少提供 60 个字符，才能切出可学习的单元", "bad_request")
+
+        def runner(on_progress):
+            return services.compile_preview(self.db, **args, on_progress=on_progress)
+
+        return compile_jobs.submit(dict(args), runner)
+
+    def compile_status(self, req, match, query, body):
+        job_id = (query.get("id") or [""])[0]
+        job = compile_jobs.status(job_id)
+        if job is None:
+            raise ApiError(404, "编译任务不存在或已过期，请重新编译", "job_not_found")
+        return job
+
+    def compile_cancel(self, req, match, query, body):
+        job_id = str((body or {}).get("job_id") or (query.get("id") or [""])[0])
+        job = compile_jobs.cancel(job_id)
+        if job is None:
+            raise ApiError(404, "编译任务不存在或已过期", "job_not_found")
+        return job
 
     def material_fix(self, req, match, query, body):
         if not isinstance(body, dict):

@@ -2272,8 +2272,11 @@ def merge_material_documents(documents: list[Any] | None, text: str) -> tuple[st
             parts.append(pasted)
     merged = "\n\n".join(parts).strip()
     if len(merged) > MAX_MATERIAL_CHARS:
+        times = -(-len(merged) // MAX_MATERIAL_CHARS)
         raise ValueError(
-            f"材料过长（{len(merged):,} 字符），请压缩到 {MAX_MATERIAL_CHARS:,} 字符以内。"
+            f"材料共 {len(docs)} 份、{len(merged):,} 字符，超过单次编译上限 "
+            f"{MAX_MATERIAL_CHARS:,} 字符。请按章节分成约 {times} 次导入"
+            f"（每次不超过 {MAX_MATERIAL_CHARS:,} 字符），或先只选本次要学的章节。"
         )
     return merged, docs
 
@@ -2283,10 +2286,11 @@ def _meta_field(value: Any, limit: int) -> str:
 
 
 def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any]:
-    """材料元信息即时生成：优先真实模型，失败回退本地规则并如实标注来源。"""
+    """材料元信息即时生成：优先真实模型，失败回退本地规则并如实标注来源与原因。"""
     merged, _docs = merge_material_documents(documents, text)
     if len(merged) < 60:
         raise ValueError("材料太短，至少提供 60 个字符。")
+    model_error = ""
     if llm.enabled():
         try:
             prompt = llm.load_prompt("meta_suggest.md").replace("{text}", merged[:6000])
@@ -2303,8 +2307,9 @@ def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any
                     "description": _meta_field(data.get("description"), 80),
                     "source": "model",
                 }
-        except Exception:
-            pass
+            model_error = "模型这次没给出可用标题"
+        except Exception as exc:
+            model_error = str(exc)[:160]
     heading = re.search(r"^#{1,4}\s+(.+)$", merged, re.M)
     first_line = heading.group(1) if heading else merged.splitlines()[0]
     title = _meta_field(re.sub(r"^[\s>#*\-•]+", "", first_line), 28) or "我的学习材料"
@@ -2314,18 +2319,22 @@ def suggest_meta(text: str, documents: list[Any] | None = None) -> dict[str, Any
         "goal_title": f"掌握{title[:16]}" if len(title) <= 16 else title,
         "description": "",
         "source": "rules",
+        # 配了 Key 但调用失败，不能让界面说成「未配置模型」——用户会一直去改配置
+        "warning": f"模型生成信息失败，已用本地规则：{model_error}" if model_error else "",
     }
 
 
 def compile_preview(db: Database, title: str, subject: str, text: str,
                     use_llm: bool = True, use_embeddings: bool = True,
                     documents: list[Any] | None = None,
-                    coverage: str = "standard") -> dict[str, Any]:
+                    coverage: str = "standard",
+                    on_progress: Any = None) -> dict[str, Any]:
     merged, docs = merge_material_documents(documents, text)
     if len(merged) < 60:
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
     pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
-                                      use_embeddings=use_embeddings, coverage=coverage)
+                                      use_embeddings=use_embeddings, coverage=coverage,
+                                      on_progress=on_progress)
     qa = quality.qa_pack(pack)
     warnings = warnings + qa["warnings"]
     if docs:

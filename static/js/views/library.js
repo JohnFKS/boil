@@ -2,6 +2,7 @@
 import {
   escapeHTML, icon, toast, openModal, truncate, formatMinutes, pct,
 } from "../utils.js";
+import { compileProgressText, runCompile } from "../compileJob.js";
 
 function packTile(pack) {
   return `<article class="card card-hover pack-tile">
@@ -109,6 +110,14 @@ export async function render(el, ctx, params) {
       <div class="field"><label for="cp-goal">目标名称</label><input class="input" id="cp-goal" placeholder="默认使用材料标题"></div>
       <div class="field full"><label for="cp-text">材料内容</label><textarea class="textarea tall" id="cp-text" placeholder="粘贴讲义、笔记或教材片段。至少 60 个字符。"></textarea><span class="hint">演示模式在本地切分、出题；配置模型后会做更细的结构抽取。不会上传到第三方，除非你配置了模型端点。</span></div>
     </div>
+    <div class="preview-box" id="cp-progress" style="display:none">
+      <div class="between"><strong>正在编译材料</strong><span class="badge badge-muted" id="cp-clock">准备中</span></div>
+      <div class="progress-line"><i id="cp-bar" style="width:0%"></i></div>
+      <div class="between mt-2">
+        <span class="hint" id="cp-msg"></span>
+        <button class="btn btn-ghost btn-sm" type="button" id="cp-cancel">取消编译</button>
+      </div>
+    </div>
     <div id="cp-error"></div>`;
     const modal = openModal({
       title: "从材料创建内容包",
@@ -126,15 +135,33 @@ export async function render(el, ctx, params) {
             if (text.length < 60) return toast("材料太短，至少 60 个字符", "error"), false;
             const btn = modal.modal.querySelector(".modal-foot .btn-primary");
             const old = btn.innerHTML;
+            const ctrl = new AbortController();
+            const progress = body.querySelector("#cp-progress");
+            const bar = body.querySelector("#cp-bar");
+            const msg = body.querySelector("#cp-msg");
+            const clock = body.querySelector("#cp-clock");
+            progress.style.display = "";
+            body.querySelector("#cp-cancel").onclick = () => ctrl.abort();
             btn.disabled = true; btn.innerHTML = "正在编译…";
+            const show = (st) => {
+              const done = st.total > 0 ? Math.min(100, Math.round(st.current / st.total * 100)) : 0;
+              bar.style.width = `${done}%`;
+              msg.textContent = compileProgressText(st);
+              clock.textContent = done ? `${done}%` : "准备中";
+            };
             try {
-              const res = await ctx.api.post("/api/packs/compile", { title, subject, text, use_llm: true });
+              const res = await runCompile(ctx.api, {
+                payload: { title, subject, text, use_llm: true },
+                onProgress: show, signal: ctrl.signal,
+              });
               if (res.warnings?.length) toast(res.warnings[0], "info", 5000);
               modal.close();
               openPackPreview(res.pack, { goalTitle: body.querySelector("#cp-goal").value.trim() || title });
             } catch (e) {
-              body.querySelector("#cp-error").innerHTML = `<div class="error-box">${escapeHTML(e.message || "编译失败")}</div>`;
-              toast(e.message || "编译失败", "error");
+              const message = e.cancelled ? "已取消编译" : (e.message || "编译失败");
+              body.querySelector("#cp-error").innerHTML = `<div class="error-box">${escapeHTML(message)}</div>`;
+              toast(message, e.cancelled ? "info" : "error");
+              progress.style.display = "none";
               btn.disabled = false; btn.innerHTML = old;
             }
             return false;

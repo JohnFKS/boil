@@ -1,6 +1,7 @@
 /* Onboarding: choose a pack or compile your own material, then create a goal. */
 import { aiFailure, aiSuccess, escapeHTML, icon, pct, pointKindMeta, toast } from "../utils.js";
 import { fileToText } from "../docImport.js";
+import { compileProgressText, runCompile, savedJobId } from "../compileJob.js";
 
 const KIND_LABELS = Object.fromEntries(
   Object.entries(pointKindMeta).map(([k, v]) => [k, v.label]));
@@ -72,6 +73,7 @@ export async function render(el, ctx, params) {
   let compileWarnings = [];
   let compileCoverage = null;
   let compileMetrics = null;
+  let compileAbort = null;
   let draft = {
     name: ctx.state.me?.user?.name || "",
     goalTitle: "",
@@ -186,6 +188,68 @@ export async function render(el, ctx, params) {
     body.querySelector("[data-skip]")?.addEventListener("click", () => ctx.navigate("#/dashboard"));
   }
 
+  function showCompileProgress(st) {
+    const box = body.querySelector("#ob-compile-progress");
+    if (!box) return;
+    box.style.display = "";
+    const done = st.total > 0 ? Math.min(100, Math.round(st.current / st.total * 100)) : 0;
+    const bar = body.querySelector("#ob-compile-bar");
+    if (bar) bar.style.width = `${done}%`;
+    const msg = body.querySelector("#ob-compile-msg");
+    if (msg) msg.textContent = compileProgressText(st);
+    const clock = body.querySelector("#ob-compile-clock");
+    if (clock) clock.textContent = done ? `${done}%` : "准备中";
+  }
+
+  function beginCompile() {
+    const ctrl = new AbortController();
+    compileAbort = ctrl;
+    const btn = body.querySelector("[data-submit]");
+    if (btn) { btn.disabled = true; btn.innerHTML = "正在编译…"; }
+    const cancel = body.querySelector("#ob-compile-cancel");
+    if (cancel) cancel.onclick = () => ctrl.abort();
+    showCompileProgress({ state: "running", current: 0, total: 0,
+                          message: "正在提交编译任务…", elapsed: 0 });
+    return ctrl;
+  }
+
+  function endCompile(label) {
+    compileAbort = null;
+    const btn = body.querySelector("[data-submit]");
+    if (btn) { btn.disabled = false; btn.innerHTML = label || btn.innerHTML; }
+    const box = body.querySelector("#ob-compile-progress");
+    if (box) box.style.display = "none";
+  }
+
+  function applyCompileResult(res) {
+    materialPack = res.pack;
+    compileQuality = res.quality || null;
+    compileWarnings = res.warnings || [];
+    compileCoverage = res.coverage || null;
+    compileMetrics = res.summary?.quality || null;
+    if (compileWarnings.length) toast(compileWarnings[0], "warn", 7000);
+    renderStep3();
+  }
+
+  async function resumeCompile(jobId) {
+    busy = true;
+    const ctrl = beginCompile();
+    try {
+      const res = await runCompile(ctx.api, {
+        resumeId: jobId, onProgress: showCompileProgress, signal: ctrl.signal,
+      });
+      applyCompileResult(res);
+    } catch (e) {
+      endCompile();
+      toast(e.cancelled ? "已取消编译，可重新选择材料再试"
+                        : `${e.message || "无法继续上次的编译"}；请重新选择材料文件。`,
+            e.cancelled ? "info" : "error", 8000);
+      renderStep2();
+    } finally {
+      busy = false;
+    }
+  }
+
   function renderStep2() {
     step = 2; updateDots();
     const title = mode === "material" ? (materialPack?.name || draft.materialTitle || "我的学习材料") : (selected?.name || "我的学习目标");
@@ -212,7 +276,7 @@ export async function render(el, ctx, params) {
                 <input type="file" id="ob-files" accept=".md,.markdown,.json,.txt,.csv,.tsv,.html,.htm,.docx,.rtf" multiple hidden>
               </div>
               <div class="file-list" id="ob-file-list">${fileListHTML()}</div>
-              <span class="hint">JSON 会按键值结构铺平成可读文本；文件与下方粘贴文本合计不超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符。</span>
+              <span class="hint">JSON 会按键值结构铺平成可读文本；文件与下方粘贴文本合计不超过 ${MAX_TOTAL_CHARS.toLocaleString()} 字符。整本教材请按章节分次导入，编译期间可以离开页面，回来会接着上一次的任务。</span>
             </div>
             <div class="field full">
               <label>拆分粒度（覆盖档）</label>
@@ -231,6 +295,14 @@ export async function render(el, ctx, params) {
         <div class="preview-box" id="ob-preview">
           <strong>${mode === "material" ? "下一步会先编译，不会立刻开始。" : `将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。`}</strong><br>
           ${mode === "material" ? "编译完成后，你可以预览单元再开始。" : `预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
+        </div>
+        <div class="preview-box" id="ob-compile-progress" style="display:none">
+          <div class="between"><strong>正在编译材料</strong><span class="badge badge-muted" id="ob-compile-clock">准备中</span></div>
+          <div class="progress-line"><i id="ob-compile-bar" style="width:0%"></i></div>
+          <div class="between mt-2">
+            <span class="hint" id="ob-compile-msg">正在提交任务…</span>
+            <button class="btn btn-ghost btn-sm" type="button" id="ob-compile-cancel">取消编译</button>
+          </div>
         </div>
         <div class="onboarding-actions">
           <button class="btn btn-ghost" data-back>上一步</button>
@@ -306,7 +378,11 @@ export async function render(el, ctx, params) {
           }
           toast(`已加入 ${added} 个文件，将合并编译为同一个主题。`, "success", 3600);
         }
-        if (errors.length) toast(errors[0], "error", 6000);
+        if (errors.length) {
+          const skipped = chosen.length - added;
+          toast(`${errors[0]}${skipped > 0 ? `；另有 ${skipped} 个文件未加入，请按章节分次导入` : ""}`,
+                "error", 8000);
+        }
       };
 
       drop?.addEventListener("click", (event) => {
@@ -398,6 +474,10 @@ export async function render(el, ctx, params) {
             toast(given ? `AI 已生成${given}，可直接修改。${res.subject ? "" : "学科没判断出来，可以自己补一句。"}`
                         : "模型这次没给出可用的元信息，字段保持原样。",
                   given ? "success" : "info", 4600);
+          } else if (res.warning) {
+            // 配了 Key 但模型调用失败：不能说成「未配置模型」，否则用户会一直去改配置
+            toast(`模型这次没能生成信息，已按本地规则给出${given || "可用字段"}。原因：${res.warning}`,
+                  "warn", 7000);
           } else {
             // 本地规则同样只报真的填进去的字段：学科没给出来就要说没给出来
             toast(`未配置模型，已按本地规则生成${given ? "了" + given : "，但这次没有可用字段"}。${res.subject ? "" : "学科没判断出来，可以自己补一句。"}`,
@@ -441,24 +521,24 @@ export async function render(el, ctx, params) {
           const materialTitle = body.querySelector("#ob-material-title").value.trim() || goalTitle;
           const subject = body.querySelector("#ob-subject").value.trim();
           draft = { ...draft, materialTitle, subject, text: pasted };
-          const res = await ctx.api.post("/api/packs/compile", {
-            title: materialTitle, subject: subject, text: pasted, documents, use_llm: true,
-            coverage: draft.coverage,
-          }, { timeout: 600000 });   // 分批编译串好几次模型调用，90s 默认超时必先炸
-          materialPack = res.pack;
-          compileQuality = res.quality || null;
-          compileWarnings = res.warnings || [];
-          compileCoverage = res.coverage || null;
-          compileMetrics = res.summary?.quality || null;
-          if (compileWarnings.length) toast(compileWarnings[0], "warn", 7000);
-          renderStep3();
+          const ctrl = beginCompile();
+          const res = await runCompile(ctx.api, {
+            payload: {
+              title: materialTitle, subject: subject, text: pasted, documents,
+              use_llm: true, coverage: draft.coverage,
+            },
+            onProgress: showCompileProgress,
+            signal: ctrl.signal,
+          });
+          applyCompileResult(res);
           return;
         }
         await createGoal({ name, pack_id: selected.id, goal_title: goalTitle, deadline, daily_minutes: daily, level: draft.level });
       } catch (e) {
-        toast(e.message || "创建失败", "error", 5000);
-        btn.disabled = false; btn.innerHTML = old;
+        toast(e.cancelled ? "已取消编译，可以修改材料后重试" : (e.message || "创建失败"),
+              e.cancelled ? "info" : "error", 7000);
       } finally {
+        endCompile(old);
         busy = false;
       }
     });
@@ -584,5 +664,13 @@ export async function render(el, ctx, params) {
     }
   }
 
-  renderStep1();
+  const pendingJob = savedJobId();
+  if (pendingJob) {
+    mode = "material";
+    renderStep2();
+    toast("正在接回上次未完成的编译…", "info", 5000);
+    resumeCompile(pendingJob);
+  } else {
+    renderStep1();
+  }
 }

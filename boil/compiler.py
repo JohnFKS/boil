@@ -27,6 +27,10 @@ SENT_END_RE = re.compile(r"[。！？!?；;\n]")
 
 # 长材料的三道闸门：单次调用上限、每批预算、单元数量上限
 BATCH_CHAR_BUDGET = 7000
+# 首批之前的「全篇骨架」也要单独封顶：实测 Dots 网关单次输入约 1.2 万字就返回
+# HTTP 400（上游 InternalServerError），骨架一超，整份材料的分批编译会毁在
+# 这一次大纲调用上，最后静默退化成「只看前 6000 字」。
+SKELETON_LIMIT = 4500
 # 实测（Dots 网关）：8.6k 字材料单次调用能出可用 JSON，10.2k 字就在尾部被截成
 # "difficulty":4,":5,":":40"——能否修好变成掷硬币。上限按真实输出能力定，不按上下文长度定。
 SINGLE_CALL_LIMIT = 6000
@@ -46,6 +50,13 @@ DEFAULT_COVERAGE = "standard"
 
 def coverage_text(mode: Any) -> str:
     return COVERAGE_MODES.get(str(mode or DEFAULT_COVERAGE), COVERAGE_MODES[DEFAULT_COVERAGE])
+
+
+def _progress(cb: Any, phase: str, current: int = 0, total: int = 0,
+              message: str = "") -> None:
+    """把编译进度交给后台任务。回调可以用异常中断（取消），这里不吞。"""
+    if cb is not None:
+        cb(phase, current, total, message)
 
 
 def _norm_text(value: Any, limit: int) -> str:
@@ -607,10 +618,28 @@ def _batch_sections(sections: list[tuple[str, str]],
 
 def _skeleton(sections: list[dict[str, Any]]) -> str:
     """全篇骨架：编号 + 标题 + 首句。让模型在第一批之前就看见整份材料的形状，
-    并且知道每个小节叫什么编号 —— 它报回来的出处才有对得上的对象。"""
-    lines = [f"- [{s['id']}] {s['title'][:40]}：{s['first']}" if s["first"]
-             else f"- [{s['id']}] {s['title'][:40]}" for s in sections]
-    return "\n".join(lines)[:12000]
+    并且知道每个小节叫什么编号 —— 它报回来的出处才有对得上的对象。
+
+    超出预算时均匀抽样而不是从尾部硬切：后半篇的小节编号整个消失的话，
+    模型报回来的出处就再也指不回原文了。
+    """
+    lines = []
+    for s in sections:
+        title = re.sub(r"\s+", " ", str(s.get("title") or "")).strip()[:36]
+        first = re.sub(r"\s+", " ", str(s.get("first") or "")).strip()[:80]
+        lines.append(f"- [{s['id']}] {title}：{first}" if first
+                     else f"- [{s['id']}] {title}")
+    total = sum(len(x) + 1 for x in lines)
+    if total > SKELETON_LIMIT and len(lines) > 1:
+        keep = max(1, int(len(lines) * SKELETON_LIMIT / total))
+        lines = lines[::max(1, -(-len(lines) // keep))]
+    out, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > SKELETON_LIMIT:
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
 
 
 def _outline_pass(title: str, subject: str, sections: list[dict[str, Any]],
@@ -636,22 +665,35 @@ def _outline_titles(outline: dict[str, Any]) -> str:
 
 def compile_material_batched(title: str, subject: str, text: str,
                              use_embeddings: bool = True,
-                             coverage: str = DEFAULT_COVERAGE
+                             coverage: str = DEFAULT_COVERAGE,
+                             on_progress: Any = None
                              ) -> tuple[dict[str, Any], list[str]]:
     """长材料分批编译：先全篇骨架出大纲，再逐批只针对本批出单元。
 
     单次调用截断到 24k 会让模型只看得到开头——那不等于"分析完所有素材"。
     """
     warnings: list[str] = []
+    _progress(on_progress, "prepare", 0, 0, "正在切分材料小节…")
     sections = _split_sections(text, use_embeddings=use_embeddings)
     if not sections:
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
     tables = _section_tables(sections)
-    outline_data = _outline_pass(title, subject, tables, len(text))
+    _progress(on_progress, "outline", 0, 1, "正在通读全篇并生成学习大纲…")
+    try:
+        outline_data = _outline_pass(title, subject, tables, len(text))
+    except Exception as exc:
+        # 大纲只是排序用的辅助信息。它失败不该把整份材料的分批编译一起带走，
+        # 否则用户拿到的是"只看了前 6000 字"的包，还以为材料都读过了。
+        outline_data = {}
+        warnings.append(f"全篇大纲生成失败，已按材料原顺序分批：{str(exc)[:140]}")
     outline_hint = _outline_titles(outline_data)
     batches = _batch_sections(tables)
+    _progress(on_progress, "batch", 0, len(batches),
+              f"大纲已就绪，共 {len(batches)} 批材料要编译…")
     collected: list[dict[str, Any]] = []
     for i, batch in enumerate(batches):
+        _progress(on_progress, "batch", i, len(batches),
+                  f"正在编译第 {i + 1}/{len(batches)} 批…")
         # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
         body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
         prompt = (llm.load_prompt("compiler_batch.md")
@@ -671,8 +713,11 @@ def compile_material_batched(title: str, subject: str, text: str,
         for unit in (data.get("units") or []) if isinstance(data, dict) else []:
             if isinstance(unit, dict):
                 collected.append(unit)
+        _progress(on_progress, "batch", i + 1, len(batches),
+                  f"已完成第 {i + 1}/{len(batches)} 批")
     if not collected:
         raise PackError("分批编译没有产出任何单元", ["请重试或使用本地编译器"])
+    _progress(on_progress, "validate", len(batches), len(batches), "正在整理单元并校验…")
     merged = {"name": outline_data.get("name") or title,
               "description": outline_data.get("description") or "",
               "subject": outline_data.get("subject") or subject,
@@ -698,7 +743,8 @@ def compile_material_batched(title: str, subject: str, text: str,
 def compile_material(title: str, subject: str, text: str,
                      use_llm: bool = True,
                      use_embeddings: bool = True,
-                     coverage: str = DEFAULT_COVERAGE) -> tuple[dict[str, Any], list[str]]:
+                     coverage: str = DEFAULT_COVERAGE,
+                     on_progress: Any = None) -> tuple[dict[str, Any], list[str]]:
     title = (title or "未命名材料").strip()
     subject = (subject or "").strip()
     warnings: list[str] = []
@@ -709,9 +755,10 @@ def compile_material(title: str, subject: str, text: str,
         if len(text) > SINGLE_CALL_LIMIT:
             try:
                 return compile_material_batched(title, subject, text, use_embeddings=use_embeddings,
-                                                coverage=coverage)
+                                                coverage=coverage, on_progress=on_progress)
             except Exception as exc:
                 warnings.append(f"分批编译失败，已回退单次抽取或本地编译器：{str(exc)[:160]}")
+        _progress(on_progress, "extract", 0, 1, "正在抽取知识点…")
         tables = _section_tables(_expand_sections(text, use_embeddings=use_embeddings))
         prompt = llm.load_prompt("compiler_extract.md")
         prompt = prompt.replace("{title}", title).replace("{subject}", subject or "未指定")
@@ -736,9 +783,11 @@ def compile_material(title: str, subject: str, text: str,
             if errors:
                 raise PackError("模型生成的 Pack 未通过校验", errors)
             warnings.extend(trimmed)
+            _progress(on_progress, "validate", 1, 1, "正在整理单元并校验…")
             return pack, warnings
         except Exception as exc:
             warnings.append(f"真实模型编译失败，已回退本地编译器：{str(exc)[:180]}")
+    _progress(on_progress, "rules", 0, 1, "正在用本地编译器切分材料…")
     pack = compile_heuristic(title, subject, text, use_embeddings=use_embeddings)
     errors = validate_pack(pack)
     if errors:
