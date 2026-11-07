@@ -99,7 +99,7 @@ def new_state(fp: str, **meta: Any) -> dict[str, Any]:
     return {"v": CACHE_VERSION, "material": fp, "created_at": stamp,
             "updated_at": stamp, "meta": meta, "outline": None,
             "content_digest": None, "batches": {}, "result": None,
-            "complete": False}
+            "complete": False, "deepen": None}
 
 
 def load(fp: str) -> dict[str, Any] | None:
@@ -146,6 +146,28 @@ def batch_units(state: dict[str, Any] | None, key: str) -> list[dict[str, Any]] 
         return None
     units = state["batches"].get(key)
     return units if isinstance(units, list) else None
+
+
+def deepen_fingerprint(payload: dict[str, Any]) -> str:
+    """一次按需深化的内容寻址键：等价于该次真正发出的请求。
+
+    刻意不含 pack_id / unit_id：同一份材料重复导入、或 pack 重装后重新深化，
+    只要骨架与取回的原文一致就应命中，不必为同一个知识点再烧一次模型。
+    """
+    return digest({"v": CACHE_VERSION, "kind": "deepen", **payload})[:32]
+
+
+def deepen_unit_of(fp: str) -> dict[str, Any] | None:
+    """读回深化结果。独立于 llm_cache：不受它开关 / 清空 / 按 mtime 淘汰影响。"""
+    state = load(fp)
+    unit = state.get("deepen") if state else None
+    return unit if isinstance(unit, dict) else None
+
+
+def mark_deepen(fp: str, unit: dict[str, Any]) -> None:
+    state = load(fp) or new_state(fp)
+    state["deepen"] = unit
+    save(fp, state)
 
 
 def drop(fp: str) -> None:

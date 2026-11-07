@@ -81,7 +81,7 @@ export async function render(el, ctx, params) {
     subject: "",
     text: "",
     coverage: "standard",
-    indexMode: false,
+    indexMode: true,
     deadline: defaultDate(),
     daily: 40,
     level: "beginner",
@@ -295,20 +295,29 @@ export async function render(el, ctx, params) {
         ${mode === "material" ? `
           <label class="preview-box" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer">
             <input type="checkbox" id="ob-index-mode" ${draft.indexMode ? "checked" : ""} style="margin-top:3px">
-            <span><strong>极速导入（推荐整本教材）</strong><br>
-              <span class="hint">导入时只建立章节索引，几秒完成、0 次生成模型调用；学到某个单元时，再检索该节原文按需生成讲解。没学到的章节永不消耗 token。</span>
+            <span><strong>极速导入（默认，推荐整本教材）</strong><br>
+              <span class="hint">导入时只建立章节索引，几秒完成、0 次生成模型调用；学到某个单元时，再检索该节原文按需生成讲解。没学到的章节永不消耗 token。取消勾选会改为完整 AI 编译：耗时几分钟、消耗更多 token，但导入即得到完整讲解。</span>
             </span>
           </label>` : ""}
         <div class="preview-box" id="ob-preview">
-          <strong>${mode === "material" ? "下一步会先编译，不会立刻开始。" : `将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。`}</strong><br>
-          ${mode === "material" ? "编译完成后，你可以预览单元再开始。" : `预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
+          ${mode === "material" ? "" : `<strong>将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。</strong><br>预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
         </div>
         ${compileProgressMarkup()}
         <div class="onboarding-actions">
           <button class="btn btn-ghost" data-back>上一步</button>
-          <button class="btn btn-primary" data-submit>${mode === "material" ? "编译并预览" : "生成学习路径"} ${icon("arrow", 15)}</button>
+          <button class="btn btn-primary" data-submit>${mode === "material" ? "建立索引并预览" : "生成学习路径"} ${icon("arrow", 15)}</button>
         </div>
       </div>`;
+    const syncImportCopy = () => {
+      if (mode !== "material") return;
+      const preview = body.querySelector("#ob-preview");
+      if (preview) preview.innerHTML = draft.indexMode
+        ? `<strong>下一步只建立章节索引，几秒完成，不会立刻开始。</strong><br>完成后可以预览骨架单元；学到某一节时，系统再按需生成这一节的完整讲解。`
+        : `<strong>下一步会用模型通读并编译全部材料，通常需要几分钟。</strong><br>编译完成后，你可以预览单元再开始。`;
+      const submit = body.querySelector("[data-submit]");
+      if (submit) submit.innerHTML = `${draft.indexMode ? "建立索引并预览" : "编译并预览"} ${icon("arrow", 15)}`;
+    };
+    syncImportCopy();
     body.querySelectorAll("[data-level]").forEach(b => b.addEventListener("click", () => {
       draft.level = b.dataset.level;
       body.querySelectorAll("[data-level]").forEach(x => x.classList.toggle("active", x === b));
@@ -318,7 +327,10 @@ export async function render(el, ctx, params) {
       body.querySelectorAll("[data-coverage]").forEach(x => x.classList.toggle("active", x === b));
     }));
     const indexMode = body.querySelector("#ob-index-mode");
-    indexMode?.addEventListener("change", () => { draft.indexMode = indexMode.checked; });
+    indexMode?.addEventListener("change", () => {
+      draft.indexMode = indexMode.checked;
+      syncImportCopy();
+    });
     const minutes = body.querySelector("#ob-minutes");
     const minutesLabel = body.querySelector("#ob-minutes-label");
     minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });

@@ -215,3 +215,15 @@ class CompileCacheTest(unittest.TestCase):
                                               use_embeddings=False)
         self.assertEqual(len(self.calls), before, "整轮命中时连切分/大纲/质检都不该再调模型")
         self.assertEqual(second["pack"]["id"], first["pack"]["id"])
+
+    def test_deepen_cache_roundtrip_and_request_sensitivity(self):
+        payload = {"messages": [{"role": "user", "content": "深化需求定律"}],
+                   "model": "m", "temperature": 0.2, "max_tokens": 2000}
+        key = compile_cache.deepen_fingerprint(payload)
+        self.assertIsNone(compile_cache.deepen_unit_of(key))
+        compile_cache.mark_deepen(key, {"title": "深化结果"})
+        self.assertEqual(compile_cache.deepen_unit_of(key)["title"], "深化结果")
+        other = {**payload, "messages": [{"role": "user", "content": "别的单元"}]}
+        self.assertNotEqual(key, compile_cache.deepen_fingerprint(other))
+        self.assertIsNone(compile_cache.deepen_unit_of(
+            compile_cache.deepen_fingerprint(other)))

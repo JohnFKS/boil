@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from boil import compiler, config, embeddings, indexer, llm, services  # noqa: E402
 from boil.db import Database  # noqa: E402
-from boil.packs import find_pack, validate_pack  # noqa: E402
+from boil.packs import find_pack, save_user_pack, validate_pack  # noqa: E402
 from boil.server import App, Handler  # noqa: E402
 
 MATERIAL = (
@@ -218,6 +218,28 @@ class IndexModeUnitTest(unittest.TestCase):
         self.assertEqual(result["reason"], "model_failed")
         unit = services.get_goal_units(self.db, self._goal_id())[0]
         self.assertEqual(unit["source_ref"]["deepen"]["state"], "pending")
+
+    def test_index_mode_is_default_and_copy_matches(self):
+        source = (ROOT / "static/js/views/onboarding.js").read_text(encoding="utf-8")
+        self.assertIn("indexMode: true", source, "极速导入应是默认导入路径")
+        self.assertNotIn("下一步会先编译", source, "默认路径下这句会说谎")
+        self.assertIn("取消勾选会改为完整 AI 编译", source)
+
+    def test_deepen_reuses_cached_result_after_pack_restore(self):
+        """pack 重装 / 状态丢失后重深化同一节，不该再烧一次模型。"""
+        _, pack = self._prepare()
+        unit_id = services.get_goal_units(self.db, self._goal_id())[1]["id"]
+        initial = json.loads(json.dumps(pack))
+        with mock.patch.object(llm, "enabled", return_value=True), \
+             mock.patch.object(llm, "model_name", return_value="mock-model"), \
+             mock.patch.object(llm, "chat_json", return_value=FAKE_DEEPEN) as chat:
+            first = services.deepen_unit(self.db, config.DEFAULT_USER, unit_id)
+            # 骨架单元回到初始内容：请求与首次完全一致，应命中内容寻址缓存
+            save_user_pack(initial)
+            second = services.deepen_unit(self.db, config.DEFAULT_USER, unit_id)
+        self.assertTrue(first["deepened"], first)
+        self.assertTrue(second["deepened"], second)
+        self.assertEqual(chat.call_count, 1, "相同请求必须命中 deepen 缓存")
 
     def _goal_id(self):
         return self.db.one("SELECT id FROM goals ORDER BY created_at DESC LIMIT 1")["id"]

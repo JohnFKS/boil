@@ -2468,29 +2468,43 @@ def deepen_unit(db: Database, user_id: str, unit_id: str,
         query=f"{target.get('title') or ''} {target.get('essence') or ''}"[:600],
         section_id=str(source_ref.get("id") or ""))
     chunk_ids = [c.get("id") for c in chunks]
+    model = llm.model_name(deep=True)
+    request_messages = [
+        {"role": "system", "content": indexer.DEEPEN_SYSTEM},
+        {"role": "user", "content": indexer.deepen_prompt(
+            target, chunks, str(pack.get("subject") or ""))},
+    ]
+    deepen_key = compile_cache.deepen_fingerprint({
+        "messages": request_messages, "model": model,
+        "temperature": 0.2, "max_tokens": 2000,
+    })
     if not llm.enabled():
         return {"deepened": False, "reason": "llm_disabled", "unit_id": unit_id,
                 "chunks": chunk_ids}
-    try:
-        data = llm.chat_json([
-            {"role": "system", "content": indexer.DEEPEN_SYSTEM},
-            {"role": "user", "content": indexer.deepen_prompt(
-                target, chunks, str(pack.get("subject") or ""))},
-        ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=2000)
-        # 深化提示词要求「一个单元对象」，编译器规范化函数要求 {"units":[...]}；
-        # 两种返回都接住，别把一次成功的模型调用误判成结构错误。
-        if isinstance(data, dict) and not isinstance(data.get("units"), list):
-            data = {"units": [data]}
-        normalized = _normalize_llm_units(
-            data, str(pack.get("name") or ""), str(pack.get("subject") or ""),
-            limit=1, tables=[])
-        fresh = (normalized.get("units") or [None])[0]
-    except Exception as exc:
-        return {"deepened": False, "reason": "model_failed", "unit_id": unit_id,
-                "detail": str(exc)[:240], "chunks": chunk_ids}
-    if not fresh:
-        return {"deepened": False, "reason": "empty_result", "unit_id": unit_id,
-                "chunks": chunk_ids}
+    # ④ 设为默认后，学习期成了主要模型消耗点：按请求内容寻址复用，
+    # pack 重装 / llm_cache 被清空 / 同一材料重复导入都不再重复烧同一节。
+    fresh = None if force else compile_cache.deepen_unit_of(deepen_key)
+    if fresh is None:
+        try:
+            data = llm.chat_json(request_messages, model=model, temperature=0.2,
+                                 max_tokens=2000)
+            # 深化提示词要求「一个单元对象」，编译器规范化函数要求 {"units":[...]}；
+            # 两种返回都接住，别把一次成功的模型调用误判成结构错误。
+            if isinstance(data, dict) and not isinstance(data.get("units"), list):
+                data = {"units": [data]}
+            normalized = _normalize_llm_units(
+                data, str(pack.get("name") or ""), str(pack.get("subject") or ""),
+                limit=1, tables=[])
+            fresh = (normalized.get("units") or [None])[0]
+        except Exception as exc:
+            return {"deepened": False, "reason": "model_failed", "unit_id": unit_id,
+                    "detail": str(exc)[:240], "chunks": chunk_ids}
+        if not fresh:
+            return {"deepened": False, "reason": "empty_result", "unit_id": unit_id,
+                    "chunks": chunk_ids}
+        # 存副本：下面的 id / order_index / source_ref 回写不该污染缓存内容
+        compile_cache.mark_deepen(deepen_key, dict(fresh))
+    fresh = dict(fresh)
 
     for key in ("id", "order_index", "difficulty", "importance",
                 "estimated_minutes", "relations"):
