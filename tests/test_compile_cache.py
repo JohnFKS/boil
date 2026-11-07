@@ -5,6 +5,7 @@ checkpoint，行为应与改造前完全一致，这里显式传入才启用缓�
 """
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,6 +78,57 @@ class CompileCacheTest(unittest.TestCase):
     def _compile(self, text: str, fp: str):
         return compiler.compile_material(TITLE, SUBJECT, text, use_llm=True,
                                          use_embeddings=False, checkpoint=fp)
+
+    def test_auto_version_tracks_source_and_ignores_frontend(self):
+        with tempfile.TemporaryDirectory(prefix="boil-cver-") as d:
+            root = Path(d)
+            for name in ("boil", "prompts", "static"):
+                (root / name).mkdir()
+            logic = root / "boil" / "compiler.py"
+            prompt = root / "prompts" / "compiler_batch.md"
+            frontend = root / "static" / "app.js"
+            logic.write_text("VALUE = 1\n", encoding="utf-8")
+            prompt.write_text("template v1\n", encoding="utf-8")
+            frontend.write_text("button v1\n", encoding="utf-8")
+            old_root = config.ROOT
+            config.ROOT = root
+            try:
+                v0 = compile_cache._auto_version()
+                self.assertEqual(v0, compile_cache._auto_version(),
+                                 "同一份代码每次算出的版本必须一致")
+                frontend.write_text("button v2\n", encoding="utf-8")
+                self.assertEqual(compile_cache._auto_version(), v0,
+                                 "前端改动不改变编译产物，不该清空缓存")
+                prompt.write_text("template v2\n", encoding="utf-8")
+                v1 = compile_cache._auto_version()
+                self.assertNotEqual(v0, v1, "提示词改了要自动失效")
+                logic.write_text("VALUE = 2\n", encoding="utf-8")
+                self.assertNotEqual(compile_cache._auto_version(), v1,
+                                    "不进指纹的纯逻辑改动也必须自动失效")
+            finally:
+                config.ROOT = old_root
+
+    def test_version_salt_forces_invalidation_without_code_change(self):
+        with mock.patch.dict(os.environ, {"BOIL_COMPILE_CACHE_VERSION": "force-1"}):
+            a = compile_cache._auto_version()
+        with mock.patch.dict(os.environ, {"BOIL_COMPILE_CACHE_VERSION": "force-2"}):
+            b = compile_cache._auto_version()
+        with mock.patch.dict(os.environ, {"BOIL_COMPILE_CACHE_VERSION": ""}):
+            plain = compile_cache._auto_version()
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, plain)
+        self.assertNotEqual(b, plain)
+        self.assertRegex(compile_cache.CACHE_VERSION, r"^1\.[0-9a-f]{16}$",
+                         "版本应是结构号 + 源码内容指纹")
+
+    def test_legacy_integer_version_checkpoint_is_rejected(self):
+        fp = compile_cache.material_fingerprint({"title": TITLE})
+        state = compile_cache.new_state(fp)
+        state["v"] = 1                  # 自动版本上线前写入的整数版本
+        state["batches"] = {"old-batch": []}
+        compile_cache.save(fp, state)
+        self.assertIsNone(compile_cache.load(fp),
+                          "代码一升级，旧 checkpoint 必须自动全部失效")
 
     def test_fingerprint_is_stable_and_sensitive(self):
         a = compile_cache.material_fingerprint({"title": "x", "coverage": "standard"})

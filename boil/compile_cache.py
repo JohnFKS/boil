@@ -11,6 +11,9 @@
 命中批缓存时连 `chat_json` / `parse_json_loose` 都不走；命中结果缓存时连
 切分、大纲、质检都不走。只有 `services.compile_preview` 显式传入指纹才启用，
 直接调 `compiler.compile_material` 的路径行为完全不变。
+
+缓存版本不需要人工维护：`CACHE_VERSION` 由 `boil/**/*.py` 与 `prompts/**/*.md`
+的内容算出，任何改动编译产物的代码 / 提示词变更都会让旧 checkpoint 自动失效。
 """
 from __future__ import annotations
 
@@ -24,7 +27,44 @@ from typing import Any
 from . import config
 from .utils import now_iso, read_json, write_json_atomic
 
-CACHE_VERSION = 1
+# --- 缓存版本（自动推导）---------------------------------------------------
+# 结构版本：只有 checkpoint 的字段格式改了才需要动这个数字。
+_SCHEMA_VERSION = 1
+# 扫描范围：能改变编译产物的后端代码与提示词。前端 / 测试 / 工具脚本刻意排除，
+# 免得改个按钮文案就把整站编译缓存清空；清单本身也随源码一起进入 hash。
+_VERSION_SOURCES = ((Path("boil"), "**/*.py"), (Path("prompts"), "**/*.md"))
+
+
+def _auto_version() -> str:
+    """把源码内容本身做成版本：相关文件一改，旧 checkpoint 自动失效。
+
+    用文件内容而不是 mtime：同一份代码每次启动都得到同一个值，git checkout、
+    重新部署、改文件时间戳都不会误失效。读不到的文件跳过，绝不让缓存逻辑
+    把服务启动卡住。只在模块导入时算一次，之后 CACHE_VERSION 是常量。
+    """
+    h = hashlib.sha256()
+    h.update(str(_SCHEMA_VERSION).encode("ascii"))
+    for rel, pattern in _VERSION_SOURCES:
+        root = config.ROOT / rel
+        if not root.exists():
+            continue
+        for path in sorted(root.glob(pattern)):
+            if "__pycache__" in path.parts or not path.is_file():
+                continue
+            h.update(str(path.relative_to(config.ROOT)).encode("utf-8"))
+            try:
+                h.update(path.read_bytes())
+            except OSError:
+                pass
+            h.update(b"\0")
+    # 可选盐：运维想不改代码就强制清缓存时使用，默认不设置
+    salt = os.environ.get("BOIL_COMPILE_CACHE_VERSION", "").strip()
+    if salt:
+        h.update(salt.encode("utf-8"))
+    return f"{_SCHEMA_VERSION}.{h.hexdigest()[:16]}"
+
+
+CACHE_VERSION = _auto_version()
 DIR_NAME = "compile_cache"
 MAX_ENTRIES = 48
 MAX_AGE_SECONDS = 7 * 24 * 3600
