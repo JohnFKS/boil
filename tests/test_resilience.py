@@ -357,6 +357,16 @@ class ClientAbortResponseTest(unittest.TestCase):
         self.assertEqual(chat.call_args.kwargs.get("retries"), 0,
                          "探测不该把最坏等待放大到 3 倍读超时")
 
+    def test_idle_keepalive_timeout_is_not_logged_as_an_error(self):
+        import contextlib
+        import io
+        h = Handler.__new__(Handler)
+        h._rid = "abc"
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            h.log_message("Request timed out: %r", TimeoutError("timed out"))
+        self.assertEqual(buf.getvalue(), "", "空闲连接回收不该刷成错误日志")
+
 
 class AbortTest(ResilienceFixture):
     def test_hanging_up_mid_stream_does_not_leak_handler_threads(self):

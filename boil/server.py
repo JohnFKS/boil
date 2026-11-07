@@ -1016,6 +1016,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if args and str(args[0]).startswith("GET /api/health"):
             return
+        # keep-alive 空闲到 Handler.timeout 时，handle_one_request 会报这句。
+        # 这是回收空闲连接的预期路径，不是失败请求；浏览器常驻连接池每 30 秒
+        # 就能刷出好几条，会把真正的问题淹掉。
+        if str(fmt).startswith("Request timed out"):
+            return
         print(f"[http] rid={getattr(self, '_rid', '-')} {fmt % args}", file=sys.stderr)
 
 

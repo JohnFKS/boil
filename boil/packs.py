@@ -9,6 +9,7 @@ Pack 是内容和能力的更新单元：
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -303,7 +304,16 @@ def derive_key_points(unit: dict[str, Any]) -> list[str]:
 
 
 def _unit_id(goal_id: str, pack_id: str, pack_unit_id: str) -> str:
-    base = slugify(f"{pack_id}-{pack_unit_id}", "unit")[:60]
+    raw = slugify(f"{pack_id}-{pack_unit_id}", "unit")
+    if len(raw) <= 60:
+        base = raw                     # 未截断：历史 unit id 保持逐字不变
+    else:
+        # pack_id 最长可达 76 字符（slugify 截到 64 + 前后缀），[:60] 会把
+        # pack_unit_id 整段吃掉，同包所有单元塌成一个主键，安装时撞
+        # UNIQUE units.id。长 id 改用「短前缀 + 包/单元联合指纹」，仍可读。
+        token = hashlib.sha256(
+            f"{pack_id}\0{pack_unit_id}".encode("utf-8")).hexdigest()[:10]
+        base = f"{raw[:36]}-{slugify(pack_unit_id, 'sec')[:12]}-{token}"
     return f"u_{goal_id.split('_')[-1]}_{base}"
 
 

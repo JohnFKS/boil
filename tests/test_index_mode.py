@@ -241,6 +241,20 @@ class IndexModeUnitTest(unittest.TestCase):
         self.assertTrue(second["deepened"], second)
         self.assertEqual(chat.call_count, 1, "相同请求必须命中 deepen 缓存")
 
+    def test_long_pack_id_installs_without_primary_key_collision(self):
+        """pack_id 可达 76 字符：截断曾让同包所有单元塌成同一个主键。"""
+        long_name = "微观经济学考点精讲" * 12
+        result = services.compile_index_preview(self.db, long_name, long_name, MATERIAL)
+        pack = result["pack"]
+        out = services.onboarding(self.db, {
+            "name": "长标题索引测试", "pack_id": pack["id"],
+            "goal_title": "长标题目标", "daily_minutes": 40,
+            "deadline": "2027-01-31", "level": "beginner"})
+        self.assertIn("install", out)
+        units = services.get_goal_units(self.db, self._goal_id())
+        self.assertEqual(len(units), len(pack["units"]),
+                         "每个骨架单元都必须有自己的主键")
+
     def _goal_id(self):
         return self.db.one("SELECT id FROM goals ORDER BY created_at DESC LIMIT 1")["id"]
 
