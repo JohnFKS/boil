@@ -8,6 +8,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -22,10 +23,13 @@ class FakeHandler(BaseHTTPRequestHandler):
     # 非空时按脚本回放：每项 {"status":200,"content":"…","finish":"stop"}
     script: list = []
 
-    def _reply(self, status: int, body: bytes, content_type: str):
+    def _reply(self, status: int, body: bytes, content_type: str,
+               extra_headers: dict | None = None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -42,17 +46,22 @@ class FakeHandler(BaseHTTPRequestHandler):
             status = int(step.get("status", 200))
             content = step.get("content", "{}")
             finish = step.get("finish")
+            usage = step.get("usage")
+            headers = step.get("headers") or {}
             if status != 200:
                 self._reply(status, json.dumps({"error": {"message": step.get("detail", "bad request")}}).encode(),
-                            "application/json")
+                            "application/json", headers)
                 return
             if payload.get("stream"):
-                self._send_sse(content, finish)
+                self._send_sse(content, finish, usage)
                 return
             choice = {"message": {"content": content}}
             if finish:
                 choice["finish_reason"] = finish
-            self._reply(200, json.dumps({"choices": [choice]}).encode(), "application/json")
+            body = {"choices": [choice]}
+            if usage:
+                body["usage"] = usage
+            self._reply(200, json.dumps(body).encode(), "application/json", headers)
             return
         content = '{"hello":"world"}' if payload.get("response_format") else "OK from fake"
         if payload.get("stream"):
@@ -61,7 +70,8 @@ class FakeHandler(BaseHTTPRequestHandler):
         self._reply(200, json.dumps({"choices": [{"message": {"content": content}}]}).encode(),
                     "application/json")
 
-    def _send_sse(self, content: str, finish: str | None):
+    def _send_sse(self, content: str, finish: str | None,
+                  usage: dict | None = None):
         """流式回给调用方；Boil 的 chat 会把它拼回非流式形状，所以这里要按字切分。"""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -77,6 +87,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         tail = {"choices": [{"delta": {}, "finish_reason": finish or "stop"}]}
+        if usage:
+            tail["usage"] = usage
         self.wfile.write(f"data: {json.dumps(tail, ensure_ascii=False)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -106,6 +118,7 @@ class LLMGatewayTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
+        llm._limiter = llm._RateLimiter()   # 每个用例独立窗口，避免互相拖慢
         llm.set_config({
             "base_url": f"http://127.0.0.1:{self.port}/v1",
             "api_key": "sk-test-1234567890abcdef",
@@ -113,6 +126,7 @@ class LLMGatewayTest(unittest.TestCase):
             "deep_model": "fake-model",
             "temperature": 0.1,
         })
+        llm.reset_usage_stats()
 
     def tearDown(self):
         FakeHandler.script = []
@@ -195,6 +209,28 @@ class LLMGatewayTest(unittest.TestCase):
         self.assertEqual(len(FakeHandler.requests), 2)
         self.assertGreater(FakeHandler.requests[1]["max_tokens"], 100)
 
+    def test_truncation_retry_uses_two_times_budget_and_compression_hint(self):
+        FakeHandler.script = [
+            {"content": '{"a": [1, 2,', "finish": "length"},
+            {"content": '{"a": [1, 2, 3]}', "finish": "stop"},
+        ]
+        out = llm.chat_json([{"role": "user", "content": "go-2x"}], max_tokens=100)
+        self.assertEqual(out, {"a": [1, 2, 3]})
+        self.assertEqual(len(FakeHandler.requests), 2)
+        # 旧的 4 倍放大被撤掉：2 倍 + 800，并让模型压缩篇幅而不是重写整份长 JSON
+        self.assertLessEqual(FakeHandler.requests[1]["max_tokens"], 1000)
+        self.assertIn("压缩", FakeHandler.requests[1]["messages"][-1]["content"])
+
+    def test_second_truncation_stops_instead_of_burning_material_again(self):
+        FakeHandler.script = [
+            {"content": '{"a": [1,', "finish": "length"},
+            {"content": '{"a": [1,', "finish": "length"},
+        ]
+        with self.assertRaises(llm.LLMError) as ctx:
+            llm.chat_json([{"role": "user", "content": "go-length-twice"}], max_tokens=100)
+        self.assertEqual(ctx.exception.code, "length_retry_exhausted")
+        self.assertEqual(len(FakeHandler.requests), 2, "连续截断不该再重发第三次")
+
     def test_truncation_without_explicit_budget_does_not_lower_ceiling(self):
         # 没设 max_tokens 时不能凭空塞一个更小的额度，否则会把网关默认值压低
         FakeHandler.script = [{"content": '{"a": 1}', "finish": "stop"}]
@@ -219,6 +255,211 @@ class LLMGatewayTest(unittest.TestCase):
         self.assertIn("response_format", FakeHandler.requests[0])
         self.assertNotIn("response_format", FakeHandler.requests[1])
 
+    # ---- Dots 平台协议适配（api-key / 限流 / 用量 / 512K 窗口） ----
+
+    def test_dots_thinking_is_disabled_even_without_extra_body(self):
+        """环境变量 / 自定义端点接 Dots 时 extra_body 为空，也必须关掉 max 档思考。"""
+        llm.set_config({"model": "dots3-note-prev", "auth_header": "api-key",
+                        "auth_prefix": "", "extra_body": {}})
+        FakeHandler.script = [{"content": "ok", "finish": "stop"}]
+        llm.chat([{"role": "user", "content": "hello"}], max_tokens=50)
+        self.assertEqual(FakeHandler.seen["payload"]["chat_template_kwargs"],
+                         {"enable_thinking": False})
+        self.assertEqual(llm.config_warnings(), [])
+
+    def test_dots_explicit_thinking_is_respected_and_flagged(self):
+        llm.set_config({"model": "dots3-note-prev", "auth_header": "api-key",
+                        "auth_prefix": "",
+                        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}}})
+        FakeHandler.script = [{"content": "ok", "finish": "stop"}]
+        llm.chat([{"role": "user", "content": "hello"}], max_tokens=50)
+        self.assertEqual(FakeHandler.seen["payload"]["chat_template_kwargs"],
+                         {"enable_thinking": True})
+        self.assertTrue(any("深度思考" in w for w in llm.config_warnings()))
+
+    def test_dots_auth_and_payload_contract(self):
+        llm.set_config({
+            "base_url": f"http://127.0.0.1:{self.port}/v1",
+            "model": "dots3-note-prev", "auth_header": "api-key", "auth_prefix": "",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        })
+        FakeHandler.script = [{"content": "ok", "finish": "stop"}]
+        llm.chat([{"role": "user", "content": "hello"}], max_tokens=500)
+        headers = FakeHandler.seen["headers"]
+        payload = FakeHandler.seen["payload"]
+        self.assertEqual(headers.get("api-key"), "sk-test-1234567890abcdef")
+        self.assertEqual(headers.get("content-type"), "application/json")
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(payload["model"], "dots3-note-prev")
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertLessEqual(payload["max_tokens"], llm.DOTS_CONTEXT_WINDOW)
+        self.assertEqual(llm.config_warnings(), [])
+
+    def test_stop_tools_and_tool_choice_passthrough(self):
+        FakeHandler.script = [{"content": "ok", "finish": "stop"}]
+        tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+        llm.chat([{"role": "user", "content": "hello"}], max_tokens=100,
+                 stop=["\n\n---"], tools=tools, tool_choice="none")
+        payload = FakeHandler.seen["payload"]
+        self.assertEqual(payload["stop"], ["\n\n---"])
+        self.assertEqual(payload["tool_choice"], "none")
+        self.assertEqual(payload["tools"], tools)
+
+    def test_usage_is_recorded_from_json_response(self):
+        llm.set_config({"stream_upstream": False})
+        FakeHandler.script = [{"content": '{"ok":1}', "finish": "stop",
+                               "usage": {"prompt_tokens": 120, "completion_tokens": 30,
+                                         "total_tokens": 150}}]
+        llm.chat([{"role": "user", "content": "go"}], max_tokens=200)
+        stats = llm.usage_stats()
+        self.assertEqual(stats["calls"], 1)
+        self.assertEqual(stats["prompt_tokens"], 120)
+        self.assertEqual(stats["completion_tokens"], 30)
+        self.assertEqual(stats["total_tokens"], 150)
+        self.assertEqual(stats["estimated_calls"], 0)
+        self.assertEqual(stats["by_model"]["fake-model"]["calls"], 1)
+
+    def test_usage_is_recorded_from_sse_finish_chunk(self):
+        FakeHandler.script = [{"content": "ok", "finish": "stop",
+                               "usage": {"prompt_tokens": 80, "completion_tokens": 20,
+                                         "total_tokens": 100}}]
+        self.assertEqual(llm.chat([{"role": "user", "content": "go"}], max_tokens=100), "ok")
+        self.assertEqual(llm.usage_stats()["total_tokens"], 100)
+
+    def test_429_retry_after_is_respected(self):
+        FakeHandler.script = [
+            {"status": 429, "detail": "rate limited", "headers": {"Retry-After": "3"}},
+            {"content": "OK after wait", "finish": "stop"},
+        ]
+        sleeps: list[float] = []
+        with mock.patch.object(llm.time, "sleep", side_effect=lambda s: sleeps.append(s)):
+            text = llm.chat([{"role": "user", "content": "go"}], max_tokens=20)
+        self.assertEqual(text, "OK after wait")
+        self.assertIn(3.0, sleeps)
+        self.assertEqual(len(FakeHandler.requests), 2)
+
+    def test_401_and_403_are_not_retried(self):
+        for status in (401, 403):
+            FakeHandler.requests = []
+            FakeHandler.script = [{"status": status, "detail": "denied"}]
+            with self.assertRaises(llm.LLMError):
+                llm.chat([{"role": "user", "content": "go"}], max_tokens=20)
+            self.assertEqual(len(FakeHandler.requests), 1)
+
+    def test_wrapped_upstream_5xx_as_400_is_retried(self):
+        FakeHandler.script = [
+            {"status": 400,
+             "detail": '{"title":"Unknown provider error","status":500,'
+                       '"error_type":"InternalServerError"}'},
+            {"content": "OK after retry", "finish": "stop"},
+        ]
+        with mock.patch.object(llm.time, "sleep", side_effect=lambda s: None):
+            text = llm.chat([{"role": "user", "content": "go"}], max_tokens=20)
+        self.assertEqual(text, "OK after retry")
+        self.assertEqual(len(FakeHandler.requests), 2)
+
+    def test_plain_parameter_400_is_not_retried(self):
+        FakeHandler.script = [{"status": 400, "detail": "invalid parameter: model"}]
+        with self.assertRaises(llm.LLMError):
+            llm.chat([{"role": "user", "content": "go"}], max_tokens=20)
+        self.assertEqual(len(FakeHandler.requests), 1)
+
+    def test_key_never_leaks_into_error_or_public_config(self):
+        key = "sk-test-1234567890abcdef"
+        FakeHandler.script = [{"status": 400, "detail": f"bad api-key header: {key}"}]
+        with self.assertRaises(llm.LLMError):
+            llm.chat([{"role": "user", "content": "go"}], max_tokens=20)
+        blob = json.dumps({"error": llm.last_error(), "public": llm.public_config(),
+                           "usage": llm.usage_stats(), "limit": llm.rate_limit_stats()},
+                          ensure_ascii=False)
+        self.assertNotIn(key, blob)
+
+    def test_context_budget_caps_max_tokens(self):
+        llm.set_config({"context_window": 4096, "stream_upstream": False})
+        FakeHandler.script = [{"content": "ok", "finish": "stop"}]
+        llm.chat([{"role": "user", "content": "短文本"}], max_tokens=100_000)
+        sent = FakeHandler.requests[-1]["max_tokens"]
+        self.assertGreater(sent, 0)
+        self.assertLess(sent, 4096)
+
+    def test_context_overflow_raises_before_any_request(self):
+        llm.set_config({"context_window": 4096})
+        FakeHandler.requests = []
+        with self.assertRaises(llm.LLMError) as ctx:
+            llm.chat([{"role": "user", "content": "x" * 20_000}], max_tokens=10)
+        self.assertEqual(ctx.exception.code, "context_overflow")
+        self.assertEqual(FakeHandler.requests, [])
+
+    def test_dots_config_warnings_catch_wrong_auth(self):
+        llm.set_config({
+            "base_url": f"http://127.0.0.1:{self.port}/v1", "model": "dots3-note-prev",
+            "auth_header": "api-key", "auth_prefix": "",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        })
+        self.assertEqual(llm.config_warnings(), [])
+        llm.set_config({"auth_header": "Authorization", "auth_prefix": "Bearer "})
+        self.assertTrue(any("api-key" in w for w in llm.config_warnings()))
+
+    def test_key_in_base_url_is_flagged(self):
+        cfg = llm.get_config()
+        cfg["base_url"] = "https://example.com/v1/?key=sk-test-1234567890abcdef"
+        self.assertTrue(any("Base URL" in w for w in llm.config_warnings(cfg)))
+
+    def test_limits_and_usage_are_exposed_in_public_config(self):
+        pub = llm.public_config()
+        self.assertEqual(pub["rpm"], llm.DEFAULT_RPM)
+        self.assertEqual(pub["tpm"], llm.DEFAULT_TPM)
+        self.assertEqual(pub["context_window"], llm.DOTS_CONTEXT_WINDOW)
+        self.assertIn("usage", pub)
+        self.assertIn("rate_limit", pub)
+        self.assertIn("config_warnings", pub)
+
+    def test_retry_after_parsing(self):
+        self.assertEqual(llm._retry_after_seconds({"Retry-After": "2.5"}), 2.5)
+        self.assertEqual(llm._retry_after_seconds({}), 0.0)
+        self.assertEqual(llm._retry_after_seconds(None), 0.0)
+
+
+class RateLimitTest(unittest.TestCase):
+    """用可推进的假时钟验滑动窗口，避免真等 60 秒。"""
+
+    def _clock(self):
+        state = {"now": 1000.0, "sleeps": []}
+
+        def monotonic():
+            return state["now"]
+
+        def sleep(seconds):
+            state["sleeps"].append(seconds)
+            state["now"] += seconds
+
+        return state, monotonic, sleep
+
+    def test_rpm_window_blocks_extra_request(self):
+        state, monotonic, sleep = self._clock()
+        limiter = llm._RateLimiter()
+        with mock.patch.object(llm.time, "monotonic", monotonic), \
+             mock.patch.object(llm.time, "sleep", sleep):
+            for _ in range(3):
+                limiter.acquire("key", rpm=2, tpm=0, tokens=10)
+        self.assertEqual(limiter.snapshot()["waits"], 1)
+        self.assertGreaterEqual(state["now"] - 1000.0, llm.RATE_WINDOW_SECONDS)
+
+    def test_tpm_window_throttles_large_request(self):
+        state, monotonic, sleep = self._clock()
+        limiter = llm._RateLimiter()
+        with mock.patch.object(llm.time, "monotonic", monotonic), \
+             mock.patch.object(llm.time, "sleep", sleep):
+            limiter.acquire("key", rpm=0, tpm=100, tokens=60)
+            limiter.acquire("key", rpm=0, tpm=100, tokens=60)
+        self.assertEqual(limiter.snapshot()["waits"], 1)
+        self.assertGreater(state["now"], 1000.0)
+
+    def test_zero_limits_disable_throttling(self):
+        limiter = llm._RateLimiter()
+        limiter.acquire("key", rpm=0, tpm=0, tokens=10 ** 9)
+        self.assertEqual(limiter.snapshot()["waits"], 0)
 
 
 class BaseUrlValidationTest(unittest.TestCase):

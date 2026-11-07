@@ -88,6 +88,18 @@ export async function render(el, ctx, params) {
       </div>
     </div>
 
+    ${u.source_ref?.deepen?.state === "pending" ? `
+      <div class="preview-box mt-2" data-deepen-box>
+        <div class="between"><strong>极速导入的骨架单元</strong><span class="badge badge-muted">尚未消耗模型</span></div>
+        <p class="small muted">导入时只建立了章节索引。点击下方按钮，系统会检索这一节的原文，只针对本单元生成一次完整讲解。</p>
+        <button class="btn btn-primary btn-sm" data-deepen>按需深化本单元</button>
+        <span class="hint" data-deepen-status></span>
+      </div>` : u.source_ref?.deepen?.state === "done" ? `
+      <div class="preview-box mt-2">
+        <div class="between"><strong>已按需深化</strong><span class="badge badge-teal">${escapeHTML(u.source_ref.deepen.model || "模型")}</span></div>
+        <span class="hint">依据 ${(u.source_ref.deepen.chunks || []).length} 个原文小节生成；其余单元仍保持零消耗，直到你学到它们。</span>
+      </div>` : ""}
+
     <div class="unit-grid">
       <div class="unit-main" data-selectable data-unit-id="${escapeAttr(u.id)}" data-source="unit">
         ${data.merged_into ? `
@@ -259,6 +271,30 @@ export async function render(el, ctx, params) {
       </aside>
     </div>`;
 
+  el.querySelector("[data-deepen]")?.addEventListener("click", async (ev) => {
+    const button = ev.currentTarget;
+    const status = el.querySelector("[data-deepen-status]");
+    button.disabled = true;
+    button.textContent = "正在检索原文并生成…";
+    if (status) status.textContent = "只针对本单元，首次约需 1～2 分钟。";
+    try {
+      const result = await ctx.api.post(
+        `/api/units/${encodeURIComponent(u.id)}/deepen`, {}, { timeout: 300000 });
+      if (result.deepened) {
+        toast("已用原文深化本单元", "success");
+        location.reload();
+      } else {
+        toast(`暂未深化：${result.reason || "未知原因"}`, "warn", 6000);
+        button.disabled = false;
+        button.textContent = "重试按需深化";
+        if (status) status.textContent = result.detail || "";
+      }
+    } catch (e) {
+      toast(e.message || "深化失败", "error", 6000);
+      button.disabled = false;
+      button.textContent = "重试按需深化";
+    }
+  });
   el.querySelectorAll("[data-socratic]").forEach(btn => btn.addEventListener("click", () => ctx.startSocratic(u.id)));
   el.querySelectorAll("[data-audio]").forEach(btn => btn.addEventListener("click", () => openAudioModal(ctx, u)));
   el.querySelectorAll("[data-save-note]").forEach(btn => btn.addEventListener("click", async () => {

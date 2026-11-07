@@ -7,8 +7,9 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import (config, decompose, embeddings, heat, llm, mastery, planner, quality, socratic, styles)
-from .compiler import compile_material
+from . import (config, decompose, embeddings, heat, indexer, llm, mastery, planner,
+               quality, socratic, styles)
+from .compiler import compile_material, _normalize_llm_units
 from .db import Database, SCHEMA_VERSION, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
 from .packs import (PackError, all_available_packs, find_pack, get_goal_relations,
@@ -2370,6 +2371,110 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
             "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
                         "near_duplicates": qa["near_duplicates"],
                         "engine": qa["engine"]}}
+
+
+# ---------------------------------------------------------------------------
+# 方向 6：极速索引导入 + 学习时按需深化
+# ---------------------------------------------------------------------------
+def compile_index_preview(db: Database, title: str, subject: str, text: str,
+                          documents: list[Any] | None = None,
+                          coverage: str = "standard") -> dict[str, Any]:
+    """导入只建索引：0 次生成模型调用、秒级完成，结果与 compile_preview 同构。"""
+    merged, docs = merge_material_documents(documents, text)
+    if len(merged) < 60:
+        raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
+    pack, index, warnings = indexer.build(title, subject, merged, docs)
+    # 骨架单元由本地规则生成，质检不需要模型裁决重复：保持导入期零生成调用
+    qa = quality.qa_pack(pack, use_llm=False)
+    warnings = warnings + qa["warnings"]
+    save_user_pack(pack)
+    indexer.save_index(index)
+    return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
+            "coverage": {"requested": coverage, "applied": "index"},
+            "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
+                        "near_duplicates": qa["near_duplicates"],
+                        "engine": qa["engine"]},
+            "index": indexer.index_summary(index)}
+
+
+def deepen_unit(db: Database, user_id: str, unit_id: str,
+                force: bool = False) -> dict[str, Any]:
+    """学到某个骨架单元时，取回相关原文，只针对这一个单元调一次模型。
+
+    结果同时写回 pack 文件与 DB（学习链读的是 `units` 表，只改文件不生效）；
+    单元 id / order_index / 出处保持不变，`install_pack` 幂等重装不会丢 SRS。
+    """
+    row = db.one("SELECT * FROM units WHERE id=?", (unit_id,))
+    if not row:
+        raise ValueError("单元不存在")
+    unit = unit_from_row(row)
+    pack_id = str(unit.get("pack_id") or "")
+    pack = find_pack(pack_id)
+    if not pack or str((pack.get("source") or {}).get("mode")) != "index":
+        return {"deepened": False, "reason": "not_index_pack", "unit_id": unit_id}
+    target = next((u for u in pack.get("units") or []
+                   if u.get("id") == unit.get("pack_unit_id")), None)
+    if target is None:
+        return {"deepened": False, "reason": "unit_not_in_pack", "unit_id": unit_id}
+
+    state = ((target.get("source_ref") or {}).get("deepen") or {})
+    if state.get("state") == "done" and not force:
+        return {"deepened": False, "reason": "already_done", "unit_id": unit_id,
+                "deepen": state}
+
+    index = indexer.load_index(pack_id)
+    source_ref = dict(target.get("source_ref") or {})
+    chunks = indexer.search(
+        index,
+        query=f"{target.get('title') or ''} {target.get('essence') or ''}"[:600],
+        section_id=str(source_ref.get("id") or ""))
+    chunk_ids = [c.get("id") for c in chunks]
+    if not llm.enabled():
+        return {"deepened": False, "reason": "llm_disabled", "unit_id": unit_id,
+                "chunks": chunk_ids}
+    try:
+        data = llm.chat_json([
+            {"role": "system", "content": indexer.DEEPEN_SYSTEM},
+            {"role": "user", "content": indexer.deepen_prompt(
+                target, chunks, str(pack.get("subject") or ""))},
+        ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=2000)
+        # 深化提示词要求「一个单元对象」，编译器规范化函数要求 {"units":[...]}；
+        # 两种返回都接住，别把一次成功的模型调用误判成结构错误。
+        if isinstance(data, dict) and not isinstance(data.get("units"), list):
+            data = {"units": [data]}
+        normalized = _normalize_llm_units(
+            data, str(pack.get("name") or ""), str(pack.get("subject") or ""),
+            limit=1, tables=[])
+        fresh = (normalized.get("units") or [None])[0]
+    except Exception as exc:
+        return {"deepened": False, "reason": "model_failed", "unit_id": unit_id,
+                "detail": str(exc)[:240], "chunks": chunk_ids}
+    if not fresh:
+        return {"deepened": False, "reason": "empty_result", "unit_id": unit_id,
+                "chunks": chunk_ids}
+
+    for key in ("id", "order_index", "difficulty", "importance",
+                "estimated_minutes", "relations"):
+        if key in target:
+            fresh[key] = target[key]
+    fresh["source_ref"] = {
+        **source_ref,
+        "deepen": {"state": "done", "at": now_iso(),
+                   "model": llm.model_name(deep=True), "chunks": chunk_ids,
+                   "context_chars": sum(len(c.get("text") or "") for c in chunks)},
+    }
+    pack["units"][pack["units"].index(target)] = fresh
+    errors = validate_pack(pack)
+    if errors:
+        return {"deepened": False, "reason": "invalid_result", "unit_id": unit_id,
+                "detail": "；".join(errors[:3]), "chunks": chunk_ids}
+    save_user_pack(pack)
+    install_pack(db, user_id, str(unit["goal_id"]), pack)
+    emit(db, "unit.deepened", {"unit_id": unit_id, "pack_id": pack_id,
+                               "chunks": chunk_ids}, user_id)
+    return {"deepened": True, "unit_id": unit_id, "pack_id": pack_id,
+            "chunks": chunk_ids, "essence": str(fresh.get("essence") or "")[:200],
+            "deepen": fresh["source_ref"]["deepen"]}
 
 
 # ---------------------------------------------------------------------------

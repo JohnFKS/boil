@@ -45,6 +45,20 @@ function diagHTML(cfg) {
   </details>`;
 }
 
+function usageHTML(cfg) {
+  const u = cfg.usage || {};
+  const r = cfg.rate_limit || {};
+  const warns = cfg.config_warnings || [];
+  const n = (v) => Number(v || 0).toLocaleString("zh-CN");
+  return `<div class="callout mt-3" data-llm-usage>
+    <strong>Token 用量与限流</strong>
+    <div class="hint">真实调用 ${n(u.calls)} 次 · 输入 ${n(u.prompt_tokens)} · 输出 ${n(u.completion_tokens)} · 合计 ${n(u.total_tokens)} tokens${u.estimated_calls ? `（${n(u.estimated_calls)} 次网关未回 usage，按字符估算）` : ""}；缓存命中 ${n(cfg.cache?.hits)} 次不花 token。</div>
+    <div class="hint">单 Key 限流 ${n(r.rpm)} 次/分钟 · ${n(r.tpm)} tokens/分钟 · 上下文窗口 ${n(cfg.context_window)}；主动等待 ${n(r.waits)} 次 / ${r.wait_seconds || 0}s。
+      <button class="link-btn" type="button" data-usage-reset>重置用量</button></div>
+    ${warns.length ? `<div class="error-box">${warns.map((w) => escapeHTML(w)).join("<br>")}</div>` : ""}
+  </div>`;
+}
+
 export async function render(el, ctx, params) {
   const cfg = await ctx.api.get("/api/settings/llm");
   const emb = await ctx.api.get("/api/settings/embeddings");
@@ -93,6 +107,7 @@ export async function render(el, ctx, params) {
           </div>
           ${cfg.forced_off ? `<div class="error-box">服务端设置了 BOIL_LLM_OFF=1，所有调用会强制走演示模式。</div>` : ""}
           ${diagHTML(cfg)}
+          ${usageHTML(cfg)}
           <div class="mt-4">
             <div class="side-label">快速填充</div>
             <div class="mt-2">${providerChips(cfg.providers || [])}</div>
@@ -107,6 +122,9 @@ export async function render(el, ctx, params) {
             <div class="field"><label for="llm-temp">温度 <span id="temp-label">${cfg.temperature}</span></label><input class="slider" id="llm-temp" type="range" min="0" max="1.5" step="0.1" value="${cfg.temperature}"></div>
             <div class="field"><label for="llm-tokens">最大输出 tokens（可选）</label><input class="input" id="llm-tokens" type="number" min="64" max="32000" value="${cfg.max_tokens || ""}" placeholder="留空由服务端决定"></div>
             <div class="field"><label for="llm-timeout">超时（秒）</label><input class="input" id="llm-timeout" type="number" min="10" max="600" value="${cfg.timeout || 120}"></div>
+            <div class="field"><label for="llm-rpm">限流 RPM（次/分钟）</label><input class="input" id="llm-rpm" type="number" min="0" max="10000" value="${cfg.rpm ?? 60}"><span class="hint">Dots 默认 60，按单个 Key 计算；0 表示不做客户端限流。</span></div>
+            <div class="field"><label for="llm-tpm">限流 TPM（tokens/分钟）</label><input class="input" id="llm-tpm" type="number" min="0" max="100000000" value="${cfg.tpm ?? 1500000}"></div>
+            <div class="field"><label for="llm-context">上下文窗口（tokens）</label><input class="input" id="llm-context" type="number" min="4096" max="1000000" value="${cfg.context_window ?? 524288}"><span class="hint">输入 tokens + max_tokens 不得超过窗口；Dots 为 524,288。</span></div>
             <div class="field full"><label for="llm-extra">高级请求参数 JSON（可选）</label><textarea class="textarea" id="llm-extra" placeholder='{}'>${escapeHTML(JSON.stringify(cfg.extra_body || {}, null, 2))}</textarea><span class="hint">会合并进请求体。Dots 可设置 <code>{"chat_template_kwargs":{"enable_thinking":true}}</code> 开启深度思考；默认预设关闭以降低延迟。</span></div>
           </div>
           <div class="field full mt-3 cache-row">
@@ -300,6 +318,9 @@ export async function render(el, ctx, params) {
       temperature: Number(el.querySelector("#llm-temp").value),
       max_tokens: el.querySelector("#llm-tokens").value ? Number(el.querySelector("#llm-tokens").value) : null,
       timeout: Number(el.querySelector("#llm-timeout").value) || 120,
+      rpm: Number(el.querySelector("#llm-rpm")?.value ?? 60),
+      tpm: Number(el.querySelector("#llm-tpm")?.value ?? 1500000),
+      context_window: Number(el.querySelector("#llm-context")?.value ?? 524288),
     };
     const key = el.querySelector("#llm-key").value.trim();
     if (key) payload.api_key = key;
@@ -329,6 +350,16 @@ export async function render(el, ctx, params) {
     } catch (err) {
       toast(err.message || "清空失败", "error");
       btn.disabled = false;
+    }
+  });
+
+  el.querySelector("[data-usage-reset]")?.addEventListener("click", async () => {
+    try {
+      await ctx.api.post("/api/settings/llm/usage/reset", {});
+      toast("用量统计已重置。", "success");
+      await render(el, ctx, params);
+    } catch (err) {
+      toast(err.message || "重置失败", "error");
     }
   });
 

@@ -67,6 +67,7 @@ class App:
             ("POST", re.compile(r"^/api/units/([^/]+)/mnemonic$"), self.unit_mnemonic),
             ("POST", re.compile(r"^/api/units/([^/]+)/merge$"), self.unit_merge),
             ("POST", re.compile(r"^/api/units/([^/]+)/unmerge$"), self.unit_unmerge),
+            ("POST", re.compile(r"^/api/units/([^/]+)/deepen$"), self.unit_deepen),
             ("GET", re.compile(r"^/api/notes$"), self.notes_list),
             ("POST", re.compile(r"^/api/notes$"), self.notes_create),
             ("POST", re.compile(r"^/api/notes/delete$"), self.notes_delete),
@@ -79,6 +80,7 @@ class App:
             ("POST", re.compile(r"^/api/packs/compile$"), self.compile_pack),
             ("GET", re.compile(r"^/api/packs/compile/status$"), self.compile_status),
             ("POST", re.compile(r"^/api/packs/compile/cancel$"), self.compile_cancel),
+            ("POST", re.compile(r"^/api/packs/index$"), self.index_pack),
             ("POST", re.compile(r"^/api/packs/suggest$"), self.pack_suggest),
             ("POST", re.compile(r"^/api/material/fix$"), self.material_fix),
             ("POST", re.compile(r"^/api/packs/import$"), self.pack_import),
@@ -107,6 +109,8 @@ class App:
             ("POST", re.compile(r"^/api/settings/llm$"), self.llm_set),
             ("POST", re.compile(r"^/api/settings/llm/test$"), self.llm_test),
             ("POST", re.compile(r"^/api/settings/llm/cache/clear$"), self.llm_cache_clear),
+            ("GET", re.compile(r"^/api/settings/llm/usage$"), self.llm_usage),
+            ("POST", re.compile(r"^/api/settings/llm/usage/reset$"), self.llm_usage_reset),
             ("GET", re.compile(r"^/api/settings/embeddings$"), self.embedding_get),
             ("POST", re.compile(r"^/api/settings/embeddings$"), self.embedding_set),
             ("POST", re.compile(r"^/api/settings/embeddings/test$"), self.embedding_test),
@@ -210,6 +214,11 @@ class App:
 
     def unit(self, req, match, query, body):
         return services.unit_detail(self.db, config.DEFAULT_USER, unquote(match.group(1)))
+
+    def unit_deepen(self, req, match, query, body):
+        force = bool((body or {}).get("force")) if isinstance(body, dict) else False
+        return services.deepen_unit(self.db, config.DEFAULT_USER,
+                                    unquote(match.group(1)), force=force)
 
     def unit_note(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -374,6 +383,15 @@ class App:
         if job is None:
             raise ApiError(404, "编译任务不存在或已过期", "job_not_found")
         return job
+
+    def index_pack(self, req, match, query, body):
+        """方向 6：只建索引（秒级、0 次生成模型调用），单元留到学习时按需深化。"""
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        args = self._compile_args(body)
+        return services.compile_index_preview(
+            self.db, args["title"], args["subject"], args["text"],
+            documents=args["documents"], coverage=args["coverage"])
 
     def material_fix(self, req, match, query, body):
         if not isinstance(body, dict):
@@ -602,6 +620,14 @@ class App:
     def llm_cache_clear(self, req, match, query, body):
         removed = llm.clear_cache()
         return {"removed": removed, "cache": llm.cache_stats(), "entries": llm.cache_size()}
+
+    def llm_usage(self, req, match, query, body):
+        return {"usage": llm.usage_stats(), "rate_limit": llm.rate_limit_stats(),
+                "config_warnings": llm.config_warnings()}
+
+    def llm_usage_reset(self, req, match, query, body):
+        llm.reset_usage_stats()
+        return {"ok": True, "usage": llm.usage_stats()}
 
     def embedding_get(self, req, match, query, body):
         return embeddings.public_config()

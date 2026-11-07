@@ -81,6 +81,7 @@ export async function render(el, ctx, params) {
     subject: "",
     text: "",
     coverage: "standard",
+    indexMode: false,
     deadline: defaultDate(),
     daily: 40,
     level: "beginner",
@@ -291,6 +292,13 @@ export async function render(el, ctx, params) {
           <div class="field"><label for="ob-minutes">每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
           <div class="field full"><label>当前基础</label><div class="choice-row">${LEVELS.map(([v, l]) => `<button class="choice ${v === draft.level ? "active" : ""}" data-level="${v}">${l}</button>`).join("")}</div></div>
         </div>
+        ${mode === "material" ? `
+          <label class="preview-box" style="display:flex;gap:10px;align-items:flex-start;cursor:pointer">
+            <input type="checkbox" id="ob-index-mode" ${draft.indexMode ? "checked" : ""} style="margin-top:3px">
+            <span><strong>极速导入（推荐整本教材）</strong><br>
+              <span class="hint">导入时只建立章节索引，几秒完成、0 次生成模型调用；学到某个单元时，再检索该节原文按需生成讲解。没学到的章节永不消耗 token。</span>
+            </span>
+          </label>` : ""}
         <div class="preview-box" id="ob-preview">
           <strong>${mode === "material" ? "下一步会先编译，不会立刻开始。" : `将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。`}</strong><br>
           ${mode === "material" ? "编译完成后，你可以预览单元再开始。" : `预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
@@ -309,6 +317,8 @@ export async function render(el, ctx, params) {
       draft.coverage = b.dataset.coverage;
       body.querySelectorAll("[data-coverage]").forEach(x => x.classList.toggle("active", x === b));
     }));
+    const indexMode = body.querySelector("#ob-index-mode");
+    indexMode?.addEventListener("change", () => { draft.indexMode = indexMode.checked; });
     const minutes = body.querySelector("#ob-minutes");
     const minutesLabel = body.querySelector("#ob-minutes-label");
     minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });
@@ -514,6 +524,15 @@ export async function render(el, ctx, params) {
           const materialTitle = body.querySelector("#ob-material-title").value.trim() || goalTitle;
           const subject = body.querySelector("#ob-subject").value.trim();
           draft = { ...draft, materialTitle, subject, text: pasted };
+          if (body.querySelector("#ob-index-mode")?.checked) {
+            btn.innerHTML = "正在建立章节索引…";
+            const indexed = await ctx.api.post("/api/packs/index", {
+              title: materialTitle, subject, text: pasted, documents,
+              coverage: draft.coverage,
+            }, { timeout: 180000 });
+            applyCompileResult(indexed);
+            return;
+          }
           const ctrl = beginCompile();
           const res = await runCompile(ctx.api, {
             payload: {
@@ -548,14 +567,21 @@ export async function render(el, ctx, params) {
     const outline = materialPack?.outline || [];
     const phases = materialPack?.study_plan || [];
     const byModel = materialPack?.generated_by === "model";
-    const sourceBadge = byModel
-      ? `<span class="badge badge-teal">AI 分析</span>`
-      : `<span class="badge badge-muted">本地规则</span>`;
+    const isIndex = materialPack?.generated_by === "index";
+    const sourceBadge = isIndex
+      ? `<span class="badge badge-teal">极速索引</span>`
+      : byModel ? `<span class="badge badge-teal">AI 分析</span>`
+                : `<span class="badge badge-muted">本地规则</span>`;
     const minutesTotal = phases.reduce((n, p) => n + (Number(p.minutes) || 0), 0);
     body.innerHTML = `
       <div class="onboarding-step active">
-        <h2>编译完成，先看一眼结构</h2>
-        <p class="sub">标题、大纲与计划都是读完全部材料后生成的；没有把握的地方不会硬编。</p>
+        <h2>${isIndex ? "索引已就绪，可以开始" : "编译完成，先看一眼结构"}</h2>
+        <p class="sub">${isIndex ? "导入没有预生成昂贵单元；学到哪一节，就为哪一节生成。" : "标题、大纲与计划都是读完全部材料后生成的；没有把握的地方不会硬编。"}</p>
+        ${isIndex ? `
+          <div class="preview-box">
+            <div class="between"><strong>极速导入完成</strong><span class="badge badge-teal">0 次生成模型调用</span></div>
+            <p class="small muted">已索引 ${(materialPack.source?.index?.chunks ?? units.length)} 个小节、${(materialPack.source?.material_chars || 0).toLocaleString()} 字符，并为每节生成骨架单元。学习路径与知识地图已就绪；打开某个单元时，系统会检索该节原文，只针对这一节生成完整讲解。</p>
+          </div>` : ""}
         <div class="preview-box">
           <div class="between"><strong>${escapeHTML(materialPack.name)}</strong><span class="badge badge-teal">${units.length} 个单元</span></div>
           ${digest.overview ? `

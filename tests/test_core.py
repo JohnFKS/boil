@@ -4,6 +4,8 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -475,13 +477,54 @@ class AiPathTest(TempCase):
         self.assertEqual(res["unit_id"], unit_id)
 
 
-    def test_long_material_is_compiled_in_batches_covering_everything(self):
-        seen = {"prompts": [], "calls": 0}
+    def test_batches_are_compiled_concurrently(self):
+        """串行时同时在跑的批次恒为 1；并发上线后应能观察到多批重叠。"""
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
 
         def fake_json(messages, **kw):
             prompt = messages[1]["content"]
-            seen["prompts"].append(prompt)
-            seen["calls"] += 1
+            with lock:
+                active["n"] += 1
+                active["peak"] = max(active["peak"], active["n"])
+            time.sleep(0.05)
+            with lock:
+                active["n"] -= 1
+            if "全篇骨架" in prompt:
+                return {"name": "并发包", "description": "d", "subject": "s", "outline": [],
+                        "study_plan": [], "digest": {"overview": "总览", "advice": []}}
+            return {"units": [{"title": "并发单元", "essence": "核心结论",
+                               "steps": ["步骤"], "key_points": ["要点"],
+                               "probes": [], "cards": []}]}
+
+        llm.enabled = lambda: True
+        llm.chat_json = fake_json
+        old_limit = compiler.SINGLE_CALL_LIMIT
+        old_batch = compiler.BATCH_CHAR_BUDGET
+        old_concurrency = compiler.config.COMPILE_CONCURRENCY
+        compiler.SINGLE_CALL_LIMIT = 1000
+        compiler.BATCH_CHAR_BUDGET = 700
+        compiler.config.COMPILE_CONCURRENCY = 4
+        try:
+            text = "\n\n".join(f"## 第 {i} 节\n并发编译的第 {i} 个侧面。{'补充说明。' * 60}"
+                               for i in range(1, 9))
+            compiler.compile_material("并发材料", "学科", text, use_llm=True,
+                                      use_embeddings=False)
+        finally:
+            compiler.SINGLE_CALL_LIMIT, compiler.BATCH_CHAR_BUDGET = old_limit, old_batch
+            compiler.config.COMPILE_CONCURRENCY = old_concurrency
+        self.assertGreaterEqual(active["peak"], 2, "批次没有真正并行")
+
+    def test_long_material_is_compiled_in_batches_covering_everything(self):
+        seen = {"prompts": [], "calls": 0}
+        lock = threading.Lock()
+
+        def fake_json(messages, **kw):
+            prompt = messages[1]["content"]
+            with lock:
+                seen["prompts"].append(prompt)
+                seen["calls"] += 1
+                n = seen["calls"]
             if "全篇骨架" in prompt:
                 return {"name": "长材料包", "description": "覆盖全部小节", "subject": "学习科学",
                         "outline": [{"title": "第一部分", "summary": "先立地基",
@@ -490,8 +533,8 @@ class AiPathTest(TempCase):
                                         "focus": "理解本质", "minutes": 200}],
                         "digest": {"overview": "这份长材料分成多节讲提取与复习。",
                                    "advice": ["先跑完第一批"]}}
-            marker = prompt.count("本批进度")
-            which = prompt.split("第 ")[-1].split(" /")[0].strip() or "1"
+            # 批号已从 prompt 移除（缓存键不再随批数变化）；调用序号足以保证标题唯一
+            which = str(n - 1)
             return {"units": [{
                 "title": f"批次{which}的单元",
                 "angle": "先复述再验证边界",
@@ -518,6 +561,9 @@ class AiPathTest(TempCase):
         finally:
             compiler.SINGLE_CALL_LIMIT, compiler.BATCH_CHAR_BUDGET = old_limit, old_batch
         self.assertEqual(warnings, [])
+        self.assertFalse(any("本批进度" in p or "{batch_index}" in p or "{batch_total}" in p
+                             for p in seen["prompts"]),
+                         "批号进了 prompt，分批数一变整轮缓存就失效")
         self.assertGreaterEqual(seen["calls"], 4, "应该是 1 次大纲 + 至少 3 次批次")
         self.assertEqual(len(pack["units"]), seen["calls"] - 1)
         self.assertEqual(pack["source"]["batches"], expected_batches)
@@ -532,16 +578,20 @@ class AiPathTest(TempCase):
 
     def test_batch_failure_skips_only_that_batch(self):
         calls = {"n": 0}
+        lock = threading.Lock()
 
         def fake_json(messages, **kw):
             prompt = messages[1]["content"]
-            calls["n"] += 1
+            with lock:
+                calls["n"] += 1
+                n = calls["n"]
             if "全篇骨架" in prompt:
                 return {"name": "包", "description": "d", "subject": "s",
                         "outline": [], "study_plan": [], "digest": {"overview": "总览", "advice": []}}
-            if "第 2 /" in prompt:
+            # 并发下完成顺序不定，用调用序号而不是批号文本触发一次失败
+            if n == 2:
                 raise RuntimeError("这一批网关炸了")
-            return {"units": [{"title": f"单元 {calls['n']}", "essence": "本质内容",
+            return {"units": [{"title": f"单元 {n}", "essence": "本质内容",
                                "steps": ["步骤"], "key_points": ["要点"],
                                "probes": [], "cards": []}]}
 
@@ -562,14 +612,17 @@ class AiPathTest(TempCase):
     def test_oversized_section_is_never_silently_cut(self):
         """小节超过批次预算必须无损切开：模型没读到的字，就没资格说「基于全部材料」。"""
         seen = {"prompts": []}
+        lock = threading.Lock()
 
         def fake_json(messages, **kw):
             prompt = messages[1]["content"]
-            seen["prompts"].append(prompt)
+            with lock:
+                seen["prompts"].append(prompt)
+                n = len(seen["prompts"])
             if "全篇骨架" in prompt:
                 return {"name": "包", "description": "d", "subject": "s", "outline": [],
                         "study_plan": [], "digest": {"overview": "总览", "advice": []}}
-            return {"units": [{"title": f"批次单元 {len(seen['prompts'])}", "essence": "核心结论",
+            return {"units": [{"title": f"批次单元 {n}", "essence": "核心结论",
                                "steps": ["步骤"], "key_points": ["要点"],
                                "probes": [], "cards": []}]}
 

@@ -32,6 +32,19 @@ MAX_BODY_BYTES = 12 * 1024 * 1024
 HTTP_BACKLOG = int(os.environ.get("BOIL_BACKLOG", "128"))
 
 
+def _bounded_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+# 单次编译内的批次并发数。Dots 单 Key 默认 60 RPM / 1,500,000 TPM，
+# 每批一次请求时 8 并发仍在额度内；默认 4 留余量，可显式调到 8。
+COMPILE_CONCURRENCY = _bounded_int("BOIL_COMPILE_CONCURRENCY", 4, 1, 8)
+
+
 def ensure_dirs() -> None:
     for p in (DATA_DIR, PACKS_DIR):
         p.mkdir(parents=True, exist_ok=True)

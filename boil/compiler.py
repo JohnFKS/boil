@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from . import decompose, llm
+from . import config, decompose, llm
 from .packs import PackError, derive_key_points, normalize_pack, validate_pack
 from .embeddings import semantic_groups
 from .utils import clamp, new_id, now_iso, slugify, split_cn
@@ -360,9 +361,57 @@ def _slice_at_anchors(body: str, anchors: list[str]) -> list[tuple[str, str]]:
     return pieces
 
 
-def _split_oversized(title: str, body: str) -> list[tuple[str, str]]:
-    """超长小节（常见于没有小标题的 PDF 粘贴）按锚点切开；失败就原样返回。"""
-    if len(body) <= SECTION_SPLIT_THRESHOLD or not llm.enabled():
+def _split_locally(title: str, body: str,
+                   budget: int = SECTION_SPLIT_THRESHOLD) -> list[tuple[str, str]]:
+    """按段落边界把超长小节切小，完全不发模型请求。
+
+    索引导入要求「0 次生成模型调用」：不能用 `_anchors_from_llm` 去问锚点，
+    否则一本教材里十来个长小节就能把导入拖成十几次串行模型调用。
+    """
+    paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    if len(paras) <= 1:
+        paras = [line.strip() for line in body.splitlines() if line.strip()]
+    pieces: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    buf: list[str] = []
+    used = 0
+
+    def emit(chunk: str) -> None:
+        first = re.split(r"[。！？!?\n]", chunk)[0].strip()
+        label = first[:28] or f"{title[:24]} · 片段 {len(pieces) + 1}"
+        if label in seen:
+            label = f"{label[:22]} · {len(pieces) + 1}"
+        seen.add(label)
+        pieces.append((label, chunk))
+
+    for para in paras:
+        buf.append(para)
+        used += len(para) + 2
+        if used < budget:
+            continue
+        chunk = "\n\n".join(buf).strip()
+        buf, used = [], 0
+        if len(chunk) >= 60:
+            emit(chunk)
+    if buf:
+        chunk = "\n\n".join(buf).strip()
+        if chunk:
+            if len(chunk) < 60 and pieces:
+                prev_title, prev_body = pieces[-1]
+                pieces[-1] = (prev_title, prev_body + "\n\n" + chunk)
+            else:
+                emit(chunk)
+    return pieces if len(pieces) >= 2 else [(title, body)]
+
+
+def _split_oversized(title: str, body: str,
+                     use_llm: bool = True) -> list[tuple[str, str]]:
+    """超长小节按锚点切开；失败就原样返回。use_llm=False 时只走本地切分。"""
+    if len(body) <= SECTION_SPLIT_THRESHOLD:
+        return [(title, body)]
+    if not use_llm:
+        return _split_locally(title, body)
+    if not llm.enabled():
         return [(title, body)]
     try:
         pieces = _slice_at_anchors(body, _anchors_from_llm(body))
@@ -371,11 +420,15 @@ def _split_oversized(title: str, body: str) -> list[tuple[str, str]]:
     return pieces if len(pieces) >= 2 else [(title, body)]
 
 
-def _expand_sections(text: str, use_embeddings: bool = True) -> list[tuple[str, str]]:
-    """切小节 + 把超长小节按锚点切开；顺序即编号顺序，两个编译路径必须走同一条。"""
+def _expand_sections(text: str, use_embeddings: bool = True,
+                     use_llm: bool = True) -> list[tuple[str, str]]:
+    """切小节 + 把超长小节按锚点切开；顺序即编号顺序，两个编译路径必须走同一条。
+
+    `use_llm=False` 给索引导入用：只做本地段落切分，保证导入期零模型调用。
+    """
     out: list[tuple[str, str]] = []
     for title, body in _split_sections(text, use_embeddings=use_embeddings):
-        out.extend(_split_oversized(title, body))
+        out.extend(_split_oversized(title, body, use_llm=use_llm))
     return out
 
 
@@ -657,10 +710,12 @@ def _outline_pass(title: str, subject: str, sections: list[dict[str, Any]],
               .replace("{section_total}", str(len(sections)))
               .replace("{char_total}", f"{char_total:,}")
               .replace("{skeleton}", _skeleton(sections)))
+    # 大纲是每批 prompt 的公共前缀：温度不为 0 时同一份材料会得到不同大纲，
+    # 于是所有批的 messages 都变、内容寻址缓存整轮失效，重复导入要重新烧一遍。
     data = llm.chat_json([
         {"role": "system", "content": "你是严谨的学习内容规划器。只输出合法 JSON。"},
         {"role": "user", "content": prompt},
-    ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=4000)
+    ], model=llm.model_name(deep=True), temperature=0.0, max_tokens=4000)
     return data if isinstance(data, dict) else {}
 
 
@@ -669,6 +724,39 @@ def _outline_titles(outline: dict[str, Any]) -> str:
     if not entries:
         return "（未提供大纲，按材料原顺序处理）"
     return "；".join(str(e.get("title") or "") for e in entries if isinstance(e, dict))
+
+
+def _batch_max_tokens(batch: list[tuple[str, str]]) -> int:
+    """按批内正文规模给足输出额度，离散分档以免缓存键随字数抖动。
+
+    max_tokens 是上限不是消耗：给小了只会把 JSON 截断、再全额重发一次，反而更贵。
+    大批给足、小批不预留 9000，目的是减少 finish_reason=length，不是省输出 token。
+    """
+    chars = sum(len(s["title"]) + len(s["body"]) for s in batch)
+    if chars <= 3500:
+        return 6000
+    if chars <= 5500:
+        return 9000
+    return 12000
+
+
+def _compile_one_batch(batch: list[tuple[str, str]], *, title: str, subject: str,
+                       outline_hint: str, coverage: str, template: str) -> list[dict[str, Any]]:
+    """一批 = 一次 chat_json。worker 里不碰进度回调：它属于后台 job，统一由主线程报。"""
+    # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
+    body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
+    prompt = (template
+              .replace("{title}", title).replace("{subject}", subject or "未指定")
+              .replace("{outline}", outline_hint)
+              .replace("{coverage}", coverage_text(coverage))
+              .replace("{text}", body))
+    data = llm.chat_json([
+        {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
+        {"role": "user", "content": prompt},
+    ], model=llm.model_name(deep=True), temperature=0.2,
+       max_tokens=_batch_max_tokens(batch))
+    units = (data.get("units") or []) if isinstance(data, dict) else []
+    return [u for u in units if isinstance(u, dict)]
 
 
 def compile_material_batched(title: str, subject: str, text: str,
@@ -703,37 +791,48 @@ def compile_material_batched(title: str, subject: str, text: str,
               detail=(f"{len(tables)} 个小节 · {len(text):,} 字符 · "
                       f"每批预算 {BATCH_CHAR_BUDGET:,} 字符 · {coverage} 档"))
     collected: list[dict[str, Any]] = []
-    for i, batch in enumerate(batches):
-        before = len(collected)
-        _progress(on_progress, "batch", i, len(batches),
-                  f"正在编译第 {i + 1}/{len(batches)} 批…",
-                  detail=f"本批 {sum(len(s['title']) + len(s['body']) for s in batch):,} 字符 · "
-                         f"{len(batch)} 个小节")
-        # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
-        body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
-        prompt = (llm.load_prompt("compiler_batch.md")
-                  .replace("{title}", title).replace("{subject}", subject or "未指定")
-                  .replace("{outline}", outline_hint)
-                  .replace("{batch_index}", str(i + 1)).replace("{batch_total}", str(len(batches)))
-                  .replace("{coverage}", coverage_text(coverage))
-                  .replace("{text}", body))
+    # 静态模板只读一次：并发时各线程重复读文件没必要，更要保证所有批拿到同一份模板
+    template = llm.load_prompt("compiler_batch.md")
+    # 波次并发：一波最多 config.COMPILE_CONCURRENCY 个，波内并行、波间收拢。
+    # 进度回调只在主线程报：它属于后台 job，且并发下完成顺序不等于批号顺序。
+    concurrency = min(max(1, config.COMPILE_CONCURRENCY), len(batches))
+    results: dict[int, list[dict[str, Any]]] = {}
+    errors: dict[int, str] = {}
+    done = 0
+
+    for start in range(0, len(batches), concurrency):
+        wave = list(enumerate(batches[start:start + concurrency], start))
+        pool = ThreadPoolExecutor(max_workers=len(wave))
         try:
-            data = llm.chat_json([
-                {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
-                {"role": "user", "content": prompt},
-            ], model=llm.model_name(deep=True), temperature=0.2, max_tokens=9000)
-        except Exception as exc:
-            warnings.append(f"第 {i + 1}/{len(batches)} 批编译失败，已跳过：{str(exc)[:140]}")
-            _progress(on_progress, "batch", i + 1, len(batches),
-                      f"第 {i + 1}/{len(batches)} 批模型调用失败，本批已跳过",
-                      level="warn", detail=str(exc))
-            continue
-        for unit in (data.get("units") or []) if isinstance(data, dict) else []:
-            if isinstance(unit, dict):
-                collected.append(unit)
-        _progress(on_progress, "batch", i + 1, len(batches),
-                  f"已完成第 {i + 1}/{len(batches)} 批",
-                  detail=f"本批新增 {len(collected) - before} 个单元，累计 {len(collected)} 个")
+            futures = {
+                pool.submit(_compile_one_batch, batch, title=title, subject=subject,
+                            outline_hint=outline_hint, coverage=coverage,
+                            template=template): idx
+                for idx, batch in wave
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    errors[idx] = str(exc)[:140]
+                done += 1
+                # 按「已完成批数」报，避免后完成的早批把进度倒退回去
+                _progress(on_progress, "batch", done, len(batches),
+                          f"已完成 {done}/{len(batches)} 批…",
+                          detail=f"并发 {len(wave)} 批 · 累计 {done} 批")
+        finally:
+            # 用户取消时不等已发出的请求，只阻止排队的批次继续启动
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    # 按批号汇总：结果顺序与串行时代完全一致，warning 顺序也可复现
+    for idx in sorted(errors):
+        warnings.append(f"第 {idx + 1}/{len(batches)} 批编译失败，已跳过：{errors[idx]}")
+        _progress(on_progress, "batch", done, len(batches),
+                  f"第 {idx + 1}/{len(batches)} 批模型调用失败，本批已跳过",
+                  level="warn", detail=errors[idx])
+    for idx in sorted(results):
+        collected.extend(results[idx])
     if not collected:
         _progress(on_progress, "batch", len(batches), len(batches),
                   "全部分批都没有产出单元", level="error",

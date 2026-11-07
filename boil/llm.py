@@ -14,8 +14,12 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlsplit
 
@@ -34,6 +38,15 @@ RESERVED_PAYLOAD_KEYS = {
     "model", "messages", "stream", "max_tokens", "temperature",
     "response_format", "tools", "tool_choice", "stop",
 }
+
+# Dots（dots3-note-prev）平台约束：512K 上下文窗口，输入 tokens + max_tokens
+# 不得超过上限；限流按「单个 API Key」分别计算 RPM / TPM。
+DOTS_CONTEXT_WINDOW = 524_288
+DEFAULT_RPM = 60
+DEFAULT_TPM = 1_500_000
+RATE_WINDOW_SECONDS = 60.0
+DOTS_HOST_HINT = "askdiandian.com"
+DOTS_MODEL = "dots3-note-prev"
 
 PROVIDERS = [
     {"id": "dots", "name": "Dots（小红书）",
@@ -71,16 +84,16 @@ class LLMError(Exception):
 
 
 _HTTP_HINTS: dict[int, str] = {
-    400: "请求被网关拒绝：常见原因是 response_format/temperature 等参数不被支持，或模型名不对。",
-    401: "认证失败：检查 API Key 是否正确，以及这个服务用的是 Authorization: Bearer 还是自定义头（Dots 用 api-key 且无前缀）。",
-    403: "被拒绝访问：Key 有效但无权访问该模型，或触发了服务商策略。",
+    400: "请求参数或 JSON 格式不正确：检查 model / messages / max_tokens；输入 tokens 与 max_tokens 之和不得超过 524,288。",
+    401: "API Key 缺失或无效：Dots 必须用 api-key 请求头传完整 Key（无 Bearer 前缀），且不能写进 URL、前端或日志。",
+    403: "Key 有效但无权访问该资源：确认平台已开通 dots3-note-prev、Key 未过期且未被停用。",
     404: "地址或模型不存在：Base URL 通常要以 /v1 结尾；也可能是模型名拼错。",
     408: "网关超时：把超时调大，或换更快的模型；长思考类模型建议提高超时。",
     409: "并发冲突：稍后重试；Boil 已按指数退避重试两次。",
     413: "请求体过大：缩短材料或降低单次编译的字符数。",
     422: "参数校验失败：多为额外参数（extra_body）与网关不兼容，可清空高级参数再试。",
-    429: "限流：降低频率或提高配额；Boil 已按指数退避重试。",
-    500: "网关内部错误：通常是服务商抖动，稍后重试。",
+    429: "过于频繁：默认限流为单 Key 60 次/分钟、1,500,000 tokens/分钟。Boil 已按 Retry-After 退避重试；仍失败请降低并发或改用极速索引导入。",
+    500: "服务内部错误：通常是服务商抖动，稍后重试。",
     502: "上游无响应：网关到模型的链路断了。",
     503: "服务不可用：模型正在维护或过载。",
     504: "网关超时：思考型模型常在长推理时触发；Boil 对上游改用流式接收来规避这类空闲超时。",
@@ -136,6 +149,218 @@ def _safe_detail(text: str) -> str:
                  lambda m: f"{m.group(1)}-…{m.group(2)[-4:]}", str(text or ""), flags=re.I)
     out = re.sub(r"(bearer\s+)[A-Za-z0-9._-]{8,}", lambda m: f"{m.group(1)}…{m.group(0)[-4:]}",
                  out, flags=re.I)
+    # 网关有时会把整个请求头回显回来；配置里的完整 Key 一律按字面掩掉
+    try:
+        key = str(get_config().get("api_key") or "")
+        if len(key) >= 8:
+            out = out.replace(key, f"…{key[-4:]}")
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Dots 协议适配：认证自检、RPM/TPM 限流、上下文预算、token 用量
+# ---------------------------------------------------------------------------
+
+
+def usage_path():
+    return config.DATA_DIR / "llm_usage.json"
+
+
+def _retry_after_seconds(headers: Any) -> float:
+    """429/503 常带 Retry-After（秒数或 HTTP 日期），优先听服务端的。"""
+    try:
+        raw = str(headers.get("Retry-After") or "").strip()
+    except AttributeError:
+        return 0.0
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
+    """中文约 1~2 字符/token、英文约 4 字符/token；取 2 字符/token 偏保守。"""
+    chars = 0
+    for item in messages or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            chars += sum(len(str(x.get("text") or "")) for x in content
+                         if isinstance(x, dict))
+    return int(chars / 2) + 16
+
+
+def estimate_request_tokens(messages: list[dict[str, Any]],
+                            max_tokens: int | None = None) -> int:
+    return estimate_prompt_tokens(messages) + int(max_tokens or 0) + 64
+
+
+def _fit_context_budget(messages: list[dict[str, Any]], max_tokens: int | None,
+                        cfg: dict[str, Any]) -> int | None:
+    """输入 tokens + max_tokens 不得超过上下文窗口（Dots 为 524,288）。"""
+    window = int(cfg.get("context_window") or DOTS_CONTEXT_WINDOW)
+    prompt = estimate_prompt_tokens(messages)
+    if prompt + 1024 >= window:
+        raise LLMError(
+            "输入超出模型上下文窗口",
+            f"估算输入 {prompt:,} tokens，窗口 {window:,} tokens；请拆分材料",
+            "context_overflow",
+            "按章节分批导入，或改用极速索引（按需深化只送本小节原文）。")
+    if not max_tokens:
+        return None
+    ceiling = max(256, window - prompt - 1024)
+    return min(int(max_tokens), ceiling)
+
+
+class _RateLimiter:
+    """单进程内按 Key 指纹做 60 秒滑动窗口限流，主动避免打到 429。
+
+    Dots 的 RPM / TPM 都按单个 API Key 计算；这里不存明文 Key，只用
+    sha256 前 16 位区分不同 Key 的窗口。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._windows: dict[str, deque] = {}
+        self._stats = {"requests": 0, "waits": 0, "wait_seconds": 0.0}
+
+    def acquire(self, scope: str, rpm: int, tpm: int, tokens: int) -> None:
+        if rpm <= 0 and tpm <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                window = self._windows.setdefault(scope, deque())
+                while window and now - window[0][0] >= RATE_WINDOW_SECONDS:
+                    window.popleft()
+                delay = 0.0
+                if rpm > 0 and len(window) >= rpm:
+                    delay = max(delay, RATE_WINDOW_SECONDS - (now - window[0][0]) + 0.01)
+                if tpm > 0:
+                    used = sum(t for _, t in window)
+                    short = used + max(1, tokens) - tpm
+                    if short > 0:
+                        for stamp, spent in window:
+                            short -= spent
+                            if short <= 0:
+                                delay = max(delay, RATE_WINDOW_SECONDS - (now - stamp) + 0.01)
+                                break
+                        else:
+                            delay = max(delay, 0.05)
+                if delay <= 0:
+                    window.append((now, max(1, tokens)))
+                    self._stats["requests"] += 1
+                    return
+                self._stats["waits"] += 1
+                self._stats["wait_seconds"] += delay
+            time.sleep(min(delay, RATE_WINDOW_SECONDS))
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._stats)
+
+
+_limiter = _RateLimiter()
+_usage_lock = threading.Lock()
+
+
+def rate_limit_stats() -> dict[str, Any]:
+    cfg = get_config()
+    snap = _limiter.snapshot()
+    return {"rpm": cfg["rpm"], "tpm": cfg["tpm"],
+            "window_seconds": RATE_WINDOW_SECONDS,
+            "requests": snap["requests"], "waits": snap["waits"],
+            "wait_seconds": round(snap["wait_seconds"], 3)}
+
+
+def _empty_usage() -> dict[str, Any]:
+    return {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "estimated_calls": 0, "by_model": {},
+            "since": now_iso(), "updated_at": ""}
+
+
+def usage_stats() -> dict[str, Any]:
+    data = read_json(usage_path(), {}) or {}
+    out = _empty_usage()
+    if isinstance(data, dict):
+        for key in out:
+            if key in data:
+                out[key] = data[key]
+    return out
+
+
+def reset_usage_stats() -> None:
+    try:
+        usage_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _record_usage(usage: dict[str, Any] | None, model: str,
+                  prompt_guess: int, completion_guess: int) -> None:
+    """把每次真实调用的 token 账记下来；网关没回 usage 时用估算并单独计数。"""
+    try:
+        with _usage_lock:
+            data = read_json(usage_path(), {}) or {}
+            if not isinstance(data, dict):
+                data = {}
+            given = usage if isinstance(usage, dict) else {}
+            prompt = int(given.get("prompt_tokens") or prompt_guess or 0)
+            completion = int(given.get("completion_tokens") or completion_guess or 0)
+            total = int(given.get("total_tokens") or (prompt + completion) or 0)
+            data["calls"] = int(data.get("calls") or 0) + 1
+            data["prompt_tokens"] = int(data.get("prompt_tokens") or 0) + prompt
+            data["completion_tokens"] = int(data.get("completion_tokens") or 0) + completion
+            data["total_tokens"] = int(data.get("total_tokens") or 0) + total
+            if not given:
+                data["estimated_calls"] = int(data.get("estimated_calls") or 0) + 1
+            by_model = data.get("by_model")
+            if not isinstance(by_model, dict):
+                by_model = {}
+            entry = by_model.get(model) or {"calls": 0, "total_tokens": 0}
+            entry["calls"] = int(entry.get("calls") or 0) + 1
+            entry["total_tokens"] = int(entry.get("total_tokens") or 0) + total
+            by_model[model] = entry
+            data["by_model"] = by_model
+            data["since"] = data.get("since") or now_iso()
+            data["updated_at"] = now_iso()
+            write_json_atomic(usage_path(), data, mode=0o600)
+    except Exception:
+        pass  # 记账失败绝不能影响一次成功回答
+
+
+def config_warnings(cfg: dict[str, Any] | None = None) -> list[str]:
+    """把文档里的硬约束变成设置页可见的自检，而不是等 401 才猜。"""
+    cfg = cfg or get_config()
+    out: list[str] = []
+    url = str(cfg.get("base_url") or "").lower()
+    model = str(cfg.get("model") or "")
+    key = str(cfg.get("api_key") or "")
+    if key and key in url:
+        out.append("Base URL 里疑似包含 API Key：请立刻删除并重新生成 Key。")
+    if DOTS_HOST_HINT in url or model == DOTS_MODEL:
+        if cfg.get("auth_header") != "api-key" or cfg.get("auth_prefix"):
+            out.append("Dots 要求 api-key 请求头且不带 Bearer 前缀，当前认证配置会返回 401。")
+        if model != DOTS_MODEL:
+            out.append(f"Dots 当前文档对应模型为 {DOTS_MODEL}，请核对模型名。")
+        extra = cfg.get("extra_body") or {}
+        thinking = extra.get("chat_template_kwargs") if isinstance(extra, dict) else None
+        # 运行时已在 _apply_extra_body 里兜底注入 false，不必再让用户手动补；
+        # 只有用户显式开了深度思考才需要说清代价（dots 只有 max 档，无法调低）。
+        if isinstance(thinking, dict) and thinking.get("enable_thinking") is True:
+            out.append("已显式开启深度思考：dots 仅支持 max 档，教材抽取会明显变慢并增加 token 消耗。")
     return out
 
 
@@ -150,6 +375,9 @@ def _env_config() -> dict[str, Any]:
         "timeout": READ_IDLE,
         "auth_header": os.environ.get("BOIL_LLM_AUTH_HEADER", DEFAULT_AUTH_HEADER),
         "auth_prefix": os.environ.get("BOIL_LLM_AUTH_PREFIX", DEFAULT_AUTH_PREFIX),
+        "rpm": os.environ.get("BOIL_LLM_RPM", DEFAULT_RPM),
+        "tpm": os.environ.get("BOIL_LLM_TPM", DEFAULT_TPM),
+        "context_window": os.environ.get("BOIL_LLM_CONTEXT_WINDOW", DOTS_CONTEXT_WINDOW),
         "extra_body": {},
     }
 
@@ -218,6 +446,10 @@ def get_config() -> dict[str, Any]:
     cfg["extra_body"] = extra
     cfg["cache_enabled"] = bool(cfg.get("cache_enabled", True))
     cfg["stream_upstream"] = bool(cfg.get("stream_upstream", True))
+    cfg["rpm"] = max(0, _number(cfg.get("rpm"), DEFAULT_RPM, int))
+    cfg["tpm"] = max(0, _number(cfg.get("tpm"), DEFAULT_TPM, int))
+    cfg["context_window"] = max(4096, _number(cfg.get("context_window"),
+                                              DOTS_CONTEXT_WINDOW, int))
     return cfg
 
 
@@ -232,6 +464,9 @@ def set_config(payload: dict[str, Any]) -> dict[str, Any]:
         "temperature": payload.get("temperature", cur["temperature"]),
         "max_tokens": payload.get("max_tokens", cur["max_tokens"]),
         "timeout": payload.get("timeout", cur["timeout"]),
+        "rpm": payload.get("rpm", cur["rpm"]),
+        "tpm": payload.get("tpm", cur["tpm"]),
+        "context_window": payload.get("context_window", cur["context_window"]),
     }
     header = str(payload.get("auth_header", cur["auth_header"]) or DEFAULT_AUTH_HEADER).strip()
     if not re.fullmatch(r"[A-Za-z0-9-]+", header):
@@ -357,6 +592,12 @@ def public_config() -> dict[str, Any]:
         "stream_upstream": bool(cfg.get("stream_upstream", True)),
         "cache": cache_stats(),
         "cache_entries": cache_size(),
+        "rpm": cfg["rpm"],
+        "tpm": cfg["tpm"],
+        "context_window": cfg["context_window"],
+        "rate_limit": rate_limit_stats(),
+        "usage": usage_stats(),
+        "config_warnings": config_warnings(cfg),
     }
 
 
@@ -371,10 +612,29 @@ def _request_headers(cfg: dict[str, Any], accept: str) -> dict[str, str]:
     }
 
 
+def _ensure_dots_thinking_off(payload: dict[str, Any], cfg: dict[str, Any]) -> None:
+    """Dots 深度思考默认开启且只有 max 档：不显式关，编译每批都要多跑一轮最重推理。
+
+    只填空、不覆盖：用户在 extra_body 里显式写了 enable_thinking 时以他的选择为准
+    （config_warnings 会说明开启的代价）。预设之外用环境变量 / 自定义端点接 Dots
+    时 extra_body 是空的，靠这里兜住，而不是靠设置页的一句建议。
+    """
+    url = str(cfg.get("base_url") or "").lower()
+    model = str(payload.get("model") or cfg.get("model") or "")
+    if DOTS_HOST_HINT not in url and model != DOTS_MODEL:
+        return
+    kwargs = payload.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif "enable_thinking" not in kwargs:
+        payload["chat_template_kwargs"] = {**kwargs, "enable_thinking": False}
+
+
 def _apply_extra_body(payload: dict[str, Any], cfg: dict[str, Any]) -> None:
     for key, value in (cfg.get("extra_body") or {}).items():
         if key not in RESERVED_PAYLOAD_KEYS and key not in payload:
             payload[key] = value
+    _ensure_dots_thinking_off(payload, cfg)
 
 
 def _extract_message(data: dict[str, Any]) -> tuple[str, str]:
@@ -403,24 +663,39 @@ def _should_retry(status: int) -> bool:
     return status in (408, 409, 429, 500, 502, 503, 504)
 
 
+def _gateway_server_error(status: int, detail: str) -> bool:
+    """有些网关把上游 5xx 包装成 HTTP 400（Dots 实测：Unknown provider error）。
+
+    按文档 400 是参数错误，不该重试；但响应体里明写 status=500 /
+    InternalServerError 时，重试比让用户改 Key 或改参数有用得多。
+    """
+    if status != 400:
+        return False
+    text = str(detail or "").lower()
+    return any(marker in text for marker in (
+        "internalservererror", "unknown provider error", "provider error",
+        "upstream", "bad gateway", "service unavailable",
+        '"status":5', '"status": 5'))
+
+
 def _http_post_json(url: str, headers: dict[str, str], payload: dict[str, Any],
-                    timeout: int) -> tuple[int, bytes]:
+                    timeout: int) -> tuple[int, bytes, float]:
     import urllib.error
     import urllib.request
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
+            return resp.status, resp.read(), _retry_after_seconds(resp.headers)
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        return exc.code, exc.read(), _retry_after_seconds(exc.headers)
     except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
         kind, hint = _classify_exception(exc)
         raise LLMError("无法连接模型服务", f"{type(exc).__name__}: {exc}", kind, hint) from exc
 
 
 def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any],
-                      timeout: int) -> tuple[int, bytes]:
+                      timeout: int) -> tuple[int, bytes, float]:
     """向上游要 stream:true，再把分片拼回非流式的响应形状。
 
     很多网关按「空闲」掐断长请求：思考型模型几十秒不吐字节就被 504 掉。
@@ -436,9 +711,11 @@ def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any]
             ctype = (resp.headers.get("Content-Type") or "").lower()
             raw = resp.read()
             if "event-stream" not in ctype:
-                return resp.status, raw      # 网关不认 stream，照旧返回 JSON
+                # 网关不认 stream，照旧返回 JSON（usage 原样保留）
+                return resp.status, raw, _retry_after_seconds(resp.headers)
             pieces: list[str] = []
             finish = ""
+            usage: dict[str, Any] = {}
             for line in raw.decode("utf-8", "replace").splitlines():
                 line = line.strip()
                 if not line.startswith("data:"):
@@ -450,6 +727,8 @@ def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any]
                     chunk = json.loads(data_text)
                 except ValueError:
                     continue
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
                 for choice in (chunk.get("choices") or []):
                     if choice.get("finish_reason"):
                         finish = str(choice["finish_reason"])
@@ -461,10 +740,12 @@ def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any]
                     if isinstance(piece, str):
                         pieces.append(piece)
             rebuilt = {"choices": [{"message": {"content": "".join(pieces)},
-                                    "finish_reason": finish}]}
-            return resp.status, json.dumps(rebuilt, ensure_ascii=False).encode("utf-8")
+                                    "finish_reason": finish}],
+                       "usage": usage}
+            return (resp.status, json.dumps(rebuilt, ensure_ascii=False).encode("utf-8"),
+                    _retry_after_seconds(resp.headers))
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        return exc.code, exc.read(), _retry_after_seconds(exc.headers)
     except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
         kind, hint = _classify_exception(exc)
         raise LLMError("无法连接模型服务", f"{type(exc).__name__}: {exc}", kind, hint) from exc
@@ -472,7 +753,9 @@ def _http_post_stream(url: str, headers: dict[str, str], payload: dict[str, Any]
 
 def chat(messages: list[dict[str, Any]], model: str | None = None,
          json_mode: bool = False, temperature: float | None = None,
-         max_tokens: int | None = None, timeout: int | None = None) -> str:
+         max_tokens: int | None = None, timeout: int | None = None,
+         stop: list[str] | None = None, tools: list[dict[str, Any]] | None = None,
+         tool_choice: Any = None) -> str:
     if not enabled():
         raise LLMError("未配置模型，当前为演示模式", "请在设置中填写 Base URL 与 API Key", "not_configured")
     cfg = get_config()
@@ -482,20 +765,34 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
         "temperature": cfg["temperature"] if temperature is None else float(temperature),
         "stream": False,
     }
-    tokens = max_tokens if max_tokens is not None else cfg.get("max_tokens")
+    # 输入 tokens + max_tokens 必须留在 512K 窗口内，超出就收缩输出额度
+    tokens = _fit_context_budget(
+        messages, max_tokens if max_tokens is not None else cfg.get("max_tokens"), cfg)
     if tokens:
         payload["max_tokens"] = int(tokens)
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+    if stop:
+        payload["stop"] = [str(s) for s in stop][:8]
+    if tools:
+        payload["tools"] = tools
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
     _apply_extra_body(payload, cfg)
     headers = _request_headers(cfg, "application/json")
     url = _base_url()
     timeout_s = int(timeout or cfg["timeout"])
+    # 限流按单个 API Key 计；只存指纹，不把明文 Key 放进任何统计或日志
+    scope = hashlib.sha256(str(cfg.get("api_key") or "").encode("utf-8")).hexdigest()[:16]
+    prompt_guess = estimate_prompt_tokens(messages)
     last_exc: LLMError | None = None
+    length_retried = False
     poster = _http_post_stream if cfg.get("stream_upstream", True) else _http_post_json
     for attempt in range(MAX_RETRIES + 1):
+        _limiter.acquire(scope, cfg["rpm"], cfg["tpm"],
+                         estimate_request_tokens(payload["messages"], payload.get("max_tokens")))
         try:
-            status, raw = poster(url, headers, payload, timeout_s)
+            status, raw, retry_after = poster(url, headers, payload, timeout_s)
         except LLMError as exc:
             last_exc = exc
             if attempt < MAX_RETRIES:
@@ -511,27 +808,54 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
                 continue
         if status != 200:
             detail = _safe_detail(raw[:1200].decode("utf-8", "replace"))
-            hint = _http_hint(status)
+            wrapped_5xx = _gateway_server_error(status, detail)
+            hint = ("网关把上游 5xx 包成了 HTTP 400（服务商内部错误）；Boil 已重试，"
+                    "稍后再试即可，不是 Key 或参数问题。" if wrapped_5xx
+                    else _http_hint(status))
             exc = LLMError(f"模型服务返回 HTTP {status}", detail, "http_error", hint)
             last_exc = exc
-            if _should_retry(status) and attempt < MAX_RETRIES:
-                time.sleep(0.8 * (2 ** attempt))
+            if (_should_retry(status) or wrapped_5xx) and attempt < MAX_RETRIES:
+                # 429 优先听 Retry-After（服务端知道下一分钟窗口何时放开）
+                wait = (max(retry_after, 1.0 * (2 ** attempt)) if status == 429
+                        else max(1.0, 0.8 * (2 ** attempt)))
+                time.sleep(min(wait, 30.0))
                 continue
             _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise exc
         try:
             data = json.loads(raw.decode("utf-8"))
             text, finish = _extract_message(data)
-            if finish == "length" and attempt < MAX_RETRIES and payload.get("max_tokens"):
-                # 被 max_tokens 截断：加大额度重来，而不是把半截 JSON 交下去
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if finish == "length" and payload.get("max_tokens"):
+                _record_usage(usage if isinstance(usage, dict) and usage else None,
+                              str(payload["model"]), prompt_guess, int(len(text) / 2))
+                # 被 max_tokens 截断：只缩量续问一次，不再按 4 倍放大额度。
+                # 旧写法把编译批的 9000 直接抬到 32000，模型可能真的生成三万 token，
+                # 一批的钱和尾延迟都被放大；批次并发时多批同时放大更明显。
+                if length_retried:
+                    raise LLMError("模型输出连续被截断", text[:300], "length_retry_exhausted")
+                length_retried = True
                 current = int(payload["max_tokens"])
-                payload["max_tokens"] = min(max(current * 4, current + 800), 32000)
+                ceiling = max(256, int(cfg["context_window"]) - prompt_guess - 1024)
+                payload["max_tokens"] = min(max(current * 2, current + 800), 32000, ceiling)
+                payload["messages"] = list(payload["messages"]) + [{
+                    "role": "user",
+                    "content": "上一次回复被输出长度截断。请压缩每个字段的篇幅，"
+                               "只输出一个完整合法的 JSON，不要解释、不要代码围栏。",
+                }]
                 continue
+            _record_usage(usage if isinstance(usage, dict) and usage else None,
+                          str(payload["model"]), prompt_guess, int(len(text) / 2))
             _clear_error()
             return text
         except (ValueError, LLMError) as exc:
             err = exc if isinstance(exc, LLMError) else LLMError("模型返回不是合法 JSON", str(exc)[:500])
             last_exc = err
+            # 连续截断说明「这一批不适合一次生成」，再重试只是重复烧同一份材料；
+            # 直接报错交给编译层记 warning，不走普通重试分支。
+            if getattr(err, "code", None) == "length_retry_exhausted":
+                _note_error(err.message, err.detail, err.code, err.hint)
+                raise err
             if attempt < MAX_RETRIES:
                 time.sleep(0.5)
                 continue
@@ -544,7 +868,8 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
 
 def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
                 temperature: float | None = None, max_tokens: int | None = None,
-                timeout: int | None = None) -> Iterator[str]:
+                timeout: int | None = None,
+                stop: list[str] | None = None) -> Iterator[str]:
     if not enabled():
         raise LLMError("未配置模型，当前为演示模式", "请在设置中填写 Base URL 与 API Key", "not_configured")
     cfg = get_config()
@@ -554,9 +879,12 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
         "temperature": cfg["temperature"] if temperature is None else float(temperature),
         "stream": True,
     }
-    tokens = max_tokens if max_tokens is not None else cfg.get("max_tokens")
+    tokens = _fit_context_budget(
+        messages, max_tokens if max_tokens is not None else cfg.get("max_tokens"), cfg)
     if tokens:
         payload["max_tokens"] = int(tokens)
+    if stop:
+        payload["stop"] = [str(s) for s in stop][:8]
     parts = urlsplit(_base_url())
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise LLMError("Base URL 不合法", _base_url(), "bad_config")
@@ -573,7 +901,12 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
     if parts.query:
         path += "?" + parts.query
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    scope = hashlib.sha256(str(cfg.get("api_key") or "").encode("utf-8")).hexdigest()[:16]
+    _limiter.acquire(scope, cfg["rpm"], cfg["tpm"],
+                     estimate_request_tokens(messages, payload.get("max_tokens")))
     produced = False
+    emitted = 0
+    usage: dict[str, Any] = {}
     try:
         conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -599,6 +932,8 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
                 data = json.loads(data_text)
             except ValueError:
                 continue
+            if isinstance(data.get("usage"), dict):
+                usage = data["usage"]
             choices = data.get("choices") or []
             if not choices:
                 continue
@@ -612,11 +947,14 @@ def stream_chat(messages: list[dict[str, Any]], model: str | None = None,
                 piece = "".join(str(x.get("text", "")) for x in piece if isinstance(x, dict))
             if isinstance(piece, str) and piece:
                 produced = True
+                emitted += len(piece)
                 yield piece
         if not produced:
             exc = LLMError("模型流式返回空正文", "服务端没有返回任何 content 分片", "empty_content")
             _note_error(exc.message, exc.detail, exc.code, exc.hint)
             raise exc
+        _record_usage(usage or None, str(payload["model"]),
+                      estimate_prompt_tokens(messages), int(emitted / 2))
         _clear_error()
     except LLMError:
         raise

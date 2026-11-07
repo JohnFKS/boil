@@ -310,13 +310,19 @@ def judge_residual(pack: dict[str, Any], suspects: list[dict[str, Any]]) -> dict
     return {"engine": "model", "verdicts": verdicts, "note": ""}
 
 
-def qa_pack(pack: dict[str, Any]) -> dict[str, Any]:
-    """跑一遍质检：返回问题、安全修复数、疑似重复与建议。不修改 pack 之外的事物。"""
+def qa_pack(pack: dict[str, Any], use_llm: bool = True) -> dict[str, Any]:
+    """跑一遍质检：返回问题、安全修复数、疑似重复与建议。不修改 pack 之外的事物。
+
+    `use_llm=False` 给索引导入用：骨架单元是规则生成的，让模型去裁决「这些
+    骨架是不是重复」既拖慢秒级导入，也白烧一次生成调用。
+    """
     issues = lint_pack(pack)
     pack, repaired = apply_safe_repairs(pack, issues)
     residual_issues = lint_pack(pack)
     suspects = find_near_duplicates(pack)
-    judgement = judge_residual(pack, suspects) if suspects else {"engine": "rules", "verdicts": [], "note": ""}
+    judgement = (judge_residual(pack, suspects) if suspects and use_llm
+                 else {"engine": "rules", "verdicts": [],
+                       "note": "索引导入跳过模型裁决" if suspects else ""})
     warnings = [f"[{i['code']}] {i['detail']}" for i in residual_issues if i["level"] == "warn"]
     return {
         "issues": residual_issues,
