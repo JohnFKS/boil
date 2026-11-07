@@ -804,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
                             "code": "bad_request", "message": str(exc)}})
                     except llm.LLMError as exc:
                         self.send_json(502, {"ok": False, "error": exc.to_dict()})
-                    except BrokenPipeError:
+                    except ConnectionError:
                         return
                     except Exception as exc:
                         print("[api] error:", traceback.format_exc(), file=sys.stderr)
@@ -878,7 +878,13 @@ class Handler(BaseHTTPRequestHandler):
             "media-src 'self' blob:; object-src 'none'; base-uri 'self'; "
             "form-action 'self'; frame-ancestors 'none'",
         )
-        super().end_headers()
+        try:
+            super().end_headers()
+        except ConnectionError:
+            # Windows 上前端 AbortController 掐断连接时，flush_headers 会抛
+            # ConnectionAbortedError(10053)；它和 ConnectionResetError(10054) 都
+            # 不是 BrokenPipeError。不在这里截住，异常会冒到兜底 500，再炸一次。
+            pass
 
     def send_json(self, status: int, payload: Any):
         body = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
@@ -889,7 +895,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
-        except BrokenPipeError:
+        except ConnectionError:
             pass
 
     def send_download(self, text: str, filename: str,
@@ -903,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(body)
-        except BrokenPipeError:
+        except ConnectionError:
             pass
 
     def start_sse(self):
@@ -989,7 +995,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.wfile.write(data)
-        except BrokenPipeError:
+        except ConnectionError:
             pass
 
     def parse_request(self):

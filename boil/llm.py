@@ -755,7 +755,7 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
          json_mode: bool = False, temperature: float | None = None,
          max_tokens: int | None = None, timeout: int | None = None,
          stop: list[str] | None = None, tools: list[dict[str, Any]] | None = None,
-         tool_choice: Any = None) -> str:
+         tool_choice: Any = None, retries: int | None = None) -> str:
     if not enabled():
         raise LLMError("未配置模型，当前为演示模式", "请在设置中填写 Base URL 与 API Key", "not_configured")
     cfg = get_config()
@@ -788,14 +788,16 @@ def chat(messages: list[dict[str, Any]], model: str | None = None,
     last_exc: LLMError | None = None
     length_retried = False
     poster = _http_post_stream if cfg.get("stream_upstream", True) else _http_post_json
-    for attempt in range(MAX_RETRIES + 1):
+    # 连通性探测传 retries=0：一次读超时就够了，不该把等待放大到 3 倍。
+    max_retries = MAX_RETRIES if retries is None else max(0, int(retries))
+    for attempt in range(max_retries + 1):
         _limiter.acquire(scope, cfg["rpm"], cfg["tpm"],
                          estimate_request_tokens(payload["messages"], payload.get("max_tokens")))
         try:
             status, raw, retry_after = poster(url, headers, payload, timeout_s)
         except LLMError as exc:
             last_exc = exc
-            if attempt < MAX_RETRIES:
+            if attempt < max_retries:
                 time.sleep(0.7 * (attempt + 1))
                 continue
             _note_error(exc.message, exc.detail, exc.code, exc.hint)
@@ -973,10 +975,12 @@ def test_connection() -> dict[str, Any]:
     if not enabled():
         raise LLMError("演示模式无需测试", "填写 API Key 后可测试真实模型", "not_configured")
     started = time.time()
+    # 探测只发一次：默认 MAX_RETRIES=2 会把最坏等待放大到 3×读超时，
+    # 前端早就在 90s 放弃了，后面两次重试全是白等。
     text = chat([
         {"role": "system", "content": "你是连接测试助手。只回复 OK。"},
         {"role": "user", "content": "ping"},
-    ], max_tokens=16, temperature=0.0)
+    ], max_tokens=16, temperature=0.0, retries=0)
     return {"ok": True, "latency_ms": int((time.time() - started) * 1000),
             "model": model_name(True), "reply": text[:80]}
 

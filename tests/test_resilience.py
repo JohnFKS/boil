@@ -18,6 +18,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -325,6 +326,36 @@ class DeadUpstreamTest(ResilienceFixture):
         status, out = self.call("POST", "/api/settings/llm/test", {}, timeout=60)
         self.assertLess(time.monotonic() - start, 40, "测试按钮把请求挂死了")
         self.assertIn(status, (200, 400, 502), out)
+
+
+class ClientAbortResponseTest(unittest.TestCase):
+    """前端 AbortController 掐断后，服务端回包不该再炸一次（Windows 10053）。"""
+
+    def test_connection_aborted_while_flushing_headers_is_silent(self):
+        class AbortedWriter:
+            def write(self, data):
+                raise ConnectionAbortedError(10053, "软件中止了一个已建立的连接")
+
+        h = Handler.__new__(Handler)
+        h.wfile = AbortedWriter()
+        h._headers_buffer = []
+        h.request_version = "HTTP/1.1"   # BaseHTTPRequestHandler.end_headers() 会读它
+        codes = []
+        h.send_response = lambda code, *a, **k: codes.append(code)
+        h.send_header = lambda *a, **k: None
+        # 旧代码只捕 BrokenPipeError：这里会冒 ConnectionAbortedError 出去，
+        # _handle 兜底再发 500 又炸一次，正是生产日志里那串 traceback。
+        h.send_json(200, {"ok": True, "data": {"latency_ms": 1}})
+        self.assertEqual(codes, [200], "断连之后不能又补发一次 500")
+
+    def test_connection_probe_does_not_retry(self):
+        with mock.patch.object(llm, "enabled", return_value=True), \
+             mock.patch.object(llm, "chat", return_value="OK") as chat, \
+             mock.patch.object(llm, "model_name", return_value="mock"):
+            result = llm.test_connection()
+        self.assertTrue(result["ok"])
+        self.assertEqual(chat.call_args.kwargs.get("retries"), 0,
+                         "探测不该把最坏等待放大到 3 倍读超时")
 
 
 class AbortTest(ResilienceFixture):

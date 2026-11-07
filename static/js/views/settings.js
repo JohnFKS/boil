@@ -59,6 +59,12 @@ function usageHTML(cfg) {
   </div>`;
 }
 
+// 连通性探测最坏要等满服务端的读超时；前端默认 90s 会先掐断连接，
+// 让服务端回包时撞 Windows 的 ConnectionAbortedError(10053)。留 15s 余量。
+function testTimeoutMs(cfg) {
+  return (Number(cfg?.timeout) || 120) * 1000 + 15000;
+}
+
 export async function render(el, ctx, params) {
   const cfg = await ctx.api.get("/api/settings/llm");
   const emb = await ctx.api.get("/api/settings/embeddings");
@@ -380,7 +386,8 @@ export async function render(el, ctx, params) {
     const btn = e.currentTarget;
     btn.disabled = true; btn.innerHTML = "重试中…";
     try {
-      const info = await ctx.api.post("/api/settings/llm/test", {});
+      const info = await ctx.api.post("/api/settings/llm/test", {},
+        { timeout: testTimeoutMs(cfg) });
       toast(`连接正常（${info.latency_ms || 0}ms）。`, "success");
       await render(el, ctx, params);
     } catch (err) {
@@ -392,10 +399,11 @@ export async function render(el, ctx, params) {
   el.querySelector("#test-llm")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
     const box = el.querySelector("#llm-result");
-    btn.disabled = true; btn.innerHTML = "测试中…";
+    btn.disabled = true; btn.innerHTML = "测试中…（慢模型请稍候）";
     box.innerHTML = "";
     try {
-      const res = await ctx.api.post("/api/settings/llm/test");
+      const res = await ctx.api.post("/api/settings/llm/test", {},
+        { timeout: testTimeoutMs(cfg) });
       box.innerHTML = `<div class="success-box">连接成功 · ${res.latency_ms} ms · ${escapeHTML(res.model)} · 回复：${escapeHTML(res.reply || "")}</div>`;
       toast("真实模型连接正常。", "success");
     } catch (err) {
