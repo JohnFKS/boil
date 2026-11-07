@@ -358,6 +358,17 @@ def install_pack(db: Database, user_id: str, goal_id: str, pack: dict[str, Any])
                 stats["updated"] += 1
             else:
                 stats["created"] += 1
+                # units.id 是全局主键，而下面 upsert 的冲突目标只有复合键：
+                # 旧数据里只要残留一条同 id、属于别的 goal/pack 的记录，就会
+                # 抛 IntegrityError 让整次 onboarding 500。这里确定性换 id，
+                # 既自愈历史坏数据，正常路径也只多一次落空的 SELECT。
+                base_uid = uid
+                suffix = 0
+                while db.one("SELECT 1 FROM units WHERE id=?", (uid,)):
+                    suffix += 1
+                    uid = (f"{base_uid}-"
+                           f"{hashlib.sha256(str(suffix).encode()).hexdigest()[:8]}")
+                unit_id_map[raw["id"]] = uid
             db.upsert("units", {
                 "id": uid,
                 "goal_id": goal_id,

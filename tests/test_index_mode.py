@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from boil import compiler, config, embeddings, indexer, llm, services  # noqa: E402
 from boil.db import Database  # noqa: E402
-from boil.packs import find_pack, save_user_pack, validate_pack  # noqa: E402
+from boil.packs import _unit_id, find_pack, install_pack, save_user_pack, validate_pack  # noqa: E402
 from boil.server import App, Handler  # noqa: E402
 
 MATERIAL = (
@@ -254,6 +254,25 @@ class IndexModeUnitTest(unittest.TestCase):
         units = services.get_goal_units(self.db, self._goal_id())
         self.assertEqual(len(units), len(pack["units"]),
                          "每个骨架单元都必须有自己的主键")
+
+    def test_install_pack_self_heals_legacy_primary_key_collision(self):
+        """历史坏数据占用了待生成的主键：不能让整次 onboarding 500。"""
+        result = services.compile_index_preview(
+            self.db, "经济学教材", "微观经济学", MATERIAL)
+        pack = result["pack"]
+        goal_id = "g_legacy_1"
+        occupied = _unit_id(goal_id, pack["id"], pack["units"][0]["id"])
+        self.db.insert("units", {
+            "id": occupied, "goal_id": "g_other", "pack_id": "p_other",
+            "pack_unit_id": "foreign", "title": "历史残留",
+            "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00",
+        })
+        install_pack(self.db, config.DEFAULT_USER, goal_id, pack)
+        rows = self.db.execute(
+            "SELECT id FROM units WHERE goal_id=?", (goal_id,)).fetchall()
+        self.assertEqual(len(rows), len(pack["units"]), "所有单元都要装上")
+        self.assertNotIn(occupied, [r[0] for r in rows],
+                         "被占用的主键必须换掉，不能覆盖旧记录")
 
     def _goal_id(self):
         return self.db.one("SELECT id FROM goals ORDER BY created_at DESC LIMIT 1")["id"]
