@@ -21,15 +21,35 @@ function clockText(seconds) {
   return s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
 }
 
-export function savedJobId() {
-  try { return sessionStorage.getItem(STORAGE_KEY) || ""; } catch { return ""; }
+function savedJob() {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    // 兼容旧格式：以前这里只存一个 job_id 字符串
+    if (raw[0] !== "{") return { id: raw, payload: null };
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value : null;
+  } catch { return null; }
 }
 
-function remember(id) {
+export function savedJobId() {
+  return savedJob()?.id || "";
+}
+
+function remember(id, payload) {
+  if (!id) {
+    try { sessionStorage.removeItem(STORAGE_KEY); } catch { /* noop */ }
+    return;
+  }
+  // 服务重启后内存里的 job 没了，但后端的批级 checkpoint 还在磁盘。
+  // 把原始材料一起存下来，404 时才能用同一份 payload 重新提交并接着跑。
+  const saved = payload === undefined ? (savedJob()?.payload ?? null) : payload;
   try {
-    if (id) sessionStorage.setItem(STORAGE_KEY, id);
-    else sessionStorage.removeItem(STORAGE_KEY);
-  } catch { /* 隐私模式下不可用：退化成只能在当前页面等待 */ }
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ id, payload: saved }));
+  } catch {
+    // 材料太大或隐私模式：退化成只存 id，至少本次会话还能接回进度
+    try { sessionStorage.setItem(STORAGE_KEY, id); } catch { /* noop */ }
+  }
 }
 
 function cancelled(message) {
@@ -164,16 +184,25 @@ export function renderCompileProgress(root, st) {
 }
 
 export async function runCompile(api, { payload = null, resumeId = "", onProgress, signal } = {}) {
+  const pendingPayload = payload || savedJob()?.payload || null;
   let jobId = resumeId;
-  if (!jobId) {
+  const submit = async () => {
+    if (!pendingPayload) throw new Error("没有可恢复的编译材料，请重新选择文件");
     const started = await api.post("/api/packs/compile",
-      { ...(payload || {}), async: true }, { timeout: 30000 });
+      { ...pendingPayload, async: true }, { timeout: 30000 });
     if (started?.pack) return started;      // 旧版服务端：同步返回了结果
-    jobId = started?.job_id || "";
-    if (!jobId) throw new Error("服务没有返回编译任务，请重启 Boil 服务后再试");
+    const id = started?.job_id || "";
+    if (!id) throw new Error("服务没有返回编译任务，请重启 Boil 服务后再试");
+    return id;
+  };
+  if (!jobId) {
+    const started = await submit();
+    if (typeof started !== "string") return started;
+    jobId = started;
   }
-  remember(jobId);
+  remember(jobId, pendingPayload);
   let failures = 0;
+  let restarts = 0;
   for (;;) {
     if (signal?.aborted) {
       try {
@@ -189,6 +218,24 @@ export async function runCompile(api, { payload = null, resumeId = "", onProgres
       failures = 0;
     } catch (err) {
       if (err?.status === 404) {
+        // 内存 job 丢了不等于编译白跑了：后端的批级 checkpoint 在磁盘上，
+        // 用同一份材料重新提交，已完成的批会直接命中，只补没跑完的部分。
+        if (pendingPayload && restarts < 2) {
+          restarts += 1;
+          try {
+            const restarted = await submit();
+            if (typeof restarted === "string" && restarted) {
+              jobId = restarted;
+              remember(jobId, pendingPayload);
+              try {
+                onProgress?.({ state: "running", current: 0, total: 0,
+                               message: "服务已重启，正在从已完成的批次继续编译…" });
+              } catch { /* UI 回调出错不该打断编译 */ }
+              await wait(POLL_MS, signal);
+              continue;
+            }
+          } catch { /* 重提也失败：退回原来的失效提示 */ }
+        }
         remember("");
         throw new Error("上次的编译任务已失效（服务可能重启过），请重新点一次编译");
       }

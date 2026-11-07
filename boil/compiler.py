@@ -10,7 +10,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from . import config, decompose, llm
+from . import compile_cache, config, decompose, llm
 from .packs import PackError, derive_key_points, normalize_pack, validate_pack
 from .embeddings import semantic_groups
 from .utils import clamp, new_id, now_iso, slugify, split_cn
@@ -740,9 +740,17 @@ def _batch_max_tokens(batch: list[tuple[str, str]]) -> int:
     return 12000
 
 
-def _compile_one_batch(batch: list[tuple[str, str]], *, title: str, subject: str,
-                       outline_hint: str, coverage: str, template: str) -> list[dict[str, Any]]:
-    """一批 = 一次 chat_json。worker 里不碰进度回调：它属于后台 job，统一由主线程报。"""
+BATCH_SYSTEM = "你是严谨的学习内容编译器。只输出合法 JSON。"
+
+
+def _batch_request(batch: list[tuple[str, str]], *, title: str, subject: str,
+                   outline_hint: str, coverage: str,
+                   template: str) -> tuple[list[dict[str, str]], int]:
+    """构造这一批真正要发出去的 messages 与输出预算。
+
+    批指纹和实际调用共用它：模板、大纲、覆盖档、批内正文任一变化都会让旧批
+    自然失效，不需要手工维护「哪些改动算影响产物」的清单。
+    """
     # 不再二次截断：_batch_sections 已保证每批在预算内，多余的切片只会静默丢内容
     body = "\n\n".join(f"### [{sec['id']}] {sec['title']}\n{sec['body']}" for sec in batch)
     prompt = (template
@@ -750,11 +758,15 @@ def _compile_one_batch(batch: list[tuple[str, str]], *, title: str, subject: str
               .replace("{outline}", outline_hint)
               .replace("{coverage}", coverage_text(coverage))
               .replace("{text}", body))
-    data = llm.chat_json([
-        {"role": "system", "content": "你是严谨的学习内容编译器。只输出合法 JSON。"},
-        {"role": "user", "content": prompt},
-    ], model=llm.model_name(deep=True), temperature=0.2,
-       max_tokens=_batch_max_tokens(batch))
+    messages = [{"role": "system", "content": BATCH_SYSTEM},
+                {"role": "user", "content": prompt}]
+    return messages, _batch_max_tokens(batch)
+
+
+def _compile_one_batch(messages: list[dict[str, str]], model: str,
+                       max_tokens: int) -> list[dict[str, Any]]:
+    """一批 = 一次 chat_json。worker 里不碰进度回调：它属于后台 job，统一由主线程报。"""
+    data = llm.chat_json(messages, model=model, temperature=0.2, max_tokens=max_tokens)
     units = (data.get("units") or []) if isinstance(data, dict) else []
     return [u for u in units if isinstance(u, dict)]
 
@@ -762,7 +774,8 @@ def _compile_one_batch(batch: list[tuple[str, str]], *, title: str, subject: str
 def compile_material_batched(title: str, subject: str, text: str,
                              use_embeddings: bool = True,
                              coverage: str = DEFAULT_COVERAGE,
-                             on_progress: Any = None
+                             on_progress: Any = None,
+                             checkpoint: str | None = None
                              ) -> tuple[dict[str, Any], list[str]]:
     """长材料分批编译：先全篇骨架出大纲，再逐批只针对本批出单元。
 
@@ -775,15 +788,43 @@ def compile_material_batched(title: str, subject: str, text: str,
         raise PackError("材料为空或无法切分", ["请至少提供一段可读文本"])
     tables = _section_tables(sections)
     _progress(on_progress, "outline", 0, 1, "正在通读全篇并生成学习大纲…")
-    try:
-        outline_data = _outline_pass(title, subject, tables, len(text))
-    except Exception as exc:
-        # 大纲只是排序用的辅助信息。它失败不该把整份材料的分批编译一起带走，
-        # 否则用户拿到的是"只看了前 6000 字"的包，还以为材料都读过了。
-        outline_data = {}
-        warnings.append(f"全篇大纲生成失败，已按材料原顺序分批：{str(exc)[:140]}")
-        _progress(on_progress, "outline", 0, 1, "全篇大纲生成失败，改按材料原顺序分批",
-                  level="warn", detail=str(exc))
+    # 首轮没有旧文件时也要建空 state，否则第一批结果就无处可写，
+    # 下次导入仍然全量重编（这是增量最容易踩的坑）。
+    state = (compile_cache.load(checkpoint) or compile_cache.new_state(checkpoint)) \
+        if checkpoint else None
+    model = llm.model_name(deep=True)
+    # 大纲只按「章节形状」缓存：正文改一个字不该让整份材料的大纲重算，
+    # 否则公共前缀一变，所有批的 prompt 都变，增量就退化成全量。
+    outline_fp = compile_cache.digest({
+        "v": compile_cache.CACHE_VERSION, "kind": "outline",
+        "title": title, "subject": subject, "section_total": len(tables),
+        "shape": [s["title"] for s in tables], "model": model,
+        "template": llm.load_prompt("compiler_outline.md"),
+    })[:32]
+    cached_outline = (state or {}).get("outline")
+    outline_data = (cached_outline["data"]
+                    if isinstance(cached_outline, dict)
+                    and cached_outline.get("fp") == outline_fp
+                    and isinstance(cached_outline.get("data"), dict) else None)
+    if outline_data is None:
+        try:
+            outline_data = _outline_pass(title, subject, tables, len(text))
+            outline_ok = True
+        except Exception as exc:
+            # 大纲只是排序用的辅助信息。它失败不该把整份材料的分批编译一起带走，
+            # 否则用户拿到的是"只看了前 6000 字"的包，还以为材料都读过了。
+            outline_data = {}
+            outline_ok = False
+            warnings.append(f"全篇大纲生成失败，已按材料原顺序分批：{str(exc)[:140]}")
+            _progress(on_progress, "outline", 0, 1, "全篇大纲生成失败，改按材料原顺序分批",
+                      level="warn", detail=str(exc))
+        # 失败的大纲不落盘：下次导入要重新试，不能把降级结果固化下来
+        if state is not None and outline_ok:
+            state["outline"] = {"fp": outline_fp, "data": outline_data}
+            compile_cache.save(checkpoint, state)
+    else:
+        _progress(on_progress, "outline", 0, 1, "复用上次的全篇大纲",
+                  detail="材料章节结构未变，跳过一次大纲调用")
     outline_hint = _outline_titles(outline_data)
     batches = _batch_sections(tables)
     _progress(on_progress, "batch", 0, len(batches),
@@ -793,39 +834,62 @@ def compile_material_batched(title: str, subject: str, text: str,
     collected: list[dict[str, Any]] = []
     # 静态模板只读一次：并发时各线程重复读文件没必要，更要保证所有批拿到同一份模板
     template = llm.load_prompt("compiler_batch.md")
+    endpoint = str(llm.get_config().get("base_url") or "")
     # 波次并发：一波最多 config.COMPILE_CONCURRENCY 个，波内并行、波间收拢。
     # 进度回调只在主线程报：它属于后台 job，且并发下完成顺序不等于批号顺序。
     concurrency = min(max(1, config.COMPILE_CONCURRENCY), len(batches))
     results: dict[int, list[dict[str, Any]]] = {}
     errors: dict[int, str] = {}
     done = 0
+    reused = 0
 
     for start in range(0, len(batches), concurrency):
         wave = list(enumerate(batches[start:start + concurrency], start))
         pool = ThreadPoolExecutor(max_workers=len(wave))
         try:
-            futures = {
-                pool.submit(_compile_one_batch, batch, title=title, subject=subject,
-                            outline_hint=outline_hint, coverage=coverage,
-                            template=template): idx
-                for idx, batch in wave
-            }
+            futures = {}
+            for idx, batch in wave:
+                messages, budget = _batch_request(
+                    batch, title=title, subject=subject, outline_hint=outline_hint,
+                    coverage=coverage, template=template)
+                key = compile_cache.batch_fingerprint({
+                    "messages": messages, "model": model, "temperature": 0.2,
+                    "max_tokens": budget, "endpoint": endpoint,
+                }) if state is not None else None
+                cached = compile_cache.batch_units(state, key) if key else None
+                if cached is not None:
+                    # 命中 checkpoint：连 chat_json 都不走，也不用再算限流额度
+                    results[idx] = cached
+                    reused += 1
+                    done += 1
+                    _progress(on_progress, "batch", done, len(batches),
+                              f"已完成 {done}/{len(batches)} 批…",
+                              detail=f"复用已完成的 {reused} 批，未调用模型")
+                    continue
+                futures[pool.submit(_compile_one_batch, messages, model, budget)] = (idx, key)
             for future in as_completed(futures):
-                idx = futures[future]
+                idx, key = futures[future]
                 try:
-                    results[idx] = future.result()
+                    units = future.result()
+                    results[idx] = units
+                    # 每批立即落盘：中断 / 重启后只需补没跑完的批
+                    if state is not None and key:
+                        state["batches"][key] = units
+                        compile_cache.save(checkpoint, state)
                 except Exception as exc:
                     errors[idx] = str(exc)[:140]
                 done += 1
                 # 按「已完成批数」报，避免后完成的早批把进度倒退回去
                 _progress(on_progress, "batch", done, len(batches),
                           f"已完成 {done}/{len(batches)} 批…",
-                          detail=f"并发 {len(wave)} 批 · 累计 {done} 批")
+                          detail=f"并发 {len(wave)} 批 · 累计 {done} 批"
+                                 + (f" · 复用 {reused} 批" if reused else ""))
         finally:
             # 用户取消时不等已发出的请求，只阻止排队的批次继续启动
             pool.shutdown(wait=False, cancel_futures=True)
 
     # 按批号汇总：结果顺序与串行时代完全一致，warning 顺序也可复现
+    failed_batches = len(errors)
     for idx in sorted(errors):
         warnings.append(f"第 {idx + 1}/{len(batches)} 批编译失败，已跳过：{errors[idx]}")
         _progress(on_progress, "batch", done, len(batches),
@@ -852,6 +916,10 @@ def compile_material_batched(title: str, subject: str, text: str,
     pack["chapters"] = decompose.chapterize(tables)
     # 记的是"当时拧到哪一档"，不是"覆盖了百分之多少"；后者是 quality.coverage
     pack["source"]["coverage_mode"] = coverage
+    if failed_batches:
+        # 有批失败时不能把「少了内容」的包当成完整结果缓存：成功批已各自落盘，
+        # 下次导入会命中它们，只补这几批（不写 complete，整轮结果就不会被复用）。
+        pack["source"]["incomplete_batches"] = failed_batches
     if len(batches) > 1:
         pack["source"]["batches"] = len(batches)
         pack["source"]["material_chars"] = len(text)
@@ -865,7 +933,8 @@ def compile_material(title: str, subject: str, text: str,
                      use_llm: bool = True,
                      use_embeddings: bool = True,
                      coverage: str = DEFAULT_COVERAGE,
-                     on_progress: Any = None) -> tuple[dict[str, Any], list[str]]:
+                     on_progress: Any = None,
+                     checkpoint: str | None = None) -> tuple[dict[str, Any], list[str]]:
     title = (title or "未命名材料").strip()
     subject = (subject or "").strip()
     warnings: list[str] = []
@@ -883,7 +952,8 @@ def compile_material(title: str, subject: str, text: str,
         if len(text) > SINGLE_CALL_LIMIT:
             try:
                 return compile_material_batched(title, subject, text, use_embeddings=use_embeddings,
-                                                coverage=coverage, on_progress=on_progress)
+                                                coverage=coverage, on_progress=on_progress,
+                                                checkpoint=checkpoint)
             except Exception as exc:
                 warnings.append(f"分批编译失败，已回退单次抽取或本地编译器：{str(exc)[:160]}")
                 _progress(on_progress, "batch", 0, 1, "分批编译失败，改走单次抽取",

@@ -7,9 +7,10 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import (config, decompose, embeddings, heat, indexer, llm, mastery, planner,
-               quality, socratic, styles)
-from .compiler import compile_material, _normalize_llm_units
+from . import (compile_cache, config, decompose, embeddings, heat, indexer, llm,
+               mastery, planner, quality, socratic, styles)
+from .compiler import (BATCH_CHAR_BUDGET, MAX_UNITS_BATCHED, SINGLE_CALL_LIMIT,
+                       compile_material, _normalize_llm_units)
 from .db import Database, SCHEMA_VERSION, json_dumps, json_loads
 from .events import emit, recent, touch_study_day
 from .packs import (PackError, all_available_packs, find_pack, get_goal_relations,
@@ -2345,9 +2346,39 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
         raise ValueError("材料太短，至少提供 60 个字符，才能切出可学习的单元。")
     _report(on_progress, "prepare", 0, 0, "材料已合并，准备编译",
             detail=f"{len(docs)} 份文件 · {len(merged):,} 字符 · 覆盖档 {coverage}")
+    # 本地编译器不调模型、本来就是秒级，没必要缓存；只有真实模型路径才建指纹。
+    fp = ""
+    content_digest = ""
+    if use_llm and llm.enabled():
+        # 身份指纹刻意**不含正文**：改一个字仍然指向同一份 checkpoint，
+        # 靠批指纹只重编受影响的那批；正文摘要单独用来校验整轮结果能不能复用。
+        fp = compile_cache.material_fingerprint({
+            "title": (title or "").strip(), "subject": (subject or "").strip(),
+            "coverage": str(coverage),
+            "use_embeddings": bool(use_embeddings),
+            "docs": [d.get("name") for d in docs],
+            "model": llm.model_name(deep=True),
+            "endpoint": str(llm.get_config().get("base_url") or ""),
+            # 提示词与分批常量都进指纹：改模板 / 改批预算后旧结果自动失效
+            "batch_template": llm.load_prompt("compiler_batch.md"),
+            "outline_template": llm.load_prompt("compiler_outline.md"),
+            "extract_template": llm.load_prompt("compiler_extract.md"),
+            "budgets": {"batch": BATCH_CHAR_BUDGET, "single": SINGLE_CALL_LIMIT,
+                        "units": MAX_UNITS_BATCHED},
+        })
+        content_digest = compile_cache.digest({"text": merged})[:32]
+        cached = compile_cache.result_of(fp, content_digest)
+        if isinstance(cached, dict) and isinstance(cached.get("pack"), dict):
+            pack = cached["pack"]
+            save_user_pack(pack)
+            _report(on_progress, "batch", 1, 1, "复用上次编译结果，无需重新调用模型",
+                    detail=f"材料内容未变化 · {len(pack.get('units') or [])} 个单元")
+            _report(on_progress, "validate", 1, 1, "内容包已就绪",
+                    detail=f"pack={pack.get('id', '')} · 命中内容寻址缓存")
+            return cached
     pack, warnings = compile_material(title, subject, merged, use_llm=use_llm,
                                       use_embeddings=use_embeddings, coverage=coverage,
-                                      on_progress=on_progress)
+                                      on_progress=on_progress, checkpoint=fp or None)
     _report(on_progress, "validate", 1, 1, "正在做内容质检…",
             detail=f"生成 {len(pack.get('units') or [])} 个单元")
     qa = quality.qa_pack(pack)
@@ -2363,14 +2394,22 @@ def compile_preview(db: Database, title: str, subject: str, text: str,
     _report(on_progress, "validate", 1, 1, "内容包已保存，准备预览",
             detail=f"pack={pack['id']} · {len(pack.get('units') or [])} 个单元 · "
                    f"{len(warnings)} 条告警")
-    return {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
-            # 覆盖档只在模型路径生效：本地编译器按小节一条一节，拧档位不改变任何东西，
-            # 所以要把"请求的档位"和"真正生效的档位"分开返回，界面才不能说谎
-            "coverage": {"requested": coverage,
-                         "applied": str((pack.get("source") or {}).get("coverage_mode") or "")},
-            "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
-                        "near_duplicates": qa["near_duplicates"],
-                        "engine": qa["engine"]}}
+    result = {"pack": pack, "summary": pack_summary(pack), "warnings": warnings,
+              # 覆盖档只在模型路径生效：本地编译器按小节一条一节，拧档位不改变任何东西，
+              # 所以要把"请求的档位"和"真正生效的档位"分开返回，界面才不能说谎
+              "coverage": {"requested": coverage,
+                           "applied": str((pack.get("source") or {}).get("coverage_mode") or "")},
+              "quality": {"issues": qa["issues"], "repaired": qa["repaired"],
+                          "near_duplicates": qa["near_duplicates"],
+                          "engine": qa["engine"]}}
+    incomplete = int((pack.get("source") or {}).get("incomplete_batches") or 0)
+    if fp and not incomplete:
+        compile_cache.mark_complete(fp, result, content_digest)
+    elif fp:
+        _report(on_progress, "validate", 1, 1,
+                f"有 {incomplete} 批未成功，本次结果不作为完整缓存",
+                level="warn", detail="已完成批的 checkpoint 已落盘，下次导入只补这些批")
+    return result
 
 
 # ---------------------------------------------------------------------------
