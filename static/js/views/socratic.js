@@ -136,6 +136,7 @@ function reportHTML(data) {
           <div class="report-actions">
             <a class="btn btn-teal" href="#/feynman/${escapeAttr(unit?.id || "")}">${icon("teach", 15)} 用费曼法补漏</a>
             <a class="btn btn-ghost" href="#/unit/${escapeAttr(unit?.id || "")}">回到单元</a>
+            <button class="btn btn-primary" data-continue-soc>${icon("chat", 15)} 继续这段对话</button>
             <button class="btn btn-ghost" data-new-soc>${icon("refresh", 15)} 再聊一次</button>
           </div>
         </div>
@@ -193,6 +194,23 @@ export async function render(el, ctx, params) {
 
 function bindReport(el, ctx, data) {
   el.querySelector("[data-new-soc]")?.addEventListener("click", () => ctx.startSocratic(data.unit.id));
+  el.querySelector("[data-continue-soc]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "正在恢复…";
+    try {
+      const fresh = await ctx.api.post("/api/socratic/reopen", { session_id: data.session.id });
+      data.session = fresh.session;
+      data.report = null;
+      el.innerHTML = chatHTML(data);
+      ctx.setPageTitle("SOCRATIC DIALOGUE", "苏格拉底");
+      ctx.renderMath(el);
+      bindChat(el, ctx, data, data.session.id);
+      toast("可以继续聊了，前面说过的话都还在。", "success");
+    } catch (err) {
+      toast(err.message || "无法继续对话", "error");
+      btn.disabled = false; btn.innerHTML = `${icon("chat", 15)} 继续这段对话`;
+    }
+  });
   if (data.session?.messages) {
     // 让 details 里的公式也能渲染
     setTimeout(() => ctx.renderMath(el), 0);
@@ -204,6 +222,7 @@ function bindChat(el, ctx, data, sid) {
   let messages = [...(session.messages || [])];
   let streaming = false;
   let finished = false;
+  let currentPlaceholder = null;   // 本轮的流式气泡；重试必须复用它，不能靠全局 id 找
   const body = el.querySelector("#chat-body");
   const input = el.querySelector("#chat-input");
   const sendBtn = el.querySelector("#send-btn");
@@ -227,18 +246,22 @@ function bindChat(el, ctx, data, sid) {
   };
   const appendAssistantPlaceholder = () => {
     const holder = document.createElement("div");
-    holder.innerHTML = `<div class="msg assistant" id="stream-msg">
+    // 不用 id：上一轮的气泡会留在 DOM 里，重复的 #stream-text 会让
+    // getElementById 永远拿到第一个，第二轮的增量就全写进上一轮（新气泡永远转圈）。
+    holder.innerHTML = `<div class="msg assistant stream-msg">
       <span class="msg-avatar">${icon("spark", 14)}</span>
-      <div><div class="msg-bubble"><div class="msg-text prose" id="stream-text"></div><div class="typing-row" id="stream-typing"><span class="typing"><i></i><i></i><i></i></span><span id="stream-status">正在思考…</span></div></div><div class="msg-meta">教练 · 正在回答</div></div>
+      <div><div class="msg-bubble"><div class="msg-text prose stream-text"></div><div class="typing-row stream-typing"><span class="typing"><i></i><i></i><i></i></span><span class="stream-status">正在思考…</span></div></div><div class="msg-meta">教练 · 正在回答</div></div>
     </div>`;
-    body.insertBefore(holder.firstElementChild, el.querySelector("#stream-anchor"));
+    const node = holder.firstElementChild;
+    body.insertBefore(node, el.querySelector("#stream-anchor"));
     scroll();
-    return {
-      textEl: document.getElementById("stream-text"),
-      typing: document.getElementById("stream-typing"),
-      status: document.getElementById("stream-status"),
-      root: document.getElementById("stream-msg"),
+    currentPlaceholder = {
+      textEl: node.querySelector(".stream-text"),
+      typing: node.querySelector(".stream-typing"),
+      status: node.querySelector(".stream-status"),
+      root: node,
     };
+    return currentPlaceholder;
   };
 
   function revealSpoiler() {
@@ -347,7 +370,12 @@ function bindChat(el, ctx, data, sid) {
       setBusy(false);
       input.focus();
     } catch (e) {
-      if (e.name === "AbortError") return;
+      if (e.name === "AbortError") {
+        // 路由重绘 / 新流会 abort 当前流。旧代码直接 return，streaming 永远
+        // 保持 true，输入框和发送按钮就此锁死，第二轮再也发不出去。
+        setBusy(false);
+        return;
+      }
       setBusy(true);
       const recovered = await recoverOrRetry(msg, attempt, placeholder);
       if (!recovered) {
@@ -362,20 +390,19 @@ function bindChat(el, ctx, data, sid) {
   }
 
   function reusePlaceholder() {
-    const root = document.getElementById("stream-msg");
-    if (!root) return appendAssistantPlaceholder();
-    const textEl = root.querySelector("#stream-text");
+    const root = currentPlaceholder?.root;
+    if (!root || !root.isConnected) return appendAssistantPlaceholder();
+    const textEl = root.querySelector(".stream-text");
     if (textEl) textEl.innerHTML = "";
-    return {
-      textEl,
-      typing: root.querySelector("#stream-typing"),
-      status: root.querySelector("#stream-status"),
-      root,
-    };
+    return currentPlaceholder;
   }
 
   async function finish() {
     if (finished) return;
+    if (streaming) {
+      toast("等教练把这一问说完，再生成报告。", "info");
+      return;
+    }
     const btn = el.querySelector("[data-finish]");
     if (btn) { btn.disabled = true; btn.innerHTML = "正在整理…"; }
     try {

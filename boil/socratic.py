@@ -287,8 +287,8 @@ def stream_reply(db: Database, user_id: str, session_id: str,
     if any(w in user_text for w in ("提示", "给点提示", "hint")):
         meta["hints"] = int(meta.get("hints") or 0) + 1
 
-    # 第 6 次作答后不再追问：直接收束并生成证据报告
-    if turn >= 6:
+    # 默认第 6 次作答后收束；「继续这段对话」会调高额度，保留历史再聊一轮
+    if turn >= int(meta.get("max_turns") or 6):
         engine = "live" if llm.enabled() else "demo"
         meta["stage"] = "done"
         meta["engine"] = engine
@@ -344,6 +344,38 @@ def stream_reply(db: Database, user_id: str, session_id: str,
     touch_study_day(db, user_id, minutes=8, sessions=1)
     yield {"type": "done", "session": get_session(db, session_id)["session"],
            "report": None, "engine": engine}
+
+
+def reopen_session(db: Database, user_id: str, session_id: str) -> dict[str, Any]:
+    """结束后继续聊：归档旧报告、保留全部消息，再给 6 轮追问额度。
+
+    从前 completed 是单向终点：stream_reply 静默拒绝发言，前端只显示报告页，
+    用户想接着问只能「再聊一次」，前面说过的话全丢。这里把会话原地唤醒。
+    """
+    row = _session_row(db, session_id)
+    if not row:
+        raise ValueError("会话不存在")
+    if row["user_id"] != user_id:
+        raise PermissionError("无权访问该会话")
+    if row["status"] == "active":
+        return get_session(db, session_id)
+    meta = json_loads(row.get("meta_json"), {})
+    prior = list(meta.get("prior_reports") or [])
+    if meta.get("report"):
+        prior.append(meta["report"])
+    meta["prior_reports"] = prior[-5:]
+    meta["report"] = None                  # 否则 generate_report 会直接返回旧报告
+    meta["evidence_added"] = True          # 证据已写过，续聊不重复计入 heat
+    turn = int(row["turn"] or 0)
+    meta["max_turns"] = turn + 6
+    meta["stage"] = _stage_for_turn(turn)
+    db.execute(
+        "UPDATE sessions SET status='active', stage=?, ended_at=NULL, meta_json=? WHERE id=?",
+        (meta["stage"], json_dumps(meta), session_id),
+    )
+    emit(db, "socratic.reopened", {"session_id": session_id,
+                                   "max_turns": meta["max_turns"]}, user_id)
+    return get_session(db, session_id)
 
 
 def finish_session(db: Database, user_id: str, session_id: str) -> dict[str, Any]:

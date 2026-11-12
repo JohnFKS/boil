@@ -88,6 +88,7 @@ class App:
             ("POST", re.compile(r"^/api/socratic/start$"), self.socratic_start),
             ("POST", re.compile(r"^/api/socratic/stream$"), self.socratic_stream),
             ("POST", re.compile(r"^/api/socratic/finish$"), self.socratic_finish),
+            ("POST", re.compile(r"^/api/socratic/reopen$"), self.socratic_reopen),
             ("GET", re.compile(r"^/api/socratic/([^/]+)$"), self.socratic_get),
             ("POST", re.compile(r"^/api/feynman/evaluate$"), self.feynman_evaluate),
             ("GET", re.compile(r"^/api/review$"), self.review),
@@ -468,6 +469,12 @@ class App:
         if not session_id:
             raise ApiError(400, "缺少 session_id", "bad_request")
         return socratic.finish_session(self.db, config.DEFAULT_USER, session_id)
+
+    def socratic_reopen(self, req, match, query, body):
+        session_id = str((body or {}).get("session_id") or "")
+        if not session_id:
+            raise ApiError(400, "缺少 session_id", "bad_request")
+        return socratic.reopen_session(self.db, config.DEFAULT_USER, session_id)
 
     def socratic_get(self, req, match, query, body):
         try:

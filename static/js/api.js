@@ -109,17 +109,18 @@ export async function stream(path, body, onEvent, { signal } = {}) {
     if (e.name === "AbortError") throw e;
     throw new ApiError("无法连接 Boil 服务", { code: "network", detail: String(e) });
   }
-  if (resp.status === 401) {
-    const err = await parseError(resp);
-    if (unauthorizedHandler) unauthorizedHandler(err);
-    throw err;
-  }
-  if (!resp.ok) throw await parseError(resp);
-  if (!resp.body) throw new ApiError("浏览器不支持流式响应");
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
+  let reader = null;
   try {
+    if (resp.status === 401) {
+      const err = await parseError(resp);
+      if (unauthorizedHandler) unauthorizedHandler(err);
+      throw err;
+    }
+    if (!resp.ok) throw await parseError(resp);
+    if (!resp.body) throw new ApiError("浏览器不支持流式响应");
+    reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -152,10 +153,11 @@ export async function stream(path, body, onEvent, { signal } = {}) {
     }
   } catch (e) {
     if (e.name === "AbortError") throw e;
+    if (e instanceof ApiError) throw e;   // 401 / 业务错误保留原始信息
     throw new ApiError("流式连接中断", { code: "stream", detail: String(e) });
   } finally {
     if (activeStream === controller) activeStream = null;
-    try { reader.releaseLock(); } catch { /* noop */ }
+    try { reader?.releaseLock(); } catch { /* noop */ }
   }
 }
 
