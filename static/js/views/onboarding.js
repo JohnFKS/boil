@@ -1,5 +1,5 @@
 /* Onboarding: choose a pack or compile your own material, then create a goal. */
-import { aiFailure, aiSuccess, escapeHTML, icon, pct, pointKindMeta, toast } from "../utils.js";
+import { aiFailure, aiSuccess, escapeHTML, formatMinutes, icon, pct, pointKindMeta, toast } from "../utils.js";
 import { fileToText } from "../docImport.js";
 import { compileProgressMarkup, renderCompileProgress, runCompile, savedJobId } from "../compileJob.js";
 
@@ -289,7 +289,7 @@ export async function render(el, ctx, params) {
             <div class="field full"><label for="ob-text">材料内容</label><textarea class="textarea tall" id="ob-text" placeholder="也可以把补充讲义、笔记或教材片段粘贴到这里。">${escapeHTML(draft.text)}</textarea><span class="hint">演示模式会在本地切分、出题、生成卡片；配置模型后会做更细的结构抽取。</span></div>
           ` : ""}
           <div class="field"><label for="ob-deadline">截止日期</label><input class="input" type="date" id="ob-deadline" value="${escapeHTML(draft.deadline)}"></div>
-          <div class="field"><label for="ob-minutes">每天可投入 <strong id="ob-minutes-label">${draft.daily} 分钟</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="120" step="5" value="${draft.daily}"><span class="hint">时间不够时，系统会生成“最少必要路径”，并明确暂存哪些单元。</span></div>
+          <div class="field"><label for="ob-minutes">每天可投入 <strong id="ob-minutes-label">${formatMinutes(draft.daily)}</strong></label><input class="slider" id="ob-minutes" type="range" min="15" max="1440" step="5" value="${draft.daily}"><span class="hint">最高 24 小时；时间不够时系统会生成“最少必要路径”，时间充裕时一天可以排更多知识点。</span></div>
           <div class="field full"><label>当前基础</label><div class="choice-row">${LEVELS.map(([v, l]) => `<button class="choice ${v === draft.level ? "active" : ""}" data-level="${v}">${l}</button>`).join("")}</div></div>
         </div>
         ${mode === "material" ? `
@@ -300,7 +300,7 @@ export async function render(el, ctx, params) {
             </span>
           </label>` : ""}
         <div class="preview-box" id="ob-preview">
-          ${mode === "material" ? "" : `<strong>将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。</strong><br>预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 40 分钟拆成小步；系统会先保留复习时间，再排新内容。`}
+          ${mode === "material" ? "" : `<strong>将安装「${escapeHTML(selected.name)}」的 ${selected.unit_count} 个单元。</strong><br>预计 ${Math.round((selected.estimated_minutes || 0) / 60)} 小时的内容量，按每天 ${formatMinutes(draft.daily)} 拆成小步；系统会先保留复习时间，再排新内容。`}
         </div>
         ${compileProgressMarkup()}
         <div class="onboarding-actions">
@@ -333,7 +333,7 @@ export async function render(el, ctx, params) {
     });
     const minutes = body.querySelector("#ob-minutes");
     const minutesLabel = body.querySelector("#ob-minutes-label");
-    minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });
+    minutes?.addEventListener("input", () => { minutesLabel.textContent = formatMinutes(minutes.value); });
 
     if (mode === "material") {
       const drop = body.querySelector("#ob-drop");

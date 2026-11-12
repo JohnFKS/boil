@@ -127,7 +127,8 @@ def onboarding(db: Database, payload: dict[str, Any]) -> dict[str, Any]:
             deadline = date.fromisoformat(deadline_str)
         except ValueError:
             warnings.append("截止日期格式不正确，已按 8 周计划生成")
-    daily_minutes = int(clamp(int(payload.get("daily_minutes") or 40), 10, 240))
+    daily_minutes = int(clamp(int(payload.get("daily_minutes") or 40), 10,
+                              planner.MAX_DAILY_MINUTES))
     level = str(payload.get("level") or "beginner")[:20]
 
     # 归档旧目标
@@ -218,6 +219,54 @@ def _unit_status_map(db: Database, user_id: str, units: list[dict[str, Any]]) ->
     return out
 
 
+def _goal_meta(goal: dict[str, Any]) -> dict[str, Any]:
+    meta = goal.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    return json_loads(goal.get("meta_json") or "{}")
+
+
+def snoozed_units(goal: dict[str, Any] | None) -> set[str]:
+    if not goal:
+        return set()
+    raw = _goal_meta(goal).get("snoozed_units") or []
+    return {str(x) for x in raw if isinstance(x, (str, int))}
+
+
+def plan_prefs(goal: dict[str, Any]) -> dict[str, Any]:
+    prefs = _goal_meta(goal).get("plan_prefs") or {}
+    cap = prefs.get("unit_cap")
+    try:
+        cap = int(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        cap = None
+    return {"unit_cap": cap,
+            "rest_days_enabled": bool(prefs.get("rest_days_enabled", True))}
+
+
+def snooze_unit(db: Database, user_id: str, unit_id: str,
+                snoozed: bool) -> dict[str, Any]:
+    """稍后再学：只从推荐队列挪开，绝不删单元、也不动掌握度。"""
+    goal = active_goal(db, user_id, None)
+    if not goal:
+        raise ValueError("还没有学习目标")
+    row = db.one("SELECT id FROM units WHERE id=? AND goal_id=?",
+                 (unit_id, goal["id"]))
+    if not row:
+        raise ValueError("单元不存在")
+    meta = _goal_meta(goal)
+    current = {str(x) for x in (meta.get("snoozed_units") or [])}
+    if snoozed:
+        current.add(unit_id)
+    else:
+        current.discard(unit_id)
+    meta["snoozed_units"] = sorted(current)
+    db.execute("UPDATE goals SET meta_json=?, updated_at=? WHERE id=?",
+               (json_dumps(meta), now_iso(), goal["id"]))
+    emit(db, "unit.snoozed", {"unit_id": unit_id, "snoozed": snoozed}, user_id)
+    return {"snoozed": snoozed, "snoozed_units": sorted(current)}
+
+
 def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[str, Any]:
     user = ensure_user(db)
     goal = active_goal(db, user_id, goal_id)
@@ -232,12 +281,23 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
     msummary = mastery.summary(db, user_id, goal["id"])
     today = planner.today_plan(plan, today_str())
     done_ids = {uid for uid, s in statuses.items() if s["status"] == "boiled"}
-    progress = planner.progress(plan, done_ids)
+    learnable = [u for u in units if not u.get("merged_into")]
+    # 提前学计划里没排到的单元也要计入进度，否则分母只认 plan.days
+    progress = planner.progress(plan, done_ids,
+                                counted_ids={u["id"] for u in learnable})
     stats = _study_stats(db, user_id)
-    next_units = _next_units(units, statuses, limit=4)
+    snoozed = snoozed_units(goal)
+    next_units = _next_units(units, statuses, limit=8, snoozed=snoozed)
     next_action = _next_action(due_total, next_units, statuses)
     plan_days = plan.get("days") or []
     today_day = next((d for d in plan_days if d.get("date") == today_str()), today)
+    # 自由学习：全部单元都能直接点开，不受计划日期与顺序限制
+    learning_units = [
+        {"id": u["id"], "title": u["title"],
+         "status": statuses.get(u["id"], {}).get("status", "new"),
+         "snoozed": u["id"] in snoozed}
+        for u in sorted(learnable, key=lambda x: (x.get("order_index") or 0, x["id"]))
+    ][:80]
     return {
         "user": _public_user(user),
         "goal": goal,
@@ -250,7 +310,7 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
             "milestones": plan.get("milestones", []),
             "outline": plan.get("outline", []),
             "progress": progress,
-            "days": plan_days[:14],
+            "days": plan_days[:30],
         },
         "stats": stats,
         "mastery": msummary,
@@ -265,6 +325,9 @@ def dashboard(db: Database, user_id: str, goal_id: str | None = None) -> dict[st
             "average_heat": round4(sum(s["heat"] for s in statuses.values()) / len(statuses)) if statuses else 0.0,
         },
         "next_units": next_units,
+        "learning_units": learning_units,
+        "snoozed_units": sorted(snoozed),
+        "plan_prefs": plan_prefs(goal),
         "next_action": next_action,
         "digest": (goal.get("meta") or {}).get("ai_digest") or {},
         "study_plan_phases": (goal.get("meta") or {}).get("ai_study_plan") or [],
@@ -319,11 +382,12 @@ def _day_start_iso(d: date) -> str:
 
 
 def _next_units(units: list[dict[str, Any]], statuses: dict[str, dict[str, Any]],
-                limit: int = 4) -> list[dict[str, Any]]:
+                limit: int = 4, snoozed: set[str] | None = None) -> list[dict[str, Any]]:
+    skipped = snoozed or set()
     out = []
     for u in sorted(units, key=lambda x: (x.get("order_index") or 0, x["id"])):
-        if u.get("merged_into"):
-            continue          # 被吸收的单元不再被推荐，内容仍在归宿里
+        if u.get("merged_into") or u["id"] in skipped:
+            continue          # 被吸收 / 稍后再学的单元不再被推荐
         st = statuses.get(u["id"], {})
         if st.get("status") in ("boiled",):
             continue
@@ -371,7 +435,8 @@ def update_goal_and_replan(db: Database, user_id: str, payload: dict[str, Any]) 
     if not goal:
         raise ValueError("还没有学习目标")
     title = str(payload.get("title") or goal["title"]).strip()[:80]
-    daily = int(clamp(int(payload.get("daily_minutes") or goal["daily_minutes"]), 10, 240))
+    daily = int(clamp(int(payload.get("daily_minutes") or goal["daily_minutes"]),
+                      10, planner.MAX_DAILY_MINUTES))
     deadline = goal.get("deadline")
     if "deadline" in payload:
         deadline = str(payload.get("deadline") or "").strip() or None
@@ -400,11 +465,23 @@ def update_goal_and_replan(db: Database, user_id: str, payload: dict[str, Any]) 
             deadline_date = date.fromisoformat(deadline)
         except ValueError:
             deadline_date = None
-    goal_meta = json_loads(goal.get("meta_json") or "{}")
+    goal_meta = _goal_meta(goal)
+    prefs = goal_meta.get("plan_prefs") or {}
+    # 只在显式传入时覆盖强度档：设置页不带这两个字段，不该把用户的选择清掉
+    if "unit_cap" in payload:
+        raw = payload.get("unit_cap")
+        prefs["unit_cap"] = int(raw) if raw not in (None, "", 0) else None
+    if "rest_days_enabled" in payload:
+        prefs["rest_days_enabled"] = bool(payload.get("rest_days_enabled"))
+    goal_meta["plan_prefs"] = prefs
+    db.execute("UPDATE goals SET meta_json=?, updated_at=? WHERE id=?",
+               (json_dumps(goal_meta), now_iso(), goal["id"]))
     plan = planner.build_plan(remaining, relations, daily_minutes=daily,
                               start=_local_today(), deadline=deadline_date,
                               goal_id=goal["id"], version=1,
-                              ai_outline=goal_meta.get("ai_outline") or None)
+                              ai_outline=goal_meta.get("ai_outline") or None,
+                              unit_cap=prefs.get("unit_cap"),
+                              rest_days_enabled=bool(prefs.get("rest_days_enabled", True)))
     plan = save_plan(db, goal["id"], plan)
     emit(db, "goal.updated", {"goal_id": goal["id"], "daily_minutes": daily,
                               "deadline": deadline, "remaining": len(remaining)}, user_id)
@@ -1189,7 +1266,18 @@ def unit_detail(db: Database, user_id: str, unit_id: str) -> dict[str, Any]:
                         "WHERE goal_id=? AND merged_into=? ORDER BY title",
                         (unit["goal_id"], unit_id))
     unmerge_blocked = _unmerge_blockers(db, unit)
+    siblings = [x["id"] for x in sorted(
+        (x for x in all_units if not x.get("merged_into")),
+        key=lambda x: (x.get("order_index") or 0, x["id"]))]
+    pos = siblings.index(unit_id) if unit_id in siblings else -1
+    neighbors = {
+        "prev": siblings[pos - 1] if pos > 0 else None,
+        "next": siblings[pos + 1] if 0 <= pos < len(siblings) - 1 else None,
+    }
+    goal = active_goal(db, user_id, unit["goal_id"])
     return {"unit": unit, "mastery": m, "status": st[unit_id],
+            "neighbors": neighbors,
+            "snoozed": unit_id in snoozed_units(goal),
             "heat": h, "heat_label": heat.heat_label(h), "pn": pn,
             "merged_into": merged_into, "absorbed": absorbed,
             "can_unmerge": not unmerge_blocked,

@@ -68,6 +68,7 @@ class App:
             ("POST", re.compile(r"^/api/units/([^/]+)/merge$"), self.unit_merge),
             ("POST", re.compile(r"^/api/units/([^/]+)/unmerge$"), self.unit_unmerge),
             ("POST", re.compile(r"^/api/units/([^/]+)/deepen$"), self.unit_deepen),
+            ("POST", re.compile(r"^/api/units/([^/]+)/snooze$"), self.unit_snooze),
             ("GET", re.compile(r"^/api/notes$"), self.notes_list),
             ("POST", re.compile(r"^/api/notes$"), self.notes_create),
             ("POST", re.compile(r"^/api/notes/delete$"), self.notes_delete),
@@ -219,6 +220,13 @@ class App:
         force = bool((body or {}).get("force")) if isinstance(body, dict) else False
         return services.deepen_unit(self.db, config.DEFAULT_USER,
                                     unquote(match.group(1)), force=force)
+
+    def unit_snooze(self, req, match, query, body):
+        if not isinstance(body, dict):
+            raise ApiError(400, "请求体必须是 JSON 对象", "bad_request")
+        return services.snooze_unit(self.db, config.DEFAULT_USER,
+                                    unquote(match.group(1)),
+                                    snoozed=bool(body.get("snoozed", True)))
 
     def unit_note(self, req, match, query, body):
         if not isinstance(body, dict):

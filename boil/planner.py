@@ -123,12 +123,20 @@ def _apply_outline_order(units: list[dict[str, Any]],
     return rescheduled
 
 
+MAX_DAILY_MINUTES = 1440          # 24 小时：允许一整天投入
+MAX_UNIT_CAP = 24
+REVIEW_CAP = 120
+
+
 def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
                daily_minutes: int = 40, start: date | None = None,
                deadline: date | None = None, version: int = 1,
                goal_id: str = "", plan_id: str = "",
-               ai_outline: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    daily_minutes = int(clamp(int(daily_minutes or 40), 10, 240))
+               ai_outline: list[dict[str, Any]] | None = None,
+               unit_cap: int | None = None,
+               rest_days_enabled: bool = True) -> dict[str, Any]:
+    """unit_cap 为空时按日预算推一个上限；显式传入则尊重用户选的强度档。"""
+    daily_minutes = int(clamp(int(daily_minutes or 40), 10, MAX_DAILY_MINUTES))
     units = _apply_outline_order(units, ai_outline)
     start = start or datetime.now().astimezone().date()
     if deadline and deadline >= start:
@@ -137,10 +145,15 @@ def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
         total_days = 56
     rest_days = max(1, total_days // 7)
     study_days = max(1, total_days - rest_days)
-    review_minutes = int(clamp(round(daily_minutes * 0.3), 10, 30))
+    review_minutes = int(clamp(round(daily_minutes * 0.3), 10, REVIEW_CAP))
     buffer_minutes = max(5, int(round(daily_minutes * 0.1)))
     new_minutes_per_day = max(15, daily_minutes - review_minutes - buffer_minutes)
     available_new_minutes = study_days * new_minutes_per_day
+    # 从前「每天最多 2 单元」是硬编码，设 24 小时也只排 2 个，预算形同虚设。
+    # 默认按每 45 分钟一个知识点估，最多 24 个；用户可用 unit_cap 覆盖。
+    daily_unit_cap = (int(clamp(int(unit_cap), 1, MAX_UNIT_CAP))
+                      if unit_cap is not None
+                      else max(2, min(MAX_UNIT_CAP, new_minutes_per_day // 45)))
 
     selected, parked, mode = _select_units(units, relations, available_new_minutes)
     required = sum(_unit_minutes(u) for u in selected)
@@ -150,7 +163,7 @@ def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
     idx = 0
     day_counter = 0
     while idx < len(selected) and day_counter < max(total_days, 1):
-        is_rest = (day_counter % 7 == 6)
+        is_rest = rest_days_enabled and (day_counter % 7 == 6)
         if is_rest:
             days.append({
                 "date": cursor.isoformat(),
@@ -167,7 +180,7 @@ def build_plan(units: list[dict[str, Any]], relations: list[dict[str, Any]],
             continue
         day_units = []
         minutes = 0
-        while idx < len(selected) and len(day_units) < 2:
+        while idx < len(selected) and len(day_units) < daily_unit_cap:
             u = selected[idx]
             um = _unit_minutes(u)
             if day_units and minutes + um > new_minutes_per_day:
@@ -261,8 +274,13 @@ def today_plan(plan: dict[str, Any], day: str | None = None) -> dict[str, Any] |
     return days[-1] if days else None
 
 
-def progress(plan: dict[str, Any], mastered_ids: set[str]) -> dict[str, Any]:
-    all_units = [x["id"] for d in plan.get("days", []) for x in d.get("new_units", [])]
+def progress(plan: dict[str, Any], mastered_ids: set[str],
+             counted_ids: set[str] | None = None) -> dict[str, Any]:
+    """counted_ids 传入时按全部可学单元算进度：提前学计划外的单元也算数。"""
+    if counted_ids is None:
+        all_units = [x["id"] for d in plan.get("days", []) for x in d.get("new_units", [])]
+    else:
+        all_units = sorted(counted_ids)
     done = sum(1 for uid in all_units if uid in mastered_ids)
     return {
         "total": len(all_units),

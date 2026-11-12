@@ -172,7 +172,7 @@ function defaultSide(data) {
     <div class="side-label">怎么用这张图</div>
     <div class="rule-list">
       <div class="rule"><span class="n">1</span><span>先看颜色：灰=未开始，金=学习中，绿=已烧开，橙=需复习。</span></div>
-      <div class="rule"><span class="n">2</span><span>沿着线走：前置关系是从左到右，不要跳着啃。</span></div>
+      <div class="rule"><span class="n">2</span><span>沿着线走：前置关系是从左到右，想提前学也可以自由点开任意节点。</span></div>
       <div class="rule"><span class="n">3</span><span>点开一个节点，直接开始预习、苏格拉底或费曼。</span></div>
     </div>
   </div>
@@ -278,7 +278,7 @@ export async function render(el, ctx, params) {
     <div class="page-head">
       <div>
         <h2>学习路径</h2>
-        <p>${escapeHTML(data.goal?.title || "")} · ${nodes.length} 个单元。颜色是状态，线是前置关系；不要跳着啃。</p>
+        <p>${escapeHTML(data.goal?.title || "")} · ${nodes.length} 个单元。颜色是状态，线是前置关系；想提前学也可以自由点开任意节点。</p>
       </div>
       <div class="row wrap">
         <span class="badge badge-teal">${data.summary?.boiled || 0} 已烧开</span>

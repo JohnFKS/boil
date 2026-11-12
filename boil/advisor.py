@@ -163,7 +163,7 @@ def build_advice(db: Database, user_id: str = "local", goal_id: str | None = Non
             "pn": {"total": 0, "missing": [], "source": None, "complete": None},
             "id": new_id("adv"), "created_at": now_iso(), "minutes": minutes or 0,
         }
-    minutes = int(clamp(minutes or goal.get("daily_minutes") or 30, 5, 240))
+    minutes = int(clamp(minutes or goal.get("daily_minutes") or 30, 5, 1440))  # planner.MAX_DAILY_MINUTES
     units = get_goal_units(db, goal["id"])
     relations = get_goal_relations(db, goal["id"])
     due = _due_map(db, user_id, goal["id"])

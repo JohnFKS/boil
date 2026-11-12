@@ -1,7 +1,7 @@
 /* Dashboard: one screen to decide the next best action. */
 import {
   escapeHTML, icon, pct, relativeTime, ringSVG, radarSVG, statusMeta,
-  eventMeta, daysUntil, formatMinutes, truncate, toast,
+  eventMeta, daysUntil, formatMinutes, escapeAttr, truncate, toast,
 } from "../utils.js";
 import { openStyleTest } from "../styleTest.js";
 
@@ -218,12 +218,21 @@ export async function render(el, ctx, params) {
           </div>
 
           <div class="card card-pad">
-            <div class="section-head" style="margin-bottom:10px"><div><div class="section-title" style="font-size:16px">学习契约</div><div class="section-sub">计划是活的</div></div></div>
+            <div class="section-head" style="margin-bottom:10px"><div><div class="section-title" style="font-size:16px">学习契约</div><div class="section-sub">计划是活的，随时能改</div></div></div>
             <div class="facet-row"><span class="muted">模式</span><span style="color:var(--text-2)">${plan.strategy?.mode === "minimum_viable" ? "最少必要路径" : "完整路径"}</span><span class="faint mono">v${plan.version || 1}</span></div>
-            <div class="facet-row"><span class="muted">每日</span><span style="color:var(--text-2)">${goal.daily_minutes} 分钟</span><span></span></div>
+            <div class="facet-row"><span class="muted">每日</span><span style="color:var(--text-2)">${formatMinutes(goal.daily_minutes)}</span><span></span></div>
             <div class="facet-row"><span class="muted">暂存</span><span style="color:var(--text-2)">${plan.strategy?.parked?.length || 0} 个单元</span><span></span></div>
             <p class="small muted" style="margin-top:12px;line-height:1.7">${escapeHTML(plan.strategy?.summary || "还没有生成计划。")}</p>
-            <a class="btn btn-ghost btn-block mt-3" href="#/map">查看路径与暂存</a>
+            <button class="btn btn-teal btn-block mt-3" data-adjust-plan>${icon("refresh", 14)} 调整计划</button>
+            <a class="btn btn-ghost btn-block mt-2" href="#/map">查看路径与暂存</a>
+          </div>
+
+          <div class="card card-pad" id="free-learning">
+            <div class="section-head" style="margin-bottom:10px"><div><div class="section-title" style="font-size:16px">自由学习</div><div class="section-sub">不必按顺序，也不必等计划排到——想学哪个直接点，支持提前学</div></div><span class="badge badge-teal">${(d.learning_units || []).length} 个知识点</span></div>
+            <div class="stack" style="gap:6px;max-height:340px;overflow:auto">
+              ${(d.learning_units || []).map((lu, i) => `<a class="btn btn-ghost btn-block" href="#/unit/${escapeAttr(lu.id)}" data-free-unit="${escapeAttr(lu.id)}">${String(i + 1).padStart(2, "0")} · ${escapeHTML(lu.title)}${lu.snoozed ? " · 稍后再学" : ""}</a>`).join("") || `<div class="empty" style="padding:18px"><p>暂时没有可学的单元。</p></div>`}
+            </div>
+            ${(d.snoozed_units || []).length ? `<button class="btn btn-ghost btn-sm mt-3" data-unsnooze-all>恢复 ${d.snoozed_units.length} 个暂缓单元</button>` : ""}
           </div>
 
           <div class="card card-pad">
@@ -245,7 +254,70 @@ export async function render(el, ctx, params) {
     });
   });
 
-  const advisorState = { advice: null, minutes: Math.min(60, Math.max(10, goal.daily_minutes || 30)) };
+  el.querySelector("[data-adjust-plan]")?.addEventListener("click", () => {
+    const prefs = d.plan_prefs || {};
+    const cap = prefs.unit_cap;
+    const rest = prefs.rest_days_enabled !== false;
+    ctx.openModal({
+      title: "调整学习计划",
+      subtitle: "随时可改；只重排尚未烧开的单元，已掌握的内容不会回到新学队列。",
+      body: `<div class="form-grid">
+        <div class="field full"><label for="adj-title">目标名称</label><input class="input" id="adj-title" value="${escapeAttr(goal.title)}"></div>
+        <div class="field"><label for="adj-minutes">每天可投入 <strong id="adj-minutes-label">${formatMinutes(goal.daily_minutes)}</strong></label><input class="slider" id="adj-minutes" type="range" min="15" max="1440" step="5" value="${goal.daily_minutes}"><span class="hint">最高 24 小时。</span></div>
+        <div class="field"><label for="adj-deadline">截止日期</label><input class="input" id="adj-deadline" type="date" value="${escapeAttr(goal.deadline || "")}"></div>
+        <div class="field"><label for="adj-cap">每天新知识点上限</label><select class="input" id="adj-cap">
+          <option value="" ${cap ? "" : "selected"}>按时间自动</option>
+          <option value="2" ${cap === 2 ? "selected" : ""}>轻松 · 2 个</option>
+          <option value="4" ${cap === 4 ? "selected" : ""}>标准 · 4 个</option>
+          <option value="8" ${cap === 8 ? "selected" : ""}>密集 · 8 个</option>
+          <option value="24" ${cap === 24 ? "selected" : ""}>不限 · 24 个</option>
+        </select></div>
+        <div class="field"><label class="row" style="gap:8px"><input type="checkbox" id="adj-rest" ${rest ? "checked" : ""}> 保留每周休息日</label><span class="hint">取消后每天都排新内容。</span></div>
+      </div><div id="adj-result"></div>`,
+      actions: [
+        { label: "取消", kind: "btn-ghost" },
+        { label: "保存并重排", kind: "btn-teal", onClick: async ({ body }) => {
+          try {
+            const capRaw = body.querySelector("#adj-cap").value;
+            const out = await ctx.api.post("/api/plan/rebuild", {
+              title: body.querySelector("#adj-title").value.trim(),
+              daily_minutes: Number(body.querySelector("#adj-minutes").value),
+              deadline: body.querySelector("#adj-deadline").value,
+              unit_cap: capRaw ? Number(capRaw) : null,
+              rest_days_enabled: body.querySelector("#adj-rest").checked,
+            });
+            ctx.state.dashboard = out;
+            toast("计划已更新，剩余路径已重排。", "success");
+            await ctx.refreshView();
+          } catch (err) {
+            body.querySelector("#adj-result").innerHTML = `<div class="error-box">${escapeHTML(err.message || "调整失败")}</div>`;
+            return false;
+          }
+        } },
+      ],
+    });
+    const slider = document.querySelector("#adj-minutes");
+    slider?.addEventListener("input", () => {
+      document.querySelector("#adj-minutes-label").textContent = formatMinutes(slider.value);
+    });
+  });
+
+  el.querySelector("[data-unsnooze-all]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      for (const uid of (d.snoozed_units || [])) {
+        await ctx.api.post(`/api/units/${encodeURIComponent(uid)}/snooze`, { snoozed: false });
+      }
+      toast("已恢复全部暂缓单元。", "success");
+      await ctx.refreshView();
+    } catch (err) {
+      toast(err.message || "恢复失败", "error");
+      btn.disabled = false;
+    }
+  });
+
+  const advisorState = { advice: null, minutes: Math.min(1440, Math.max(10, goal.daily_minutes || 30)) };
   el.querySelector("#advisor-card")?.addEventListener("click", (e) => {
     const minuteBtn = e.target.closest("[data-advice-minutes]");
     if (minuteBtn) { loadAdvice(ctx, Number(minuteBtn.dataset.adviceMinutes), advisorState); return; }

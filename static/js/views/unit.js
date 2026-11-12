@@ -63,6 +63,8 @@ export async function render(el, ctx, params) {
   const probes = data.probes || [];
   const sessions = data.sessions || [];
   const dueCards = cards.filter(c => c.state !== "new" && new Date(c.due_at) <= new Date());
+  const neighbors = data.neighbors || {};
+  const snoozed = Boolean(data.snoozed);
   ctx.setPageTitle("KNOWLEDGE UNIT", "知识单元");
 
   el.innerHTML = `
@@ -85,6 +87,9 @@ export async function render(el, ctx, params) {
         <a class="btn btn-ghost" href="#/feynman/${escapeAttr(u.id)}?mode=examiner">${icon("trophy", 16)} 极致对标</a>
         <button class="btn btn-ghost" data-audio>${icon("volume", 16)} 听一耳</button>
         <a class="btn btn-ghost" href="#/review">${icon("review", 16)} 复习</a>
+        ${neighbors.prev ? `<a class="btn btn-ghost" href="#/unit/${escapeAttr(neighbors.prev)}">${icon("chevronLeft", 15)} 上一个知识点</a>` : ""}
+        ${neighbors.next ? `<a class="btn btn-ghost" href="#/unit/${escapeAttr(neighbors.next)}">下一个知识点 ${icon("arrow", 15)}</a>` : ""}
+        <button class="btn btn-ghost" data-snooze>${snoozed ? "恢复学习" : "稍后再学"}</button>
       </div>
     </div>
 
@@ -293,6 +298,18 @@ export async function render(el, ctx, params) {
       toast(e.message || "深化失败", "error", 6000);
       button.disabled = false;
       button.textContent = "重试按需深化";
+    }
+  });
+  el.querySelector("[data-snooze]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      await ctx.api.post(`/api/units/${encodeURIComponent(u.id)}/snooze`, { snoozed: !snoozed });
+      toast(snoozed ? "已放回学习队列。" : "已设为稍后再学，随时可以恢复。", "success");
+      await ctx.refreshView();
+    } catch (err) {
+      toast(err.message || "操作失败", "error");
+      btn.disabled = false;
     }
   });
   el.querySelectorAll("[data-socratic]").forEach(btn => btn.addEventListener("click", () => ctx.startSocratic(u.id)));

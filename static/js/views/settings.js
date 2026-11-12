@@ -181,7 +181,7 @@ export async function render(el, ctx, params) {
           <div class="between"><div><h3>学习契约</h3><div class="sub">修改每天可投入的时间或截止日期，系统会重排剩余路径。</div></div><span class="badge badge-ember">计划是活的</span></div>
           ${goal ? `<div class="form-grid mt-4">
             <div class="field full"><label for="goal-title">当前目标</label><input class="input" id="goal-title" value="${escapeAttr(goal.title)}"></div>
-            <div class="field"><label for="goal-minutes">每天可投入 <strong id="goal-minutes-label">${goal.daily_minutes} 分钟</strong></label><input class="slider" id="goal-minutes" type="range" min="15" max="120" step="5" value="${goal.daily_minutes}"></div>
+            <div class="field"><label for="goal-minutes">每天可投入 <strong id="goal-minutes-label">${formatMinutes(goal.daily_minutes)}</strong></label><input class="slider" id="goal-minutes" type="range" min="15" max="1440" step="5" value="${goal.daily_minutes}"><span class="hint">最高 24 小时；保存后只重排尚未烧开的单元。</span></div>
             <div class="field"><label for="goal-deadline">截止日期</label><input class="input" id="goal-deadline" type="date" value="${escapeAttr(goal.deadline || "")}"></div>
             <div class="field full"><span class="hint">重排只针对尚未烧开的单元；已烧开的单元不会回到新学队列，但仍会按 FSRS 安排复习。</span></div>
           </div>
@@ -425,7 +425,7 @@ export async function render(el, ctx, params) {
 
   const minutes = el.querySelector("#goal-minutes");
   const minutesLabel = el.querySelector("#goal-minutes-label");
-  minutes?.addEventListener("input", () => { minutesLabel.textContent = `${minutes.value} 分钟`; });
+  minutes?.addEventListener("input", () => { minutesLabel.textContent = formatMinutes(minutes.value); });
   el.querySelector("#rebuild-plan")?.addEventListener("click", async (e) => {
     if (!goal) return;
     const btn = e.currentTarget;
